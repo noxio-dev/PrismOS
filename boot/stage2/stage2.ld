@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (c) 2026 noxio-dev
  *
- * PrismOS boot0 linker script
+ * PrismOS stage2 linker script -- flat binary loaded at 0x7E00.
  */
 
 OUTPUT_FORMAT(binary)
@@ -10,7 +10,7 @@ OUTPUT_ARCH(i386)
 
 SECTIONS
 {
-    . = 0x7C00;
+    . = 0x7E00;
 
     .text : {
         *(.text)
@@ -18,13 +18,9 @@ SECTIONS
         *(.data)
     }
 
-    . = 0x7C00 + 510;
-    .sig : {
-        *(.sig)
-    }
-
     /DISCARD/ : {
         *(.bss)
+        *(COMMON)
         *(.note*)
         *(.comment*)
     }
