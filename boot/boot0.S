@@ -1,9 +1,9 @@
 /*-
  * SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (c) 2026 noxio-dev
- *
- * PrismOS boot0 -- real-mode boot sector (MBR)
  */
+
+#include <prism.inc>
 
     .text
     .code16
@@ -14,7 +14,7 @@ _start:
     movw %ax, %ds
     movw %ax, %es
     movw %ax, %ss
-    movw $0x7C00, %sp
+    movw $BOOT0_ADDR, %sp
     sti
 
     movb %dl, boot_drive
@@ -22,26 +22,26 @@ _start:
     movw $msg_hello, %si
     call bios_print
 
-    movw $0x7E00, %bx
+    movw $LOADER_ADDR, %bx
     movb $0x02, %ah
-    movb $0x01, %al
+    movb $LOADER_SECTORS, %al
     movb $0x00, %ch
     movb $0x00, %dh
-    movb $0x02, %cl
+    movb $LOADER_SECTOR, %cl
     movb boot_drive, %dl
     int  $0x13
     jc   disk_error
 
-    movw $msg_stage2, %si
+    movw $msg_jump, %si
     call bios_print
 
-    ljmp $0x0000, $0x7E00
+    ljmp $0x0000, $LOADER_ADDR
 
 disk_error:
     movw $msg_err, %si
     call bios_print
 1:  hlt
-    jmp 1b
+    jmp  1b
 
 bios_print:
     lodsb
@@ -56,9 +56,9 @@ bios_print:
 
     .data
 
-msg_hello:  .asciz "PrismOS boot0: hello, world!\r\n"
-msg_stage2: .asciz "loading stage2...\r\n"
-msg_err:    .asciz "DISK ERROR -- halting.\r\n"
+msg_hello: .asciz "PrismOS boot0: hello, world!\r\n"
+msg_jump:  .asciz "Chargement du loader...\r\n"
+msg_err:   .asciz "Erreur disque -- halte.\r\n"
 
 boot_drive: .byte 0
 

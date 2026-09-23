@@ -1,8 +1,3 @@
-/*-
- * SPDX-License-Identifier: GPL-3.0-or-later
- * Copyright (c) 2026 noxio-dev
- */
-
 OUTPUT_FORMAT(binary)
 OUTPUT_ARCH(i386)
 
