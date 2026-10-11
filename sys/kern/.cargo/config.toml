@@ -1,0 +1,8 @@
+# Build with:   cargo build --release
+# One-time setup: rustup target add x86_64-unknown-none
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+# Fixed addresses (linker.ld): plain ET_EXEC, no PIE, no dynamic relocation.
+rustflags = ["-C", "relocation-model=static", "-C", "link-arg=-no-pie"]
