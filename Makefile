@@ -60,7 +60,7 @@ EFI_OBJS  := $(patsubst %.c,$B/efi/%.o,$(COMMON_SRCS) $(wildcard boot/efi/*.c))
 
 # ---- default target ----------------------------------------------------
 
-.PHONY: all clean run run-uefi run-iso test kernel esp iso
+.PHONY: all clean run run-uefi run-iso test kernel esp iso run-kvm run-uefi-kvm
 all: $B/$(NAME).img
 
 # ---- compile rules -------------------------------------------------------
@@ -154,6 +154,26 @@ run-uefi: $B/$(NAME).img
 	$(QEMU) $(QEMUFLAGS) -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=$B/OVMF_VARS.fd \
 		-drive file=$<,format=raw -serial stdio
+
+# KVM : BIOS
+run-kvm: $B/$(NAME).img
+	@test -e /dev/kvm || { echo "KVM unavailable: /dev/kvm not found"; exit 1; }
+	$(QEMU) -enable-kvm $(QEMUFLAGS) \
+		-drive file=$<,format=raw \
+		-serial stdio
+
+# KVM : UEFI
+run-uefi-kvm: $B/$(NAME).img
+	@test -e /dev/kvm || { echo "KVM unavailable: /dev/kvm not found"; exit 1; }
+	@test -n "$(OVMF_CODE)" || { echo "OVMF not found: set OVMF_CODE and OVMF_VARS"; exit 1; }
+	@test -f "$(OVMF_CODE)" || { echo "OVMF_CODE file not found: $(OVMF_CODE)"; exit 1; }
+	@test -f "$(OVMF_VARS)" || { echo "OVMF_VARS file not found: $(OVMF_VARS)"; exit 1; }
+	cp -f $(OVMF_VARS) $B/OVMF_VARS_KVM.fd
+	$(QEMU) -enable-kvm $(QEMUFLAGS) \
+		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+		-drive if=pflash,format=raw,file=$B/OVMF_VARS_KVM.fd \
+		-drive file=$<,format=raw \
+		-serial stdio
 
 # ---- ISO --------------------------------------------------------------------
 

@@ -11,10 +11,12 @@
 
 mod boot;
 mod console;
+mod cpu;
 mod fb;
 mod font;
 mod serial;
 mod vga;
+mod vm;
 
 use boot::BootInfo;
 use core::arch::asm;
@@ -50,6 +52,37 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             kprintln!("cmdline  : \"{}\"", bi.cmdline());
         }
         None => kprintln!("warning: no valid boot info from the loader"),
+    }
+
+        kprintln!();
+
+    // --- Détection CPU / VM ---------------------------------------------
+    let cpu = cpu::Cpu::detect();
+    let brand = cpu.brand();
+    kprintln!("cpu      : {}", if brand.is_empty() { "unknown" } else { brand });
+    kprintln!(
+        "vendor   : {}, family {} model {} stepping {}",
+        cpu.vendor(),
+        cpu.family(),
+        cpu.model(),
+        cpu.stepping()
+    );
+    let mut feats = [0u8; 256];
+    kprintln!("features : {}", cpu.features_into(&mut feats));
+
+    match vm::detect() {
+        Some(vm) => {
+            kprintln!(
+                "machine  : {} (sig \"{}\", hv max leaf {:#x})",
+                vm.name(),
+                vm.signature_str(),
+                vm.max_leaf
+            );
+            if let Some(pv) = vm.kvm_features() {
+                kprintln!("kvm      : paravirt features {:#010x}", pv);
+            }
+        }
+        None => kprintln!("machine  : bare metal"),
     }
 
     halt()
