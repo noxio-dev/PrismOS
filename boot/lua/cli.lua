@@ -17,53 +17,110 @@ end
 
 local function out(s) loader.write(s) end
 
--- Line editor: edit in place, arrows for history and cursor, returns the line.
+
+-- Line editor: edit in place, with safe terminal wrapping.
 local function readline(prompt)
     local buf, pos, hist = "", 0, #history + 1
+
     local function redraw()
-        out("\r" .. prompt .. buf .. "\27[K")
-        local back = #buf - pos
-        if back > 0 then out("\27[" .. back .. "D") end
+        local cols = loader.size()
+        local width = type(cols) == "table" and cols[1] or cols
+        width = tonumber(width) or 80
+
+        local available = math.max(1, width - #prompt - 1)
+
+        local start = math.max(0, pos - available + 1)
+        if start > #buf - available then
+            start = math.max(0, #buf - available)
+        end
+
+        local visible = buf:sub(start + 1, start + available)
+        local cursor = pos - start
+
+        out("\r\27[K" .. prompt .. visible)
+
+        local back = #visible - cursor
+        if back > 0 then
+            out("\27[" .. back .. "D")
+        end
     end
-    out(prompt)
+
+    redraw()
+
     while true do
         local k = loader.getkey()
+
         if k == "enter" then
-            out("\n")
+            out("\r\n")
             return buf
+
         elseif k == "backspace" then
             if pos > 0 then
                 buf = buf:sub(1, pos - 1) .. buf:sub(pos + 1)
                 pos = pos - 1
                 redraw()
             end
+
         elseif k == "delete" then
-            if pos < #buf then buf = buf:sub(1, pos) .. buf:sub(pos + 2); redraw() end
+            if pos < #buf then
+                buf = buf:sub(1, pos) .. buf:sub(pos + 2)
+                redraw()
+            end
+
         elseif k == "left" then
-            if pos > 0 then pos = pos - 1; out("\27[D") end
+            if pos > 0 then
+                pos = pos - 1
+                redraw()
+            end
+
         elseif k == "right" then
-            if pos < #buf then pos = pos + 1; out("\27[C") end
+            if pos < #buf then
+                pos = pos + 1
+                redraw()
+            end
+
         elseif k == "home" or k == "ctrl-a" then
-            pos = 0; redraw()
+            pos = 0
+            redraw()
+
         elseif k == "end" or k == "ctrl-e" then
-            pos = #buf; redraw()
+            pos = #buf
+            redraw()
+
         elseif k == "up" then
-            if hist > 1 then hist = hist - 1; buf = history[hist]; pos = #buf; redraw() end
+            if hist > 1 then
+                hist = hist - 1
+                buf = history[hist]
+                pos = #buf
+                redraw()
+            end
+
         elseif k == "down" then
-            if hist < #history then hist = hist + 1; buf = history[hist]
-            else hist = #history + 1; buf = "" end
-            pos = #buf; redraw()
+            if hist < #history then
+                hist = hist + 1
+                buf = history[hist]
+            else
+                hist = #history + 1
+                buf = ""
+            end
+            pos = #buf
+            redraw()
+
         elseif k == "ctrl-u" then
-            buf, pos = "", 0; redraw()
+            buf, pos = "", 0
+            redraw()
+
         elseif k == "ctrl-c" then
-            out("^C\n")
+            out("^C\r\n")
             return ""
+
         elseif k == "tab" then
-            -- nothing to complete yet
+            -- Nothing to complete yet.
+
         elseif k and #k == 1 then
             buf = buf:sub(1, pos) .. k .. buf:sub(pos + 1)
             pos = pos + 1
-            if pos == #buf then out(k) else redraw() end
+            redraw()
         end
     end
 end
