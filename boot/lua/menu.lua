@@ -68,8 +68,16 @@ local function draw(sel)
     local rows, cols = loader.size()
     out(sgr("0") .. ESC .. "?25l" .. ESC .. "2J")
     local x = math.max(1, (cols - #logo[1]) // 2)
+    local rainbow = {
+        "1;31",
+        "1;33",
+        "1;32",
+        "1;36",
+        "1;34",
+    }
+
     for i, l in ipairs(logo) do
-        out(at(1 + i, x) .. sgr(i % 2 == 0 and "1;36" or "1;35") .. l)
+        out(at(1 + i, x) .. sgr(rainbow[i]) .. l .. sgr("0"))
     end
     local title = config.get("loader_menu_title", "Welcome to PrismOS")
     out(at(8, math.max(1, (cols - #title) // 2)) .. sgr("1;37") .. title)
