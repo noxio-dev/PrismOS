@@ -17,6 +17,10 @@ mod font;
 mod serial;
 mod vga;
 mod vm;
+mod io;
+mod kbd;
+mod line;
+mod sh;
 
 use boot::BootInfo;
 use core::arch::asm;
@@ -85,10 +89,12 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         None => kprintln!("machine  : bare metal"),
     }
 
-    halt()
+    // The boot report is done: drop to the interactive shell.
+    sh::set_boot_info(bi);
+    sh::run()
 }
 
-fn halt() -> ! {
+pub(crate) fn halt() -> ! {
     loop {
         // SAFETY: nothing left to run, sleep forever.
         unsafe { asm!("cli", "hlt", options(nomem, nostack)) };

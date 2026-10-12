@@ -41,3 +41,15 @@ pub fn write_byte(b: u8) {
         outb(COM1, b);
     }
 }
+
+/// A byte is pending in the receive buffer.
+pub fn has_byte() -> bool {
+    // SAFETY: Line Status Register read on COM1.
+    unsafe { inb(COM1 + 5) & 0x01 != 0 }
+}
+
+/// Read one received byte.  Call only after has_byte() returned true.
+pub fn read_byte() -> u8 {
+    // SAFETY: Receive Buffer read on COM1.
+    unsafe { inb(COM1) }
+}

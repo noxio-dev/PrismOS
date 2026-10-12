@@ -65,6 +65,18 @@ pub fn _print(args: fmt::Arguments) {
     let _ = c.write_fmt(args);
 }
 
+/// Clear every active console.
+pub fn clear() {
+    // SAFETY: single CPU, called from the boot console context.
+    let c = unsafe { &mut *addr_of_mut!(CONSOLE) };
+    if let Some(v) = c.vga.as_mut() {
+        v.clear();
+    }
+    if let Some(f) = c.fb.as_mut() {
+        f.clear(); // add a clear() to FbConsole if it does not have one yet
+    }
+}
+
 #[macro_export]
 macro_rules! kprint {
     ($($arg:tt)*) => { $crate::console::_print(format_args!($($arg)*)) };
