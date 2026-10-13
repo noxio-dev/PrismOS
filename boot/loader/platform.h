@@ -55,6 +55,7 @@ void plat_sleep(unsigned ms);
 void plat_idle(void);                        /* wait briefly for events */
 int  plat_key_poll(void);                    /* key code or 0 */
 void plat_reboot(void) __attribute__((noreturn));
+void plat_shutdown(void) __attribute__((noreturn));
 
 #define PLAT_ALLOC_KERNEL   1        /* kernel image and modules */
 #define PLAT_ALLOC_BOOTDATA 2        /* boot info, tables, stack (< 4 GiB) */

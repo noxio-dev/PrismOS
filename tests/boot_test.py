@@ -76,12 +76,22 @@ def main():
                        "-drive", "if=pflash,format=raw,file=" + v,
                        "-drive", "file=%s,format=raw" % work]
 
-    hello = ["Hello, world!", "PrismOS kernel"]
+    hello = ["Hello, world!", "PrismOS kernel", "gdt/tss", "idt", "pic",
+             "pit      : channel 0 at 100 Hz", "pmm      :", "vmm      :",
+             "heap     :", "kbd      :", "interrupts enabled", "prism# "]
     scenarios = [
         ("BIOS autoboot", bios_cmd, [], hello + ["firmware : BIOS"], 40),
         ("BIOS prompt: Esc, then boot", bios_cmd,
          [("Autoboot in", "\x1b"), ("OK ", "version\rboot -v\r")],
          ["OK ", "PrismOS loader 0.1.0", "Hello, world!", 'cmdline  : "-v"'], 40),
+        ("BIOS shell: exception recovery", bios_cmd,
+         [("prism# ", "crash int\r"), ("prism# ", "crash page\r"),
+          ("prism# ", "crash div\r"), ("prism# ", "uptime\r")],
+         ["handled, continuing", "page mapped, continuing", "divide by zero",
+          "survived", "ticks at 100 Hz"], 60),
+        ("BIOS shell: memory + layout", bios_cmd,
+         [("prism# ", "meminfo\r"), ("prism# ", "layout fr\r"), ("prism# ", "kbd\r")],
+         ["pages total", "self-test: ok", "switched to fr", "i8042"], 60),
     ]
     if code and vars_ and os.path.exists(code):
         scenarios += [

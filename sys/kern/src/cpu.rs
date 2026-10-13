@@ -34,15 +34,15 @@ pub fn cpuid(leaf: u32, subleaf: u32) -> Cpuid {
 pub enum Feature {
     Fpu, Tsc, Msr, Apic, Cmov, Sse, Sse2,
     Sse3, Ssse3, Sse41, Sse42, Popcnt, Aes, Avx, Rdrand,
-    Avx2, Erms, Rdseed,
+    Avx2, Erms, Rdseed, Pdpe1Gb,
 }
 
 impl Feature {
-    const ALL: [Feature; 18] = [
+    const ALL: [Feature; 19] = [
         Feature::Fpu, Feature::Tsc, Feature::Msr, Feature::Apic, Feature::Cmov,
         Feature::Sse, Feature::Sse2, Feature::Sse3, Feature::Ssse3, Feature::Sse41,
         Feature::Sse42, Feature::Popcnt, Feature::Aes, Feature::Avx, Feature::Rdrand,
-        Feature::Avx2, Feature::Erms, Feature::Rdseed,
+        Feature::Avx2, Feature::Erms, Feature::Rdseed, Feature::Pdpe1Gb,
     ];
 
     fn name(self) -> &'static str {
@@ -65,6 +65,7 @@ impl Feature {
             Feature::Avx2 => "avx2",
             Feature::Erms => "erms",
             Feature::Rdseed => "rdseed",
+            Feature::Pdpe1Gb => "pdpe1gb",
         }
     }
 
@@ -88,6 +89,7 @@ impl Feature {
             Feature::Avx2 => 1 << 5,
             Feature::Erms => 1 << 9,
             Feature::Rdseed => 1 << 18,
+            Feature::Pdpe1Gb => 1 << 26,
         }
     }
 
@@ -95,6 +97,7 @@ impl Feature {
         match self {
             Feature::Fpu | Feature::Tsc | Feature::Msr | Feature::Apic | Feature::Cmov
             | Feature::Sse | Feature::Sse2 => cpu.f1_edx,
+            Feature::Pdpe1Gb => cpu.f81_edx,
             Feature::Sse3 | Feature::Ssse3 | Feature::Sse41 | Feature::Sse42
             | Feature::Popcnt | Feature::Aes | Feature::Avx | Feature::Rdrand => cpu.f1_ecx,
             Feature::Avx2 | Feature::Erms | Feature::Rdseed => cpu.f7_ebx,
@@ -109,6 +112,7 @@ pub struct Cpu {
     f1_edx: u32,
     f1_ecx: u32,
     f7_ebx: u32,
+    f81_edx: u32,
 }
 
 impl Cpu {
@@ -122,6 +126,11 @@ impl Cpu {
 
         let l1 = cpuid(1, 0);
         let f7_ebx = if l0.eax >= 7 { cpuid(7, 0).ebx } else { 0 };
+        let f81_edx = if cpuid(0x8000_0000, 0).eax >= 0x8000_0001 {
+            cpuid(0x8000_0001, 0).edx
+        } else {
+            0
+        };
 
         let mut brand = [0u8; 48];
         if cpuid(0x8000_0000, 0).eax >= 0x8000_0004 {
@@ -135,7 +144,7 @@ impl Cpu {
             }
         }
 
-        Cpu { vendor, brand, eax1: l1.eax, f1_edx: l1.edx, f1_ecx: l1.ecx, f7_ebx }
+        Cpu { vendor, brand, eax1: l1.eax, f1_edx: l1.edx, f1_ecx: l1.ecx, f7_ebx, f81_edx }
     }
 
     pub fn vendor(&self) -> &str {

@@ -1,27 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 noxio-dev
 //
-// Line discipline for the kernel terminal: merges PS/2 and serial input,
-// echoes, handles backspace, and returns a full line.
+// Line discipline for the kernel terminal: merges the PS/2 keyboard queue
+// and the serial RX queue, echoes, handles backspace / Ctrl-U / Ctrl-C,
+// and sleeps in `hlt` between characters instead of busy-polling (the PIT
+// keeps a 100 Hz heartbeat so the loop never sleeps forever).
 
-use crate::kbd::{has_key, Kbd};
-use crate::serial;
-use core::ptr::addr_of_mut;
+use crate::io::hlt;
 
 const BACKSPACE: u8 = 0x7F;
 
-// SAFETY: single CPU, no interrupts enabled yet, so no reentrancy.
-static mut KBD: Kbd = Kbd::new();
-
-/// Next input character from either source, or None if nothing is pending.
+/// Next input character from either source, or None when idle.
 fn get_char() -> Option<u8> {
-    if serial::has_byte() {
-        return Some(serial::read_byte());
+    if let Some(c) = crate::kbd::pop_char() {
+        return Some(c);
     }
-    // SAFETY: see KBD above.
-    let kbd = unsafe { &mut *addr_of_mut!(KBD) };
-    if has_key() {
-        return kbd.get_char();
+    if let Some(b) = crate::serial::pop_rx() {
+        return Some(b);
     }
     None
 }
@@ -30,7 +25,11 @@ fn get_char() -> Option<u8> {
 pub fn read_line(buf: &mut [u8]) -> usize {
     let mut n = 0usize;
     loop {
-        let Some(c) = get_char() else { continue };
+        let Some(c) = get_char() else {
+            // Nothing pending: sleep until the next interrupt.
+            hlt();
+            continue;
+        };
         match c {
             b'\r' | b'\n' => {
                 crate::kprint!("\n");
@@ -42,12 +41,34 @@ pub fn read_line(buf: &mut [u8]) -> usize {
                     crate::kprint!("\x08 \x08");
                 }
             }
+            0x03 => {
+                // Ctrl-C: erase the partial line and cancel it.
+                while n > 0 {
+                    n -= 1;
+                    crate::kprint!("\x08 \x08");
+                }
+                crate::kprint!("^C\n");
+                return 0;
+            }
+            0x15 => {
+                // Ctrl-U: kill the line.
+                while n > 0 {
+                    n -= 1;
+                    crate::kprint!("\x08 \x08");
+                }
+            }
             c if (0x20..0x7F).contains(&c) && n < buf.len() => {
                 buf[n] = c;
                 n += 1;
                 crate::kprint!("{}", c as char);
             }
-            _ => {} // releases, control characters: ignored
+            c if c >= 0x80 && n < buf.len() => {
+                // CP437 accents from the FR layout: store and echo raw.
+                buf[n] = c;
+                n += 1;
+                crate::kprint!("{}", c as char);
+            }
+            _ => {} // other control characters: ignored
         }
     }
 }

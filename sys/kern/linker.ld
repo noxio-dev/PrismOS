@@ -23,15 +23,20 @@ SECTIONS
     . = KERNBASE + 0x200000;
 
     .text : ALIGN(4K) {
+        __text_start = .;
         *(.text._start)
         *(.text .text.*)
+        __text_end = .;
     } :text
 
     .rodata : ALIGN(4K) {
+        __rodata_start = .;
         *(.rodata .rodata.*)
+        __rodata_end = .;
     } :rodata
 
     .data : ALIGN(4K) {
+        __data_start = .;
         *(.data .data.*)
     } :data
 

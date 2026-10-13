@@ -113,6 +113,19 @@ void plat_reboot(void)
     for (;;) __asm__ volatile("hlt");
 }
 
+void plat_shutdown(void)
+{
+    __asm__ volatile("cli");
+
+    outw(0x604, 0x2000);
+
+    outw(0xB004, 0x2000);
+
+    for (;;) {
+        __asm__ volatile("hlt");
+    }
+}
+
 /* ---- memory -------------------------------------------------------------- */
 
 int e820_read(struct prism_mmap_entry *m, int max)

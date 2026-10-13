@@ -52,10 +52,16 @@ const COMMANDS: &[Cmd] = &[
     Cmd { name: "dump", usage: "<addr> [len]", desc: "hexdump memory (default 64 bytes)", run: cmd_dump },
     Cmd { name: "in", usage: "<port>", desc: "read a byte from an I/O port", run: cmd_in },
     Cmd { name: "out", usage: "<port> <val>", desc: "write a byte to an I/O port", run: cmd_out },
-    Cmd { name: "crash", usage: "<div|int|page>", desc: "raise an exception (IDT smoke test)", run: cmd_crash },
+    Cmd { name: "crash", usage: "<div|int|page>", desc: "raise an exception (recovered by the handlers)", run: cmd_crash },
+    Cmd { name: "layout", usage: "[us|fr]", desc: "show or switch the keyboard layout", run: cmd_layout },
+    Cmd { name: "kbd", usage: "", desc: "keyboard / i8042 controller status", run: cmd_kbd },
+    Cmd { name: "uptime", usage: "", desc: "time since boot (PIT ticks)", run: cmd_uptime },
+    Cmd { name: "date", usage: "", desc: "RTC date and time", run: cmd_date },
+    Cmd { name: "meminfo", usage: "", desc: "PMM / heap statistics", run: cmd_meminfo },
     Cmd { name: "clear", usage: "", desc: "clear the screen", run: cmd_clear },
     Cmd { name: "reboot", usage: "", desc: "restart the machine", run: cmd_reboot },
     Cmd { name: "halt", usage: "", desc: "stop the machine", run: cmd_halt },
+    Cmd { name: "snake", usage: "", desc: "play Snake in the console", run: cmd_snake },
 ];
 
 pub fn run() -> ! {
@@ -467,26 +473,109 @@ fn cmd_out(args: &mut Args) {
 
 fn cmd_crash(args: &mut Args) {
     let Some(mode) = args.next() else { usage("crash"); return };
-    crate::kprintln!("crash: triggering a {} exception...", mode);
     match mode {
         "div" => {
-            // SAFETY: deliberate divide-by-zero (#DE).
+            crate::kprintln!("crash: divide by zero (recovered by the #DE handler)");
+            // SAFETY: deliberate divide-by-zero; the handler zeroes rax:rdx
+            // and skips the 3-byte `div rax` (48 f7 f0).
             unsafe { asm!("xor rax, rax\ndiv rax", out("rax") _, out("rdx") _) }
         }
         "int" => {
-            // SAFETY: deliberate breakpoint trap (#BP) through the current IDT.
+            crate::kprintln!("crash: int3 (recovered by the #BP handler)");
+            // SAFETY: deliberate breakpoint trap; the handler advances RIP.
             unsafe { asm!("int3") }
         }
         "page" => {
-            // SAFETY: deliberate read of a page nothing should map (#PF).
-            let _ = unsafe { (0x0000_5000_0000_0000u64 as *const u64).read_volatile() };
+            crate::kprintln!("crash: page fault (recovered by the #PF handler)");
+            // SAFETY: deliberate read of the magic test page; the handler
+            // maps it and the instruction re-executes.
+            let v = unsafe { (crate::vmm::CRASH_TEST_ADDR as *const u64).read_volatile() };
+            crate::kprintln!("crash: survived, the page reads {:#x}", v);
         }
         _ => {
-            crate::kprintln!("crash: unknown mode '{}'", mode);
+            crate::kprintln!("crash: unknown mode '{}' (use div, int or page)", mode);
             return;
         }
     }
     crate::kprintln!("crash: survived -- the handler returned cleanly");
+}
+
+fn cmd_layout(args: &mut Args) {
+    match args.next() {
+        None => {
+            crate::kprintln!("layout: {} (layouts: us, fr)", crate::kbd::layout_name());
+            crate::kprintln!("  fr: AltGr+8 = backslash, AltGr+9 = ^, AltGr+0 = @");
+            crate::kprintln!("  us: the key next to ] prints the backslash");
+        }
+        Some(l) => {
+            if crate::kbd::set_layout(l) {
+                crate::kprintln!("layout: switched to {}", l);
+            } else {
+                crate::kprintln!("layout: unknown layout '{}' (use us or fr)", l);
+            }
+        }
+    }
+}
+
+fn cmd_kbd(_args: &mut Args) {
+    let (shift, ctrl, alt, altgr, caps) = crate::kbd::modifiers();
+    let st = crate::io::IrqGuard::new();
+    let _ = st;
+    crate::kprintln!("keyboard : {}", crate::kbd::layout_name());
+    crate::kprintln!("modifiers: shift={} ctrl={} alt={} altgr={} caps={}",
+        yn(shift), yn(ctrl), yn(alt), yn(altgr), yn(caps));
+    // SAFETY: raw status port read.
+    let status = unsafe { crate::io::inb(0x64) };
+    crate::kprintln!("i8042    : status {:#04x} (obf={} ibf={} aux={} sys={})",
+        status, yn(status & 1 != 0), yn(status & 2 != 0), yn(status & 0x20 != 0), yn(status & 4 != 0));
+    let counts = [
+        crate::int::IRQ_COUNTS[0].load(core::sync::atomic::Ordering::Relaxed),
+        crate::int::IRQ_COUNTS[1].load(core::sync::atomic::Ordering::Relaxed),
+        crate::int::IRQ_COUNTS[4].load(core::sync::atomic::Ordering::Relaxed),
+    ];
+    crate::kprintln!("irqs     : timer={} kbd={} com1={} (masked: {:#04x})",
+        counts[0], counts[1], counts[2], crate::pic::mask_state());
+    crate::kprintln!("tip      : 'layout fr' if your keyboard is AZERTY");
+}
+
+fn yn(b: bool) -> &'static str {
+    if b { "yes" } else { "no" }
+}
+
+fn cmd_uptime(_args: &mut Args) {
+    let ms = crate::pit::uptime_ms();
+    crate::kprintln!("uptime   : {}.{:03} s ({} ticks at {} Hz)",
+        ms / 1000, ms % 1000, crate::pit::ticks(), crate::pit::HZ);
+}
+
+fn cmd_date(_args: &mut Args) {
+    match crate::rtc::read() {
+        Some(dt) => crate::kprintln!(
+            "rtc      : {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            dt.year, dt.month, dt.day, dt.hour, dt.min, dt.sec
+        ),
+        None => crate::kprintln!("rtc      : not available"),
+    }
+}
+
+fn cmd_meminfo(_args: &mut Args) {
+    let ps = crate::pmm::stats_snapshot();
+    let free = ps.free_pages.load(core::sync::atomic::Ordering::Relaxed);
+    crate::kprintln!("pmm      : {} pages total, {} free, {} used, {} allocated",
+        ps.total_pages,
+        free,
+        ps.total_pages - free,
+        crate::pmm::alloc_count()
+    );
+    crate::kprintln!("           managed {:#x}..{:#x} ({}/{} MiB)",
+        ps.base, ps.top, (ps.top - ps.base) >> 20, (ps.top - ps.base) >> 20);
+    crate::kprintln!("vmm      : {} pages mapped, direct map {:#x}",
+        crate::vmm::pages_mapped(), crate::vmm::DIRECT_MAP_BASE);
+    let hs = crate::heap::stats();
+    crate::kprintln!("heap     : {} used / {} free, {} allocs, {} frees",
+        Size(hs.used), Size(hs.free), hs.allocs, hs.frees);
+    crate::kprintln!("           self-test: {}",
+        if crate::heap::self_test() { "ok" } else { "FAILED" });
 }
 
 fn cmd_clear(_args: &mut Args) {
@@ -499,6 +588,10 @@ fn cmd_reboot(_args: &mut Args) {
 
 fn cmd_halt(_args: &mut Args) {
     crate::halt();
+}
+
+fn cmd_snake(_args: &mut Args) {
+    crate::snake::run();
 }
 
 // ---------------------------------------------------------------- reboot

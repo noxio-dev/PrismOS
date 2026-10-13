@@ -175,6 +175,15 @@ void plat_reboot(void)
     for (;;) __asm__ volatile("hlt");
 }
 
+void plat_shutdown(void)
+{
+    efi_st->runtime_services->reset_system(2, 0, 0, NULL);
+
+    for (;;) {
+        __asm__ volatile("cli; hlt");
+    }
+}
+
 const char *plat_name(void) { return "uefi"; }
 
 /* ---- memory ------------------------------------------------------------------------ */

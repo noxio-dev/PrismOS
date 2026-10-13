@@ -48,6 +48,7 @@ static int l_getkey(lua_State *L)
 static int l_time(lua_State *L) { lua_pushinteger(L, (lua_Integer)plat_ms()); return 1; }
 static int l_delay(lua_State *L) { plat_sleep((unsigned)luaL_checkinteger(L, 1)); return 0; }
 static int l_reboot(lua_State *L) { (void)L; plat_reboot(); }
+static int l_shutdown(lua_State *L) { (void)L; plat_shutdown(); }
 
 /* ---- environment ---------------------------------------------------- */
 
@@ -208,12 +209,11 @@ static int l_memmap(lua_State *L)
 
 static const luaL_Reg loader_funcs[] = {
     { "write", l_write }, { "size", l_size }, { "getkey", l_getkey },
-    { "time", l_time }, { "delay", l_delay }, { "reboot", l_reboot },
-    { "getenv", l_getenv }, { "setenv", l_setenv }, { "unsetenv", l_unsetenv },
-    { "environ", l_environ },
+    { "time", l_time }, { "delay", l_delay },{ "reboot", l_reboot },
+    { "shutdown", l_shutdown }, { "getenv", l_getenv }, { "setenv", l_setenv },
+    { "unsetenv", l_unsetenv },{ "environ", l_environ },
     { "readfile", l_readfile }, { "stat", l_stat }, { "exists", l_exists },
-    { "readdir", l_readdir },
-    { "load_kernel", l_load_kernel }, { "load_module", l_load_module },
+    { "readdir", l_readdir },{ "load_kernel", l_load_kernel }, { "load_module", l_load_module },
     { "kernel", l_kernel }, { "boot", l_boot }, { "memmap", l_memmap },
     { NULL, NULL }
 };

@@ -58,6 +58,25 @@ local items = {
     { label = "Memory map", key = "4", run = memmap },
     { label = "Escape to loader prompt", key = "5", run = function() return "cli" end },
     { label = "Reboot", key = "6", run = function() loader.reboot() end },
+    {
+        label = "Shutdown",
+        key = "7",
+        run = function()
+            out(sgr("0") .. ESC .. "2J" .. ESC .. "H")
+            out(sgr("1;37") .. "Shutting down PrismOS..." .. sgr("0") .. "\n")
+
+            if loader.shutdown then
+                loader.shutdown()
+                out("\nShutdown failed or returned.\n")
+            else
+                out("\nShutdown is not supported by this bootloader.\n")
+            end
+
+            out("Press any key to return to the menu.")
+            loader.getkey()
+            return "redraw"
+        end
+    },
 }
 
 local function label(item)

@@ -60,7 +60,9 @@ pub fn init(bi: Option<&BootInfo>) {
 
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
-    // SAFETY: single CPU, no interrupts enabled yet, so no reentrancy.
+    // Keep IRQ-context prints from interleaving with task-context ones.
+    let _guard = crate::io::IrqGuard::new();
+    // SAFETY: single CPU; the guard serializes output paths.
     let c = unsafe { &mut *addr_of_mut!(CONSOLE) };
     let _ = c.write_fmt(args);
 }
