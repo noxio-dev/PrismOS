@@ -60,6 +60,20 @@ impl Ring {
         // Overrun: drop the byte rather than tear the queue.
     }
 
+    /// Queue a character as UTF-8 (all or nothing, so a full ring never
+    /// leaves half a sequence behind).
+    fn push_char(&mut self, c: char) {
+        let mut tmp = [0u8; 4];
+        let bytes = c.encode_utf8(&mut tmp).as_bytes();
+        let used = self.head.load(Ordering::Relaxed).wrapping_sub(self.tail.load(Ordering::Acquire));
+        if used as usize + bytes.len() > self.buf.len() {
+            return;
+        }
+        for &b in bytes {
+            self.push(b);
+        }
+    }
+
     fn pop(&mut self) -> Option<u8> {
         let t = self.tail.load(Ordering::Relaxed);
         let h = self.head.load(Ordering::Acquire);
@@ -75,16 +89,17 @@ impl Ring {
 // ------------------------------------------------------------------ layout
 
 /// One keyboard layout: unshifted / shifted / AltGr tables indexed by
-/// set-1 scancode.  Accented characters use the CP437 bytes the VGA text
-/// console displays natively.
+/// set-1 scancode, holding Unicode characters ('\0' = no character).  The
+/// decoder queues them as UTF-8, so accents, the euro sign and friends
+/// reach the console intact.
 pub struct Layout {
     pub name: &'static str,
-    pub plain: [u8; 128],
-    pub shift: [u8; 128],
-    pub altgr: [u8; 128],
+    pub plain: [char; 128],
+    pub shift: [char; 128],
+    pub altgr: [char; 128],
 }
 
-const fn fill(dst: &mut [u8; 128], start: u8, s: &[u8]) {
+const fn fill(dst: &mut [char; 128], start: u8, s: &[char]) {
     let mut i = 0;
     while i < s.len() {
         dst[start as usize + i] = s[i];
@@ -92,87 +107,84 @@ const fn fill(dst: &mut [u8; 128], start: u8, s: &[u8]) {
     }
 }
 
-const US_PLAIN: [u8; 128] = {
-    let mut t = [0u8; 128];
-    t[0x01] = b'\x1b';
-    fill(&mut t, 0x02, b"1234567890-=");
-    t[0x0E] = b'\x7f';
-    t[0x0F] = b'\t';
-    fill(&mut t, 0x10, b"qwertyuiop[]");
-    t[0x1C] = b'\n';
-    fill(&mut t, 0x1E, b"asdfghjkl;'"); // .. through 0x28
-    t[0x29] = b'`';
-    t[0x2B] = b'\\';
-    fill(&mut t, 0x2C, b"zxcvbnm,./");
-    t[0x39] = b' ';
-    fill(&mut t, 0x47, b"789-456+1230."); // keypad
+/// Keys every layout shares: Esc, Backspace, Tab, Enter, Space, keypad.
+const fn common(t: &mut [char; 128]) {
+    t[0x01] = '\x1b';
+    t[0x0E] = '\x7f';
+    t[0x0F] = '\t';
+    t[0x1C] = '\n';
+    t[0x39] = ' ';
+}
+
+const fn keypad(t: &mut [char; 128]) {
+    fill(t, 0x47, &['7', '8', '9', '-', '4', '5', '6', '+', '1', '2', '3', '0', '.']);
+}
+
+const US_PLAIN: [char; 128] = {
+    let mut t = ['\0'; 128];
+    common(&mut t);
+    fill(&mut t, 0x02, &['1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=']);
+    fill(&mut t, 0x10, &['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']']);
+    fill(&mut t, 0x1E, &['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'']);
+    t[0x29] = '`';
+    t[0x2B] = '\\';
+    fill(&mut t, 0x2C, &['z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/']);
+    t[0x56] = '\\'; // ISO key next to left shift
+    keypad(&mut t);
     t
 };
 
-const US_SHIFT: [u8; 128] = {
-    let mut t = [0u8; 128];
-    t[0x01] = b'\x1b';
-    fill(&mut t, 0x02, b"!@#$%^&*()_+");
-    t[0x0E] = b'\x7f';
-    t[0x0F] = b'\t';
-    fill(&mut t, 0x10, b"QWERTYUIOP{}");
-    t[0x1C] = b'\n';
-    fill(&mut t, 0x1E, b"ASDFGHJKL:\""); // .. through 0x28
-    t[0x29] = b'~';
-    t[0x2B] = b'|';
-    fill(&mut t, 0x2C, b"ZXCVBNM<>?");
-    t[0x39] = b' ';
+const US_SHIFT: [char; 128] = {
+    let mut t = ['\0'; 128];
+    common(&mut t);
+    fill(&mut t, 0x02, &['!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+']);
+    fill(&mut t, 0x10, &['Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}']);
+    fill(&mut t, 0x1E, &['A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"']);
+    t[0x29] = '~';
+    t[0x2B] = '|';
+    fill(&mut t, 0x2C, &['Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?']);
+    t[0x56] = '|';
     t
 };
 
-const US_ALTGR: [u8; 128] = [0u8; 128];
+const US_ALTGR: [char; 128] = ['\0'; 128];
 
 /// French AZERTY (the standard Windows FR layout).  AltGr layer:
 ///   é~ " # ' { ( [ - | è` _ \ ç^ à@ ) ] = }
-/// so **AltGr+8 is the backslash** (and AltGr+9 = ^, AltGr+0 = @).
-/// Accents are CP437 codes (rendered correctly on the VGA console).
-const FR_PLAIN: [u8; 128] = {
-    let mut t = [0u8; 128];
-    t[0x01] = b'\x1b';
-    //      &   é   "   '   (   -   è   _   ç   à   )   =
-    fill(&mut t, 0x02, b"&\x82\"'(-\x8a_\x87\x85)=");
-    t[0x0E] = b'\x7f';
-    t[0x0F] = b'\t';
-    //      a   z   e   r   t   y   u   i   o   p   ^   $
-    fill(&mut t, 0x10, b"azertyuiop^$");
-    t[0x1C] = b'\n';
-    //      q   s   d   f   g   h   j   k   l   m   ù
-    fill(&mut t, 0x1E, b"qsdfghjklm\x97");
-    t[0x29] = b'\xFD'; // ²
-    t[0x2B] = b'*';
-    //      w   x   c   v   b   n   ,   ;   :   !
-    fill(&mut t, 0x2C, b"wxcvbnm,;:!");
-    t[0x39] = b' ';
-    fill(&mut t, 0x47, b"789-456+1230."); // keypad
-    t[0x56] = b'<'; // ISO key next to left shift
+/// so **AltGr+8 is the backslash** (and AltGr+9 = ^, AltGr+0 = @), AltGr+E
+/// is the euro sign.  ^ and ¨ are typed as plain characters (no dead keys).
+const FR_PLAIN: [char; 128] = {
+    let mut t = ['\0'; 128];
+    common(&mut t);
+    t[0x29] = '²';
+    fill(&mut t, 0x02, &['&', 'é', '"', '\'', '(', '-', 'è', '_', 'ç', 'à', ')', '=']);
+    fill(&mut t, 0x10, &['a', 'z', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '^', '$']);
+    fill(&mut t, 0x1E, &['q', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'm', 'ù']);
+    t[0x2B] = '*';
+    fill(&mut t, 0x2C, &['w', 'x', 'c', 'v', 'b', 'n', ',', ';', ':', '!']);
+    t[0x56] = '<';
+    keypad(&mut t);
     t
 };
 
-const FR_SHIFT: [u8; 128] = {
-    let mut t = [0u8; 128];
-    t[0x01] = b'\x1b';
-    fill(&mut t, 0x02, b"1234567890\xF8+"); // °
-    t[0x0E] = b'\x7f';
-    t[0x0F] = b'\t';
-    fill(&mut t, 0x10, b"AZERTYUIOP\xA8\x9C"); // ¨ £
-    t[0x1C] = b'\n';
-    fill(&mut t, 0x1E, b"QSDFGHJKLM%");
-    t[0x2B] = b'\xE6'; // µ
-    fill(&mut t, 0x2C, b"WXCVBNM?./");
-    t[0x39] = b' ';
-    t[0x56] = b'>';
+const FR_SHIFT: [char; 128] = {
+    let mut t = ['\0'; 128];
+    common(&mut t);
+    fill(&mut t, 0x02, &['1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '°', '+']);
+    fill(&mut t, 0x10, &['A', 'Z', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '¨', '£']);
+    fill(&mut t, 0x1E, &['Q', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 'M', '%']);
+    t[0x2B] = 'µ';
+    fill(&mut t, 0x2C, &['W', 'X', 'C', 'V', 'B', 'N', '?', '.', '/', '§']);
+    t[0x56] = '>';
     t
 };
 
-const FR_ALTGR: [u8; 128] = {
-    let mut t = [0u8; 128];
+const FR_ALTGR: [char; 128] = {
+    let mut t = ['\0'; 128];
     // 0x03..0x0D: the AltGr layer of the digit row.
-    fill(&mut t, 0x03, b"~#{[|`\\^@]}");
+    fill(&mut t, 0x03, &['~', '#', '{', '[', '|', '`', '\\', '^', '@', ']', '}']);
+    t[0x12] = '€';
+    t[0x1B] = '¤';
     t
 };
 
@@ -218,7 +230,7 @@ fn current_layout() -> &'static Layout {
 const SET2_TO_SET1: [u8; 128] = {
     let mut t = [0u8; 128];
     t[0x0E] = 0x29; // grave
-    t[0x0F] = 0x0F; // tab
+    t[0x0D] = 0x0F; // tab
     t[0x11] = 0x38; // left alt
     t[0x12] = 0x2A; // left shift
     t[0x14] = 0x1D; // left ctrl
@@ -263,6 +275,8 @@ const SET2_TO_SET1: [u8; 128] = {
     t[0x4B] = 0x26; // l
     t[0x4C] = 0x27; // semicolon
     t[0x4D] = 0x19; // p
+    t[0x4E] = 0x0C; // minus
+    t[0x61] = 0x56; // ISO key next to left shift (<> / backslash)
     t[0x52] = 0x28; // apostrophe
     t[0x54] = 0x1A; // [
     t[0x55] = 0x0D; // =
@@ -347,7 +361,7 @@ impl Kbd {
     }
 
     /// Translate one raw controller byte into an optional character.
-    fn feed(&mut self, raw: u8) -> Option<u8> {
+    fn feed(&mut self, raw: u8) -> Option<char> {
         // The extended-key prefix is the same in both sets.
         if raw == 0xE0 {
             self.ext = true;
@@ -376,8 +390,8 @@ impl Kbd {
             match sc {
                 0x1D => self.ctrl_r = !release, // right ctrl
                 0x38 => self.altgr = !release, // right alt = AltGr
-                0x1C if !release => return Some(b'\n'), // keypad enter
-                0x35 if !release => return Some(b'/'),  // keypad slash
+                0x1C if !release => return Some('\n'), // keypad enter
+                0x35 if !release => return Some('/'),  // keypad slash
                 _ => {}
             }
             return None; // arrows, insert, delete, releases: not needed yet
@@ -421,15 +435,17 @@ impl Kbd {
         } else {
             layout.plain[sc as usize]
         };
-        if c == 0 {
+        if c == '\0' {
             return None;
         }
-        if self.caps && c.is_ascii_alphabetic() {
-            c = if shifted { c.to_ascii_lowercase() } else { c.to_ascii_uppercase() };
+        if self.caps && c.is_alphabetic() && !self.altgr {
+            // Caps Lock flips the case of letters (é -> É as well).
+            let flipped = if shifted { c.to_lowercase().next() } else { c.to_uppercase().next() };
+            c = flipped.unwrap_or(c);
         }
         // Ctrl+letter -> matching control character (Ctrl-C, Ctrl-U...).
         if (self.ctrl_l || self.ctrl_r) && c.is_ascii_alphabetic() {
-            return Some(c.to_ascii_lowercase() & 0x1F);
+            return Some((c.to_ascii_lowercase() as u8 & 0x1F) as char);
         }
         Some(c)
     }
@@ -644,7 +660,7 @@ pub fn on_irq() {
         let kbd = unsafe { &mut *addr_of_mut!(KBD) };
         let queue = unsafe { &mut *addr_of_mut!(QUEUE) };
         if let Some(c) = kbd.feed(b) {
-            queue.push(c);
+            queue.push_char(c);
         }
     }
 }
@@ -669,7 +685,7 @@ pub fn poll() -> bool {
     let kbd = unsafe { &mut *addr_of_mut!(KBD) };
     let queue = unsafe { &mut *addr_of_mut!(QUEUE) };
     if let Some(c) = kbd.feed(b) {
-        queue.push(c);
+        queue.push_char(c);
     }
     true
 }

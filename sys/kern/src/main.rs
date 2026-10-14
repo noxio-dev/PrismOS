@@ -21,7 +21,6 @@ mod boot;
 mod console;
 mod cpu;
 mod fb;
-mod font;
 mod heap;
 mod int;
 mod io;
@@ -35,6 +34,7 @@ mod serial;
 mod sh;
 mod vga;
 mod vm;
+mod unifont;
 mod vmm;
 mod snake;
 
@@ -156,7 +156,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     if heap::init() {
         kprintln!(
             "heap     : {} KiB at {:#x} (16-byte blocks, free-list)",
-            vmm::HEAP_SIZE >> 10,
+            heap::size() >> 10,
             vmm::HEAP_BASE
         );
     } else {

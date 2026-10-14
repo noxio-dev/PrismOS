@@ -61,6 +61,7 @@ const COMMANDS: &[Cmd] = &[
     Cmd { name: "clear", usage: "", desc: "clear the screen", run: cmd_clear },
     Cmd { name: "reboot", usage: "", desc: "restart the machine", run: cmd_reboot },
     Cmd { name: "halt", usage: "", desc: "stop the machine", run: cmd_halt },
+    Cmd { name: "unicode", usage: "", desc: "print a Unicode test page", run: cmd_unicode },
     Cmd { name: "snake", usage: "", desc: "play Snake in the console", run: cmd_snake },
 ];
 
@@ -572,8 +573,8 @@ fn cmd_meminfo(_args: &mut Args) {
     crate::kprintln!("vmm      : {} pages mapped, direct map {:#x}",
         crate::vmm::pages_mapped(), crate::vmm::DIRECT_MAP_BASE);
     let hs = crate::heap::stats();
-    crate::kprintln!("heap     : {} used / {} free, {} allocs, {} frees",
-        Size(hs.used), Size(hs.free), hs.allocs, hs.frees);
+    crate::kprintln!("heap     : {} used / {} free, {} allocs, {} frees, {} free block(s)",
+        Size(hs.used), Size(hs.free), hs.allocs, hs.frees, hs.free_blocks);
     crate::kprintln!("           self-test: {}",
         if crate::heap::self_test() { "ok" } else { "FAILED" });
 }
@@ -588,6 +589,20 @@ fn cmd_reboot(_args: &mut Args) {
 
 fn cmd_halt(_args: &mut Args) {
     crate::halt();
+}
+
+fn cmd_unicode(_args: &mut Args) {
+    crate::kprintln!("ASCII    : The quick brown fox \\ | / ~ ` ^ jumps over 0123456789");
+    crate::kprintln!("Latin    : Ça va ? Très bien, merci — œuvre, naïve, Straße, ÿ, Ł, ß, €, £, ¥");
+    crate::kprintln!("Greek    : Α Β Γ Δ α β γ δ ω   ελληνικά");
+    crate::kprintln!("Cyrillic : Привет, мир!  Ж ж Щ щ");
+    crate::kprintln!("Hebrew   : שלום   Arabic: مرحبا");
+    crate::kprintln!("Devanagari: नमस्ते   Thai: สวัสดี");
+    crate::kprintln!("CJK      : 你好，世界  こんにちは  안녕하세요");
+    crate::kprintln!("Symbols  : ← ↑ → ↓ ∑ ∞ ≠ ≤ ≥ √ π ∂ ∫ ★ ☺ ♥ ♪ ✓ ✗");
+    crate::kprintln!("Boxes    : ┌─┬─┐ │ ╔═╗ ░▒▓█ ▀▄ ┘");
+    crate::kprintln!("Emoji    : 😀 🚀 🐧 🦀");
+    crate::kprintln!("Combining: e\u{301} a\u{300} o\u{302} n\u{303}  (e + accent marks)");
 }
 
 fn cmd_snake(_args: &mut Args) {

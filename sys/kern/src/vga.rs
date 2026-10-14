@@ -49,14 +49,26 @@ impl Vga {
         }
     }
 
-    pub fn put(&mut self, b: u8) {
-        match b {
-            b'\n' => self.newline(),
-            b'\r' => self.x = 0,
-            _ => {
-                let c = if (0x20..0x7F).contains(&b) { b } else { b'?' };
+    /// Print one character.  The VGA text hardware only has the 256 glyphs of
+    /// code page 437, so characters outside it show as '?' (the framebuffer
+    /// console, used on UEFI, draws all of Unicode).
+    pub fn put_char(&mut self, ch: char) {
+        match ch {
+            '\n' => self.newline(),
+            '\r' => self.x = 0,
+            '\x08' => self.x = self.x.saturating_sub(1),
+            '\t' => {
+                let next = (self.x / 8 + 1) * 8;
+                while self.x < next.min(COLS) {
+                    self.put_char(' ');
+                }
+            }
+            c if (c as u32) < 0x20 || c == '\u{7F}' => {}
+            c if crate::unifont::width(c) == 0 => {} // combining marks: not representable
+            c => {
+                let b = to_cp437(c).unwrap_or(b'?');
                 // SAFETY: x < COLS and y < ROWS are maintained by newline().
-                unsafe { write_volatile(BASE.add(self.y * COLS + self.x), ATTR | c as u16) };
+                unsafe { write_volatile(BASE.add(self.y * COLS + self.x), ATTR | b as u16) };
                 self.x += 1;
                 if self.x >= COLS {
                     self.newline();
@@ -76,4 +88,24 @@ impl Vga {
             core::arch::asm!("out dx, al", in("dx") 0x3D5u16, in("al") (pos >> 8) as u8, options(nomem, nostack));
         }
     }
+}
+
+/// Code page 437, bytes 0x80..=0xFF.
+const CP437_HIGH: [char; 128] = [
+    'Ç', 'ü', 'é', 'â', 'ä', 'à', 'å', 'ç', 'ê', 'ë', 'è', 'ï', 'î', 'ì', 'Ä', 'Å',
+    'É', 'æ', 'Æ', 'ô', 'ö', 'ò', 'û', 'ù', 'ÿ', 'Ö', 'Ü', '¢', '£', '¥', '₧', 'ƒ',
+    'á', 'í', 'ó', 'ú', 'ñ', 'Ñ', 'ª', 'º', '¿', '⌐', '¬', '½', '¼', '¡', '«', '»',
+    '░', '▒', '▓', '│', '┤', '╡', '╢', '╖', '╕', '╣', '║', '╗', '╝', '╜', '╛', '┐',
+    '└', '┴', '┬', '├', '─', '┼', '╞', '╟', '╚', '╔', '╩', '╦', '╠', '═', '╬', '╧',
+    '╨', '╤', '╥', '╙', '╘', '╒', '╓', '╫', '╪', '┘', '┌', '█', '▄', '▌', '▐', '▀',
+    'α', 'ß', 'Γ', 'π', 'Σ', 'σ', 'µ', 'τ', 'Φ', 'Θ', 'Ω', 'δ', '∞', 'φ', 'ε', '∩',
+    '≡', '±', '≥', '≤', '⌠', '⌡', '÷', '≈', '°', '∙', '·', '√', 'ⁿ', '²', '■', '\u{A0}',
+];
+
+/// The code page 437 byte that displays as `c` on VGA text hardware.
+fn to_cp437(c: char) -> Option<u8> {
+    if (' '..='~').contains(&c) {
+        return Some(c as u8);
+    }
+    CP437_HIGH.iter().position(|&x| x == c).map(|i| 0x80 + i as u8)
 }

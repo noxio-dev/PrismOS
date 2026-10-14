@@ -439,25 +439,21 @@ pub fn init(bi: &BootInfo) -> bool {
     ok
 }
 
-/// Map the kernel heap region with 4 KiB pages (called by heap::init).
-pub fn map_heap() -> bool {
-    let mut ok = true;
+/// Map up to `size` bytes of the heap region with 4 KiB pages (called by
+/// heap::init).  Stops at the first page the PMM cannot supply and returns
+/// the number of bytes actually mapped, contiguous from HEAP_BASE.
+pub fn map_heap(size: u64) -> u64 {
+    let end = HEAP_BASE + (size.min(HEAP_SIZE) & !(PAGE - 1));
     let mut v = HEAP_BASE;
-    while v < HEAP_BASE + HEAP_SIZE {
-        match crate::pmm::alloc_page() {
-            Some(phys) => {
-                if !map_4k(v, phys, RW | NX) && translate(v).is_none() {
-                    ok = false;
-                }
-            }
-            None => {
-                ok = false;
-                break;
-            }
+    while v < end {
+        let Some(phys) = crate::pmm::alloc_page() else { break };
+        if !map_4k(v, phys, RW | NX) {
+            crate::pmm::free_page(phys);
+            break;
         }
         v += PAGE;
     }
-    ok
+    v - HEAP_BASE
 }
 
 #[allow(dead_code)]

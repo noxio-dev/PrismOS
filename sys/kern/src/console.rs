@@ -20,16 +20,20 @@ static mut CONSOLE: Console = Console { vga: None, fb: None };
 
 impl fmt::Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        for b in s.bytes() {
-            if b == b'\n' {
+        for ch in s.chars() {
+            if ch == '\n' {
                 serial::write_byte(b'\r');
             }
-            serial::write_byte(b);
+            // The serial line carries UTF-8 as is.
+            let mut buf = [0u8; 4];
+            for &b in ch.encode_utf8(&mut buf).as_bytes() {
+                serial::write_byte(b);
+            }
             if let Some(v) = self.vga.as_mut() {
-                v.put(b);
+                v.put_char(ch);
             }
             if let Some(f) = self.fb.as_mut() {
-                f.put(b);
+                f.put_char(ch);
             }
         }
         Ok(())
@@ -65,6 +69,19 @@ pub fn _print(args: fmt::Arguments) {
     // SAFETY: single CPU; the guard serializes output paths.
     let c = unsafe { &mut *addr_of_mut!(CONSOLE) };
     let _ = c.write_fmt(args);
+}
+
+/// Cells `c` occupies on screen (0, 1 or 2).  VGA text mode always uses 1.
+pub fn char_width(c: char) -> usize {
+    // SAFETY: read-only access to the console configuration.
+    let con = unsafe { &*addr_of_mut!(CONSOLE) };
+    if con.fb.is_some() {
+        crate::unifont::width(c)
+    } else if (c as u32) < 0x20 || c == '\u{7F}' || crate::unifont::width(c) == 0 {
+        0
+    } else {
+        1
+    }
 }
 
 /// Clear every active console.

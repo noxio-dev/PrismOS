@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Linear framebuffer text console (UEFI GOP), 8x8 font drawn at 2x.
+// Linear framebuffer text console (UEFI GOP).  Text is Unicode: glyphs come
+// from GNU Unifont (unifont.rs), 8x16 pixels per cell and 16x16 for wide
+// characters, scaled by an integer factor chosen from the screen size so
+// that at least 80x25 cells always fit.
 
 use crate::boot::Framebuffer;
-use crate::font::FONT8X8;
-
-const SCALE: usize = 2;
-const CELL: usize = 8 * SCALE; // cell width in pixels
-const CELL_H: usize = CELL + 4; // cell height: glyph plus 2 px of leading above and below
+use crate::unifont;
 
 pub struct FbConsole {
     fb: Framebuffer,
+    scale: usize,
+    cell_w: usize,
+    cell_h: usize,
     cols: usize,
     rows: usize,
     x: usize,
@@ -27,18 +29,25 @@ fn mask(shift: u8, bits: u8) -> u32 {
 }
 
 impl FbConsole {
-    /// Returns `None` for framebuffers we cannot draw on (not 32 bpp).
+    /// Returns `None` for framebuffers we cannot draw on (not 32 bpp, or too
+    /// small for a single cell).
     pub fn new(fb: Framebuffer) -> Option<Self> {
-        if fb.addr == 0 || fb.bpp != 32 || fb.width < CELL as u32 || fb.height < CELL_H as u32 {
+        if fb.addr == 0 || fb.bpp != 32 || fb.width < 8 || fb.height < 16 {
             return None;
         }
         let fg = mask(fb.red_shift, fb.red_bits)
             | mask(fb.green_shift, fb.green_bits)
             | mask(fb.blue_shift, fb.blue_bits);
+        // Largest integer scale that still gives an 80x25 grid.
+        let scale = (fb.width as usize / (80 * 8)).min(fb.height as usize / (25 * 16)).max(1);
+        let (cell_w, cell_h) = (8 * scale, unifont::CELL_H * scale);
         let mut c = FbConsole {
-            cols: fb.width as usize / CELL,
-            rows: fb.height as usize / CELL_H,
+            cols: fb.width as usize / cell_w,
+            rows: fb.height as usize / cell_h,
             fb,
+            scale,
+            cell_w,
+            cell_h,
             x: 0,
             y: 0,
             fg,
@@ -63,18 +72,29 @@ impl FbConsole {
         self.y = 0;
     }
 
-    fn draw(&self, c: u8, col: usize, row: usize) {
-        let glyph = &FONT8X8[(c & 0x7F) as usize];
-        for (gy, bits) in glyph.iter().enumerate() {
-            for gx in 0..8 {
-                let on = bits & (1 << gx) != 0;
+    /// Draw a glyph with its top-left corner at pixel (px, py).  With
+    /// `overlay` only the set pixels are painted (combining marks).
+    fn draw(&self, g: unifont::Glyph, px: isize, py: usize, overlay: bool) {
+        let gw = if g.wide { 16 } else { 8 };
+        let bytes = gw / 8;
+        let s = self.scale;
+        let (w, h) = (self.fb.width as isize, self.fb.height as usize);
+        for gy in 0..unifont::CELL_H {
+            for gx in 0..gw {
+                let on = g.rows[gy * bytes + gx / 8] & (0x80 >> (gx % 8)) != 0;
+                if overlay && !on {
+                    continue;
+                }
                 let color = if on { self.fg } else { self.bg };
-                for sy in 0..SCALE {
-                    for sx in 0..SCALE {
-                        let px = col * CELL + gx * SCALE + sx;
-                        let py = row * CELL_H + 2 + gy * SCALE + sy;
-                        // SAFETY: col < cols and row < rows keep us inside the screen.
-                        unsafe { self.pixel_ptr(px, py).write_volatile(color) };
+                for sy in 0..s {
+                    for sx in 0..s {
+                        let x = px + (gx * s + sx) as isize;
+                        let y = py + gy * s + sy;
+                        if x < 0 || x >= w || y >= h {
+                            continue;
+                        }
+                        // SAFETY: bounds checked against the framebuffer size.
+                        unsafe { self.pixel_ptr(x as usize, y).write_volatile(color) };
                     }
                 }
             }
@@ -84,19 +104,19 @@ impl FbConsole {
     fn scroll(&mut self) {
         let pitch = self.fb.pitch as usize;
         let base = self.fb.addr as usize;
-        let rows_px = self.rows * CELL_H;
-        for py in 0..rows_px - CELL_H {
+        let rows_px = self.rows * self.cell_h;
+        for py in 0..rows_px - self.cell_h {
             // SAFETY: copies one scan line inside the framebuffer; lines do not overlap.
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    (base + (py + CELL_H) * pitch) as *const u8,
+                    (base + (py + self.cell_h) * pitch) as *const u8,
                     (base + py * pitch) as *mut u8,
-                    self.cols * CELL * 4,
+                    self.cols * self.cell_w * 4,
                 );
             }
         }
-        for py in rows_px - CELL_H..rows_px {
-            for px in 0..self.cols * CELL {
+        for py in rows_px - self.cell_h..rows_px {
+            for px in 0..self.cols * self.cell_w {
                 // SAFETY: inside the framebuffer.
                 unsafe { self.pixel_ptr(px, py).write_volatile(self.bg) };
             }
@@ -112,18 +132,47 @@ impl FbConsole {
         }
     }
 
-    pub fn put(&mut self, b: u8) {
-        match b {
-            b'\n' => self.newline(),
-            b'\r' => self.x = 0,
-            _ => {
-                let c = if (0x20..0x7F).contains(&b) { b } else { b'?' };
-                self.draw(c, self.x, self.y);
-                self.x += 1;
-                if self.x >= self.cols {
-                    self.newline();
-                }
+    /// Print one character: control codes, zero-width marks, then glyphs.
+    pub fn put_char(&mut self, c: char) {
+        match c {
+            '\n' => return self.newline(),
+            '\r' => {
+                self.x = 0;
+                return;
             }
+            '\x08' => {
+                self.x = self.x.saturating_sub(1);
+                return;
+            }
+            '\t' => {
+                let next = (self.x / 8 + 1) * 8;
+                while self.x < next.min(self.cols) {
+                    self.put_char(' ');
+                }
+                return;
+            }
+            c if (c as u32) < 0x20 || c == '\u{7F}' => return,
+            _ => {}
+        }
+
+        // Zero advance: overlay on the previous glyph, `shift` pixels left of the pen.
+        if let Some(shift) = unifont::combining_shift(c) {
+            if let Some(g) = unifont::glyph(c) {
+                let pen = (self.x * self.cell_w) as isize;
+                self.draw(g, pen - (shift as usize * self.scale) as isize, self.y * self.cell_h, true);
+            }
+            return;
+        }
+
+        let Some(g) = unifont::glyph_or_fallback(c) else { return };
+        let cells = if g.wide { 2 } else { 1 };
+        if self.x + cells > self.cols {
+            self.newline();
+        }
+        self.draw(g, (self.x * self.cell_w) as isize, self.y * self.cell_h, false);
+        self.x += cells;
+        if self.x >= self.cols {
+            self.newline();
         }
     }
 }
