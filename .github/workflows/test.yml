@@ -16,7 +16,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             clang lld gcc binutils make python3 \
-            mkfs.fat mtools xorriso \
+            mtools xorriso \
             qemu-system-x86 ovmf
 
       - name: Install Rust target
