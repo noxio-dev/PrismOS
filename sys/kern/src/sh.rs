@@ -58,6 +58,10 @@ const COMMANDS: &[Cmd] = &[
     Cmd { name: "uptime", usage: "", desc: "time since boot (PIT ticks)", run: cmd_uptime },
     Cmd { name: "date", usage: "", desc: "RTC date and time", run: cmd_date },
     Cmd { name: "meminfo", usage: "", desc: "PMM / heap statistics", run: cmd_meminfo },
+    Cmd { name: "acpi", usage: "", desc: "ACPI tables, CPUs, IOAPICs, HPET, APIC timer", run: cmd_acpi },
+    Cmd { name: "lspci", usage: "[-v]", desc: "list PCI devices (-v: BARs)", run: cmd_lspci },
+    Cmd { name: "ahci", usage: "[read <disk> <lba> [n]]", desc: "AHCI controller / disks; read sectors", run: cmd_ahci },
+    Cmd { name: "heaptest", usage: "[n]", desc: "stress the heap with n objects (default 100000)", run: cmd_heaptest },
     Cmd { name: "clear", usage: "", desc: "clear the screen", run: cmd_clear },
     Cmd { name: "reboot", usage: "", desc: "restart the machine", run: cmd_reboot },
     Cmd { name: "halt", usage: "", desc: "stop the machine", run: cmd_halt },
@@ -321,6 +325,12 @@ fn cmd_regs(_args: &mut Args) {
     crate::kprintln!("cr4     {:#018x}", cr4);
     crate::kprintln!("rflags  {:#018x}", flags);
     crate::kprintln!("rsp     {:#018x}", rsp);
+    if crate::apic::enabled() {
+        crate::kprintln!("lapic id {} (version {:#x}, {})", crate::apic::lapic_id(),
+            crate::apic::lapic_version(), if crate::apic::is_x2apic() { "x2APIC" } else { "xAPIC" });
+    } else {
+        crate::kprintln!("lapic    : not in use (8259 mode)");
+    }
 }
 
 // ----------------------------------------------------------- raw memory
@@ -536,6 +546,8 @@ fn cmd_kbd(_args: &mut Args) {
     ];
     crate::kprintln!("irqs     : timer={} kbd={} com1={} (masked: {:#04x})",
         counts[0], counts[1], counts[2], crate::pic::mask_state());
+    crate::kprintln!("timer    : {} ticks, source {}", crate::pit::ticks(),
+        if crate::apic::enabled() { "LAPIC" } else { "PIT" });
     crate::kprintln!("tip      : 'layout fr' if your keyboard is AZERTY");
 }
 
@@ -573,10 +585,151 @@ fn cmd_meminfo(_args: &mut Args) {
     crate::kprintln!("vmm      : {} pages mapped, direct map {:#x}",
         crate::vmm::pages_mapped(), crate::vmm::DIRECT_MAP_BASE);
     let hs = crate::heap::stats();
-    crate::kprintln!("heap     : {} used / {} free, {} allocs, {} frees, {} free block(s)",
-        Size(hs.used), Size(hs.free), hs.allocs, hs.frees, hs.free_blocks);
+    crate::kprintln!("heap     : {} used / {} free of {}, {} allocs, {} frees, {} failed, {} bad frees",
+        Size(hs.used), Size(hs.free), Size(crate::heap::size()), hs.allocs, hs.frees, hs.failed, hs.bad_frees);
+    crate::kprint!("           buddy free blocks by order:");
+    for (o, n) in hs.orders.iter().enumerate() {
+        if *n != 0 {
+            crate::kprint!(" {}K x{}", 4u64 << o, n);
+        }
+    }
+    crate::kprintln!();
+    crate::kprintln!("           {:<14} {:>5} {:>6} {:>11} {:>9} {:>9}", "cache", "size", "slabs", "inuse/total", "allocs", "frees");
+    for i in 0..crate::heap::cache_slots() {
+        if let Some(c) = crate::heap::cache_info(i) {
+            crate::kprintln!("           {:<14} {:>5} {:>6} {:>5}/{:<5} {:>9} {:>9}",
+                c.name(), c.objsize, c.slabs, c.inuse, c.total, c.allocs, c.frees);
+        }
+    }
     crate::kprintln!("           self-test: {}",
         if crate::heap::self_test() { "ok" } else { "FAILED" });
+}
+
+fn cmd_heaptest(args: &mut Args) {
+    let n = args.next().and_then(parse_u64).unwrap_or(100_000) as usize;
+    let r = crate::heap::stress(n);
+    crate::kprintln!("heaptest : {} objects allocated/freed, {} alloc failures, {}",
+        r.objects, r.failed_allocs, if r.ok { "ok, no corruption" } else { "CORRUPTION DETECTED" });
+}
+
+fn cmd_acpi(_args: &mut Args) {
+    let Some(a) = crate::acpi::info() else {
+        crate::kprintln!("acpi     : no tables");
+        return;
+    };
+    crate::kprintln!("rsdp     : revision {}, oem \"{}\", root {}", a.rsdp_rev,
+        core::str::from_utf8(&a.oem).unwrap_or("?").trim(), if a.xsdt { "XSDT" } else { "RSDT" });
+    crate::kprint!("tables   :");
+    for t in &a.tables[..a.n_tables] {
+        crate::kprint!(" {}", core::str::from_utf8(t).unwrap_or("????"));
+    }
+    crate::kprintln!();
+    crate::kprintln!("madt     : lapic at {:#x}, pcat_compat={}", a.lapic_addr, yn(a.pcat_compat));
+    for c in &a.cpus[..a.n_cpus] {
+        crate::kprintln!("  cpu    : acpi id {} apic id {} {}", c.acpi_id, c.apic_id,
+            if c.enabled { "enabled" } else { "disabled" });
+    }
+    for io in &a.ioapics[..a.n_ioapics] {
+        crate::kprintln!("  ioapic : id {} at {:#x}, gsi base {}", io.id, io.addr, io.gsi_base);
+    }
+    for o in &a.overrides[..a.n_overrides] {
+        crate::kprintln!("  irq    : ISA {} -> GSI {} (flags {:#x})", o.irq, o.gsi, o.flags);
+    }
+    if a.fadt {
+        crate::kprintln!("fadt     : sci irq {}, pm timer port {:#x}, flags {:#x}", a.sci_irq, a.pm_timer_port, a.fadt_flags);
+    }
+    if a.hpet {
+        crate::kprintln!("hpet     : at {:#x}, min tick {}", a.hpet_addr, a.hpet_min_tick);
+    }
+    if crate::apic::enabled() {
+        crate::kprintln!("apic     : id {}, {} counts/ms (calibrated on {}), tick {} Hz",
+            crate::apic::lapic_id(), crate::apic::timer_per_ms(), crate::apic::calibration_source(), crate::pit::HZ);
+    }
+}
+
+fn cmd_lspci(args: &mut Args) {
+    let verbose = args.next() == Some("-v");
+    for d in crate::pci::devices() {
+        crate::kprintln!("{:02x}:{:02x}.{} {:04x}:{:04x}  {} [{:02x}{:02x}] ({}) irq {}",
+            d.bus, d.dev, d.func, d.vendor, d.device,
+            crate::pci::class_name(d.class, d.subclass), d.class, d.subclass,
+            crate::pci::vendor_name(d.vendor), d.irq_line);
+        if verbose {
+            crate::kprintln!("         progif {:#04x} rev {:#04x} cmd {:#06x}", d.progif, d.revision, d.read_command());
+            for i in 0..6 {
+                if let Some(b) = d.bar(i) {
+                    crate::kprintln!("         bar{} {} {:#x} size {:#x}{}", i, if b.io { "io " } else { "mem" },
+                        b.addr, b.size, if b.is64 { " (64-bit)" } else { "" });
+                }
+            }
+        }
+    }
+}
+
+fn cmd_ahci(args: &mut Args) {
+    use crate::blk::BlockDev;
+    match args.next() {
+        None => {
+            let Some(c) = crate::ahci::controller() else {
+                crate::kprintln!("ahci     : no controller");
+                return;
+            };
+            crate::kprintln!("ahci     : {:02x}:{:02x}.{}, AHCI {}.{}, {} port(s), {} slot(s), 64-bit DMA {}",
+                c.pci.0, c.pci.1, c.pci.2, c.version >> 16, (c.version >> 8) & 0xFF, c.ports, c.slots, yn(c.s64a));
+            for i in 0..crate::ahci::MAX_DISKS {
+                if let Some(d) = crate::ahci::disk(i) {
+                    crate::kprintln!("disk {}   : port {}, {} sectors ({}), \"{}\" serial {}",
+                        i, d.port(), d.sectors(), Size(d.sectors() * 512), d.model(), d.serial());
+                }
+            }
+        }
+        Some("read") => {
+            let (Some(di), Some(lba)) = (args.next(), args.next()) else { return usage("ahci") };
+            let (Some(di), Some(lba)) = (parse_u64(di), parse_u64(lba)) else {
+                return crate::kprintln!("ahci: bad number");
+            };
+            let count = args.next().and_then(parse_u64).unwrap_or(1).clamp(1, 8) as usize;
+            let Some(d) = crate::ahci::disk(di as usize) else {
+                return crate::kprintln!("ahci: no disk {}", di);
+            };
+            let mut buf = [0u8; 8 * 512];
+            let buf = &mut buf[..count * 512];
+            match d.read(lba, buf) {
+                Ok(()) => hexdump(buf, lba * 512),
+                Err(e) => crate::kprintln!("ahci: read of sector {} failed: {:?}", lba, e),
+            }
+        }
+        Some(_) => usage("ahci"),
+    }
+}
+
+/// 16 bytes per line, hex + ASCII.  Repeated identical lines are folded.
+fn hexdump(buf: &[u8], base: u64) {
+    let mut prev: Option<&[u8]> = None;
+    let mut folded = false;
+    for (i, line) in buf.chunks(16).enumerate() {
+        if prev == Some(line) && i + 1 != (buf.len() + 15) / 16 {
+            if !folded {
+                crate::kprintln!("*");
+                folded = true;
+            }
+            continue;
+        }
+        folded = false;
+        prev = Some(line);
+        crate::kprint!("{:08x} ", base + (i * 16) as u64);
+        for j in 0..16 {
+            match line.get(j) {
+                Some(b) => crate::kprint!(" {:02x}", b),
+                None => crate::kprint!("   "),
+            }
+        }
+        crate::kprint!("  |");
+        for &b in line {
+            crate::kprint!("{}", if (0x20..0x7F).contains(&b) { b as char } else { '.' });
+        }
+        crate::kprintln!("|");
+    }
 }
 
 fn cmd_clear(_args: &mut Args) {
