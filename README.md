@@ -7,8 +7,8 @@ FreeBSD-style boot: a real **BIOS + UEFI bootloader** whose logic is written in
 ## Todo
 
 - [x] Phase 1.1 — heap (slab/buddy)
-- [ ] Phase 1.2 — ACPI/APIC (LAPIC + IOAPIC + 8259 masked)
-- [ ] Phase 1.3 — PCI/AHCI
+- [x] Phase 1.2 — ACPI/APIC (LAPIC + IOAPIC + 8259 masked)
+- [x] Phase 1.3 — PCI/AHCI
 - [ ] Phase 1.4 — VFS + ext4 R/W
 - [ ] Phase 2 — ring 3, syscalls, process, scheduler, ELF loader
 - [ ] Phase 3 — POSIX syscalls, newlib, BusyBox, shell userspace
