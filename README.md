@@ -2,7 +2,7 @@
 
 A small experimental x86-64 operating system, written from scratch.
 FreeBSD-style boot: a real **BIOS + UEFI bootloader** whose logic is written in
-**Lua**, loading a **Rust** kernel (for now we have a shell).
+**C/Lua**, loading a **Rust** kernel (for now we have a shell).
 
 ## Todo
 
