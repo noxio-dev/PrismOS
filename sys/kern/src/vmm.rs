@@ -467,6 +467,19 @@ pub fn phys_to_virt(phys: u64) -> u64 {
     DIRECT_MAP_BASE + phys
 }
 
+/// Kernel virtual address through which physical address `phys` can be
+/// accessed: the identity map below 4 GiB, the direct map above (RAM only).
+/// None when the address is not reachable.
+pub fn phys_access(phys: u64) -> Option<u64> {
+    if phys < (1 << 32) {
+        return Some(phys);
+    }
+    if READY.load(Ordering::Acquire) && phys < crate::pmm::stats_snapshot().top {
+        return Some(DIRECT_MAP_BASE + phys);
+    }
+    None
+}
+
 pub fn pages_mapped() -> u64 {
     // SAFETY: read-only counter.
     unsafe { PAGES_MAPPED }

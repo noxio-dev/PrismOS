@@ -192,13 +192,24 @@ pub fn init(bi: &BootInfo) -> Stats {
 /// Take one free physical page (4 KiB), zeroed.  Returns None when no page
 /// is left (or none reachable in the current boot phase).
 pub fn alloc_page() -> Option<u64> {
+    alloc_page_inner(false)
+}
+
+/// Like alloc_page(), but the page is guaranteed to sit below 4 GiB: for DMA
+/// engines that only handle 32-bit addresses (and reachable through the
+/// identity map).
+pub fn alloc_page_low() -> Option<u64> {
+    alloc_page_inner(true)
+}
+
+fn alloc_page_inner(force_low: bool) -> Option<u64> {
     let words = BITMAP_WORDS.load(Ordering::Relaxed);
     if words == 0 {
         return None;
     }
     let _guard = IrqGuard::new();
     // Before the CR3 switch only the first 4 GiB is reachable.
-    let limit = if LOW_ONLY.load(Ordering::Acquire) {
+    let limit = if force_low || LOW_ONLY.load(Ordering::Acquire) {
         words.min((FOUR_GIB / PAGE / 64) as usize)
     } else {
         words
@@ -238,7 +249,6 @@ fn zero_page(phys: u64) {
 
 /// Give a page back.  Pages the allocator does not own (outside the managed
 /// range, or already free) are ignored.
-#[allow(dead_code)] // page recycling comes with the slab/vfs work
 pub fn free_page(phys: u64) {
     if phys & (PAGE - 1) != 0 {
         return;
