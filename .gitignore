@@ -9,3 +9,5 @@ build/
 
 *.zip
 sys/kern/target/
+
+!sys/kern/data/unifont.bin
