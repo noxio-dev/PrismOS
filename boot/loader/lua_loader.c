@@ -14,7 +14,7 @@
 #include "platform.h"
 #include "fs.h"
 
-#define LOADER_VERSION "PrismOS loader 0.1.0"
+#define LOADER_VERSION "PrismOS loader"
 #define LOADER_SCRIPT  "/boot/lua/loader.lua"
 
 /* ---- console ------------------------------------------------------- */
