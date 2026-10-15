@@ -2,7 +2,20 @@
 
 A small experimental x86-64 operating system, written from scratch.
 FreeBSD-style boot: a real **BIOS + UEFI bootloader** whose logic is written in
-**Lua**, loading a **Rust** kernel (for now it only says hello).
+**Lua**, loading a **Rust** kernel (for now we have a shell).
+
+## Todo
+
+- [x] Phase 1.1 — heap (slab/buddy)
+- [ ] Phase 1.2 — ACPI/APIC (LAPIC + IOAPIC + 8259 masked)
+- [ ] Phase 1.3 — PCI/AHCI
+- [ ] Phase 1.4 — VFS + ext4 R/W
+- [ ] Phase 2 — ring 3, syscalls, process, scheduler, ELF loader
+- [ ] Phase 3 — POSIX syscalls, newlib, BusyBox, shell userspace
+- [ ] Phase 4 — cross-binutils + cross-gcc
+- [ ] Phase 5 — native gcc -> self-hosting bootstrap
+
+*`One day, perhaps, PrismOS will be self-hosted lol`*
 
 ## Boot chain
 
