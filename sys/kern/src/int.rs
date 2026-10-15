@@ -291,6 +291,10 @@ stub!(stub_mc, 18);
 stub!(stub_xm, 19);
 stub!(stub_ve, 20);
 
+// LAPIC timer and spurious vector (apic.rs).
+stub!(stub_apic_timer, 0x30);
+stub!(stub_spurious, 0xFF);
+
 // IRQ lines 0..15 after the 8259 remap.
 stub!(stub_irq0, 0x20);
 stub!(stub_irq1, 0x21);
@@ -394,13 +398,15 @@ extern "C" fn isr_handler(frame: &mut IsrFrame) {
             IRQ_COUNTS[irq as usize].fetch_add(1, Ordering::Relaxed);
             // Acknowledge the PIC first so the line can fire again while
             // the handler runs (classic EOI-first discipline).
-            crate::pic::eoi(irq);
+            crate::apic::eoi(irq);
             // SAFETY: IRQ table is written only at init with interrupts off.
             let table = unsafe { &*addr_of_mut!(IRQ_TABLE) };
             if let Some(h) = table[irq as usize] {
                 h(frame);
             }
         }
+        0x30 => crate::apic::on_timer(),
+        0xFF => {} // spurious: no EOI by definition
         _ => {
             crate::kprintln!("\nunexpected interrupt vector {}", v);
             dump_frame(frame);
@@ -511,6 +517,9 @@ pub fn idt_init() {
     set_gate(0x2D, stub_irq13, 0);
     set_gate(0x2E, stub_irq14, 0);
     set_gate(0x2F, stub_irq15, 0);
+
+    set_gate(0x30, stub_apic_timer, 0);
+    set_gate(0xFF, stub_spurious, 0);
 
     // SAFETY: building and loading our own table with interrupts disabled.
     unsafe {

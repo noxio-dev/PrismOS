@@ -9,7 +9,8 @@
 //
 // Bring-up order:
 //   console -> GDT/TSS -> IDT -> PIC (masked) -> PIT -> serial IRQ
-//   -> PMM -> VMM (own tables, CR3 switch) -> heap -> keyboard (i8042)
+//   -> PMM -> VMM (own tables, CR3 switch) -> heap -> ACPI -> APIC/IOAPIC
+//   (8259 off, LAPIC timer takes over from the PIT) -> keyboard (i8042)
 //   -> sti -> shell
 //
 // Every step logs one line so the boot output doubles as a bring-up check.
@@ -17,6 +18,12 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+mod acpi;
+mod ahci;
+mod apic;
+mod blk;
 mod boot;
 mod console;
 mod cpu;
@@ -26,6 +33,7 @@ mod int;
 mod io;
 mod kbd;
 mod line;
+mod pci;
 mod pic;
 mod pit;
 mod pmm;
@@ -121,7 +129,9 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // --- Device IRQs (registered now, unmasked at the end) ------------------
     serial::init();
     int::register_irq(pic::IRQ_COM1, |_f| serial::on_irq());
-    pic::unmask(pic::IRQ_COM1);
+    // Nothing is unmasked yet: whether the 8259 or the IOAPIC delivers these
+    // lines is decided after the ACPI/APIC probe (unmasking on the 8259 and
+    // then switching leaves a stale INTR request behind).
     kprintln!(
         "serial   : COM1 115200 8n1, rx on irq{}{}",
         pic::IRQ_COM1,
@@ -129,7 +139,6 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     );
 
     int::register_irq(pic::IRQ_TIMER, |_f| pit::on_tick());
-    pic::unmask(pic::IRQ_TIMER);
     int::register_irq(pic::IRQ_KBD, |_f| kbd::on_irq());
 
     // --- Memory management ----------------------------------------------------
@@ -155,12 +164,45 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     }
     if heap::init() {
         kprintln!(
-            "heap     : {} KiB at {:#x} (16-byte blocks, free-list)",
+            "heap     : {} KiB at {:#x} (buddy 4 KiB..4 MiB + slab 32..1024)",
             heap::size() >> 10,
             vmm::HEAP_BASE
         );
     } else {
         kprintln!("heap     : init failed (no memory for the region)");
+    }
+
+    // --- ACPI / APIC ------------------------------------------------------------
+    // Needs the direct map (tables above 4 GiB) so it comes after the VMM.
+    if acpi::init(bi) {
+        let a = acpi::info().unwrap();
+        kprintln!(
+            "acpi     : rev {} ({}), {} tables, {} cpu(s), {} ioapic(s), hpet {}",
+            a.rsdp_rev,
+            if a.xsdt { "XSDT" } else { "RSDT" },
+            a.n_tables,
+            a.n_cpus,
+            a.n_ioapics,
+            if a.hpet { "yes" } else { "no" }
+        );
+    } else {
+        kprintln!("acpi     : no usable tables (staying on the 8259)");
+    }
+    if apic::init() {
+        kprintln!(
+            "apic     : lapic id {} at {:#x} ({}), 8259 masked, timer {} Hz ({} counts/ms via {})",
+            apic::lapic_id(),
+            apic::lapic_phys(),
+            if apic::is_x2apic() { "x2APIC" } else { "xAPIC" },
+            pit::HZ,
+            apic::timer_per_ms(),
+            apic::calibration_source()
+        );
+        apic::unmask(pic::IRQ_COM1);
+    } else {
+        kprintln!("apic     : unavailable, timer stays on the PIT");
+        pic::unmask(pic::IRQ_TIMER);
+        pic::unmask(pic::IRQ_COM1);
     }
 
     // --- Keyboard ------------------------------------------------------------
@@ -179,7 +221,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         if !ks.acked {
             kprintln!("           keyboard did not ACK -- it may stay silent");
         }
-        pic::unmask(pic::IRQ_KBD);
+        irq_unmask(pic::IRQ_KBD);
     } else {
         kprintln!("kbd      : no PS/2 controller detected (USB-only machine?)");
         kprintln!("           console input stays on the serial line");
@@ -187,11 +229,52 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     // --- Lift off --------------------------------------------------------------
     int::sti();
-    kprintln!("interrupts enabled -- dropping to the shell");
+    kprintln!("interrupts enabled");
+
+    // --- PCI / storage (needs the system tick for command time-outs) ----------
+    kprintln!("pci      : {} function(s) on the bus", pci::init());
+    let ndisks = ahci::init();
+    match ahci::controller() {
+        Some(c) => kprintln!(
+            "ahci     : controller {:02x}:{:02x}.{} AHCI {}.{}, {} port(s), {} slot(s), {} disk(s)",
+            c.pci.0,
+            c.pci.1,
+            c.pci.2,
+            c.version >> 16,
+            (c.version >> 8) & 0xFF,
+            c.ports,
+            c.slots,
+            ndisks
+        ),
+        None => kprintln!("ahci     : no controller"),
+    }
+    for i in 0..ndisks {
+        if let Some(d) = ahci::disk(i) {
+            use blk::BlockDev;
+            kprintln!(
+                "           disk {} (port {}): {} MiB, \"{}\"",
+                i,
+                d.port(),
+                d.sectors() >> 11,
+                d.model()
+            );
+        }
+    }
+
+    kprintln!("dropping to the shell");
     kprintln!();
 
     sh::set_boot_info(Some(bi));
     sh::run()
+}
+
+/// Unmask an ISA IRQ on whichever controller is in charge.
+fn irq_unmask(irq: u8) {
+    if apic::enabled() {
+        apic::unmask(irq);
+    } else {
+        pic::unmask(irq);
+    }
 }
 
 pub(crate) fn halt() -> ! {

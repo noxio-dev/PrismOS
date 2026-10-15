@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 noxio-dev
 //
-// 8253/8254 programmable interval timer: channel 0 is wired to IRQ0 and is
-// reprogrammed to a 100 Hz heartbeat.  The tick counter drives uptime and
+// 8253/8254 programmable interval timer.  Channel 0 gives a 100 Hz heartbeat
+// until the APIC takes over (apic.rs, which then also drives on_tick); channel 2
+// is used as a calibration stopwatch for the LAPIC timer.  Formerly the only
+// timer, now a fallback and a calibration source.  The tick counter drives uptime and
 // the `sleep` primitive used by the shell.
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -31,7 +33,48 @@ pub fn init() {
     }
 }
 
-/// IRQ0 handler body (called from the dispatch table).
+/// Silence channel 0 once the LAPIC timer has taken over as the tick source
+/// (mode 0 one-shot: at most one stray pulse on a line nobody routes).
+pub fn stop() {
+    // SAFETY: standard PIT channel 0 programming.
+    unsafe {
+        outb(MODE_CMD, 0x30);
+        outb(CH0_DATA, 0);
+        outb(CH0_DATA, 0);
+    }
+}
+
+/// Wait `ms` milliseconds (1..=50) with channel 2 in one-shot mode, without
+/// interrupts: used to calibrate the LAPIC timer when there is no HPET.
+/// Returns false if the PIT never signalled (broken or absent).
+pub fn wait_ms_ch2(ms: u32) -> bool {
+    let count = BASE_HZ * ms as u64 / 1000;
+    if count == 0 || count > 0xFFFF {
+        return false;
+    }
+    // SAFETY: standard PIT channel 2 / port 0x61 gate sequence.
+    unsafe {
+        let p61 = crate::io::inb(0x61);
+        outb(0x61, p61 & 0xFC); // gate low, speaker off
+        outb(MODE_CMD, 0xB0); // ch2, lobyte/hibyte, mode 0
+        outb(0x42, (count & 0xFF) as u8);
+        outb(0x42, (count >> 8) as u8);
+        outb(0x61, (p61 & 0xFC) | 1); // gate high: start counting
+        let mut spins = 0u32;
+        let mut done = false;
+        while spins < 20_000_000 {
+            if crate::io::inb(0x61) & 0x20 != 0 {
+                done = true;
+                break;
+            }
+            spins += 1;
+        }
+        outb(0x61, p61 & 0xFC);
+        done
+    }
+}
+
+/// IRQ0 / LAPIC timer tick handler body (called from the dispatch table).
 pub fn on_tick() {
     let t = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     BOOT_MS.store(t * 10, Ordering::Relaxed); // 100 Hz -> 10 ms per tick
