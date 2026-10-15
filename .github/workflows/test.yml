@@ -1,0 +1,47 @@
+name: test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld gcc binutils make python3 \
+            mkfs.fat mtools xorriso \
+            qemu-system-x86 ovmf
+
+      - name: Install Rust target
+        run: rustup target add x86_64-unknown-none
+
+      - name: Build
+        run: make
+
+      - name: Test BIOS boot
+        timeout-minutes: 5
+        run: make test
+
+      - name: Upload disk image (on failure, for debug)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prismos-img-debug
+          path: build/prismos.img
+          if-no-files-found: ignore
+
+      - name: Upload disk image (on success, latest build)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prismos-img-latest
+          path: build/prismos.img
+          if-no-files-found: ignore
+          retention-days: 30
