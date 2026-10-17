@@ -11,7 +11,7 @@
 //   console -> GDT/TSS -> IDT -> PIC (masked) -> PIT -> serial IRQ
 //   -> PMM -> VMM (own tables, CR3 switch) -> heap -> ACPI -> APIC/IOAPIC
 //   (8259 off, LAPIC timer takes over from the PIT) -> keyboard (i8042)
-//   -> sti -> shell
+//   -> sti -> PCI/AHCI -> VFS (ext4 on the first volume found) -> shell
 //
 // Every step logs one line so the boot output doubles as a bring-up check.
 
@@ -27,7 +27,9 @@ mod blk;
 mod boot;
 mod console;
 mod cpu;
+mod ext4;
 mod fb;
+mod fsys;
 mod heap;
 mod int;
 mod io;
@@ -40,6 +42,8 @@ mod pmm;
 mod rtc;
 mod serial;
 mod sh;
+mod shfs;
+mod vfs;
 mod vga;
 mod vm;
 mod unifont;
@@ -260,6 +264,9 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             );
         }
     }
+
+    // --- VFS / ext4 (phase 1.4) ---------------------------------------------
+    fsys::init();
 
     kprintln!("dropping to the shell");
     kprintln!();

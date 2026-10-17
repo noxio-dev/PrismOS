@@ -62,6 +62,27 @@ const COMMANDS: &[Cmd] = &[
     Cmd { name: "lspci", usage: "[-v]", desc: "list PCI devices (-v: BARs)", run: cmd_lspci },
     Cmd { name: "ahci", usage: "[read <disk> <lba> [n]]", desc: "AHCI controller / disks; read sectors", run: cmd_ahci },
     Cmd { name: "heaptest", usage: "[n]", desc: "stress the heap with n objects (default 100000)", run: cmd_heaptest },
+    Cmd { name: "mount", usage: "[-r] [-l] [<disk>[:<part>] <path>]", desc: "list / mount ext2/3/4 volumes (-l: volumes found)", run: crate::shfs::cmd_mount },
+    Cmd { name: "umount", usage: "<path>", desc: "flush and unmount a file system", run: crate::shfs::cmd_umount },
+    Cmd { name: "df", usage: "", desc: "file system usage", run: crate::shfs::cmd_df },
+    Cmd { name: "sync", usage: "", desc: "write pending changes to disk", run: crate::shfs::cmd_sync },
+    Cmd { name: "pwd", usage: "", desc: "print the current directory", run: crate::shfs::cmd_pwd },
+    Cmd { name: "cd", usage: "[dir]", desc: "change the current directory", run: crate::shfs::cmd_cd },
+    Cmd { name: "ls", usage: "[-la] [path...]", desc: "list a directory", run: crate::shfs::cmd_ls },
+    Cmd { name: "stat", usage: "<path>", desc: "inode details", run: crate::shfs::cmd_stat },
+    Cmd { name: "cat", usage: "<path...>", desc: "print files", run: crate::shfs::cmd_cat },
+    Cmd { name: "hd", usage: "<path> [off] [len]", desc: "hexdump a file (len <= 4096)", run: crate::shfs::cmd_hd },
+    Cmd { name: "write", usage: "<path> <text>", desc: "create/replace a file with text + newline (\\n \\t escapes)", run: crate::shfs::cmd_write },
+    Cmd { name: "append", usage: "<path> <text>", desc: "append text + newline to a file", run: crate::shfs::cmd_append },
+    Cmd { name: "mkdir", usage: "[-p] <dir...>", desc: "create directories", run: crate::shfs::cmd_mkdir },
+    Cmd { name: "rmdir", usage: "<dir...>", desc: "remove empty directories", run: crate::shfs::cmd_rmdir },
+    Cmd { name: "rm", usage: "[-r] <path...>", desc: "remove files (-r: whole trees)", run: crate::shfs::cmd_rm },
+    Cmd { name: "mv", usage: "<src> <dst>", desc: "move / rename", run: crate::shfs::cmd_mv },
+    Cmd { name: "cp", usage: "<src> <dst>", desc: "copy a file", run: crate::shfs::cmd_cp },
+    Cmd { name: "ln", usage: "[-s] <target> <name>", desc: "hard or symbolic link", run: crate::shfs::cmd_ln },
+    Cmd { name: "touch", usage: "<path...>", desc: "create empty files", run: crate::shfs::cmd_touch },
+    Cmd { name: "truncate", usage: "<path> <size>", desc: "resize a file", run: crate::shfs::cmd_truncate },
+    Cmd { name: "chmod", usage: "<octal> <path>", desc: "change permission bits", run: crate::shfs::cmd_chmod },
     Cmd { name: "clear", usage: "", desc: "clear the screen", run: cmd_clear },
     Cmd { name: "reboot", usage: "", desc: "restart the machine", run: cmd_reboot },
     Cmd { name: "halt", usage: "", desc: "stop the machine", run: cmd_halt },
@@ -135,7 +156,7 @@ fn dispatch(name: &str, args: &mut Args) {
 // ---------------------------------------------------------------- parsing
 
 /// Whitespace-separated argument scanner over the tail of a command line.
-struct Args<'a> {
+pub(crate) struct Args<'a> {
     rest: &'a str,
 }
 
@@ -145,7 +166,7 @@ impl<'a> Args<'a> {
     }
 
     /// Next whitespace-delimited token, if any.
-    fn next(&mut self) -> Option<&'a str> {
+    pub(crate) fn next(&mut self) -> Option<&'a str> {
         self.rest = self.rest.trim_start();
         let end = self.rest.find(char::is_whitespace).unwrap_or(self.rest.len());
         if end == 0 {
@@ -157,13 +178,13 @@ impl<'a> Args<'a> {
     }
 
     /// Untouched remainder of the line (trimmed); for `echo` and friends.
-    fn rest(&self) -> &'a str {
+    pub(crate) fn rest(&self) -> &'a str {
         self.rest.trim()
     }
 }
 
 /// Parse a number: decimal by default, hex with a `0x`/`0X` prefix.
-fn parse_u64(s: &str) -> Option<u64> {
+pub(crate) fn parse_u64(s: &str) -> Option<u64> {
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         u64::from_str_radix(hex, 16).ok()
     } else {
@@ -201,7 +222,7 @@ fn bad_number(cmd: &str, tok: &str) {
 }
 
 /// Print the usage line of a command, straight from the table.
-fn usage(name: &str) {
+pub(crate) fn usage(name: &str) {
     if let Some(c) = COMMANDS.iter().find(|c| c.name == name) {
         if c.usage.is_empty() {
             crate::kprintln!("usage: {}", name);
@@ -704,7 +725,7 @@ fn cmd_ahci(args: &mut Args) {
 }
 
 /// 16 bytes per line, hex + ASCII.  Repeated identical lines are folded.
-fn hexdump(buf: &[u8], base: u64) {
+pub(crate) fn hexdump(buf: &[u8], base: u64) {
     let mut prev: Option<&[u8]> = None;
     let mut folded = false;
     for (i, line) in buf.chunks(16).enumerate() {
@@ -737,10 +758,12 @@ fn cmd_clear(_args: &mut Args) {
 }
 
 fn cmd_reboot(_args: &mut Args) {
+    crate::fsys::sync_all();
     reboot_now();
 }
 
 fn cmd_halt(_args: &mut Args) {
+    crate::fsys::sync_all();
     crate::halt();
 }
 
@@ -847,7 +870,7 @@ fn kind_name(kind: u32) -> &'static str {
 }
 
 /// Byte count rendered as B / KiB / MiB / GiB with at most one decimal.
-struct Size(u64);
+pub(crate) struct Size(pub u64);
 
 impl core::fmt::Display for Size {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

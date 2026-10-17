@@ -103,6 +103,34 @@ def main():
     else:
         print("note: OVMF not found, skipping UEFI scenarios")
 
+    # ext4 + VFS: a second disk on an AHCI controller, driven from the shell.
+    data = os.path.join(tmp, "data.img")
+    have_fs = shutil.which("mke2fs") is not None
+    if have_fs:
+        with open(data, "wb") as f:
+            f.truncate(32 * 1024 * 1024)
+        seed = os.path.join(tmp, "seed")
+        os.makedirs(seed)
+        with open(os.path.join(seed, "hello.txt"), "w") as f:
+            f.write("Hello from the PrismOS ext4 data disk.\n")
+        subprocess.run(["mke2fs", "-q", "-F", "-t", "ext4", "-d", seed, data], check=True)
+
+        def fs_cmd():
+            return base + ["-drive", "file=%s,format=raw" % work,
+                           "-device", "ahci,id=ahci0",
+                           "-drive", "id=data,file=%s,format=raw,if=none" % data,
+                           "-device", "ide-hd,drive=data,bus=ahci0.0"]
+
+        scenarios.append(
+            ("BIOS shell: ext4 on AHCI (VFS)", fs_cmd,
+             [("prism# ", "cat /hello.txt\r"), ("prism# ", "mkdir /d\r"),
+              ("prism# ", "write /d/t.txt persisted by PrismOS\r"), ("prism# ", "cat /d/t.txt\r"),
+              ("prism# ", "ls /d\r"), ("prism# ", "df\r"), ("prism# ", "sync\r")],
+             ["vfs      : disk 0 on / (ext4", "Hello from the PrismOS ext4 data disk.",
+              "persisted by PrismOS", "t.txt", "mounted on", "synced"], 60))
+    else:
+        print("note: mke2fs not found, skipping the ext4 scenario")
+
     failed = 0
     for name, cmd, steps, expect, timeout in scenarios:
         start = time.time()
@@ -115,6 +143,15 @@ def main():
             print("-----------------------")
         else:
             print("ok    %s  (%.1fs)" % (name, time.time() - start))
+    if have_fs:
+        # What the guest wrote must be readable (and consistent) on the host.
+        r = subprocess.run(["e2fsck", "-fn", data], capture_output=True, text=True)
+        d = subprocess.run(["debugfs", "-R", "cat /d/t.txt", data], capture_output=True, text=True)
+        if r.returncode != 0 or "persisted by PrismOS" not in d.stdout:
+            failed += 1
+            print("FAIL  ext4 image after the guest ran\n" + r.stdout + d.stdout)
+        else:
+            print("ok    ext4 image clean and /d/t.txt readable on the host")
     shutil.rmtree(tmp, ignore_errors=True)
     sys.exit(1 if failed else 0)
 

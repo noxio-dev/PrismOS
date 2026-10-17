@@ -14,7 +14,11 @@ PYTHON    ?= python3
 CARGO     ?= cargo
 CARGOFLAGS ?=
 QEMU      ?= qemu-system-x86_64
-QEMUFLAGS ?= -m 256M
+DATA_IMG  ?= build/data.img
+DATA_SIZE ?= 64M
+# Second disk on an AHCI controller: an ext4 volume the kernel mounts on /.
+QEMU_DATA := -device ahci,id=ahci0 -drive id=data,file=$(DATA_IMG),format=raw,if=none -device ide-hd,drive=data,bus=ahci0.0
+QEMUFLAGS ?= -m 256M $(QEMU_DATA)
 OVMF_CODE ?= $(firstword $(wildcard \
     /usr/share/OVMF/OVMF_CODE_4M.fd \
     /usr/share/OVMF/OVMF_CODE.fd \
@@ -60,7 +64,7 @@ EFI_OBJS  := $(patsubst %.c,$B/efi/%.o,$(COMMON_SRCS) $(wildcard boot/efi/*.c))
 
 # ---- default target ----------------------------------------------------
 
-.PHONY: all clean run run-uefi run-iso test kernel esp iso run-kvm run-uefi-kvm
+.PHONY: all clean run run-uefi run-iso test kernel esp iso run-kvm run-uefi-kvm data fstest
 all: $B/$(NAME).img
 
 # ---- compile rules -------------------------------------------------------
@@ -143,12 +147,23 @@ $B/$(NAME).img: $B/boot0.bin $B/boot1.bin $B/loader.bin $B/esp.stamp tools/mkima
 	$(PYTHON) tools/mkimage.py --boot0 $B/boot0.bin --boot1 $B/boot1.bin \
 		--loader $B/loader.bin --esp-dir $B/esp -o $@
 
+# ---- ext4 data disk -----------------------------------------------------------
+# Created once and kept between runs (so what you write in the shell survives);
+# `make clean` or `rm build/data.img` starts over.
+
+data: $(DATA_IMG)
+$(DATA_IMG):
+	@mkdir -p $(@D) $(@D)/datatree
+	printf 'Hello from the PrismOS ext4 data disk.\n' > $(@D)/datatree/hello.txt
+	truncate -s $(DATA_SIZE) $@
+	mke2fs -q -F -t ext4 -L PRISMDATA -d $(@D)/datatree $@
+
 # ---- run / test -----------------------------------------------------------------
 
-run: $B/$(NAME).img
+run: $B/$(NAME).img $(DATA_IMG)
 	$(QEMU) $(QEMUFLAGS) -drive file=$<,format=raw -serial stdio
 
-run-uefi: $B/$(NAME).img
+run-uefi: $B/$(NAME).img $(DATA_IMG)
 	@test -n "$(OVMF_CODE)" || { echo "OVMF not found: set OVMF_CODE and OVMF_VARS"; exit 1; }
 	cp -f $(OVMF_VARS) $B/OVMF_VARS.fd
 	$(QEMU) $(QEMUFLAGS) -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
@@ -156,14 +171,14 @@ run-uefi: $B/$(NAME).img
 		-drive file=$<,format=raw -serial stdio
 
 # KVM : BIOS
-run-kvm: $B/$(NAME).img
+run-kvm: $B/$(NAME).img $(DATA_IMG)
 	@test -e /dev/kvm || { echo "KVM unavailable: /dev/kvm not found"; exit 1; }
 	$(QEMU) -enable-kvm $(QEMUFLAGS) \
 		-drive file=$<,format=raw \
 		-serial stdio
 
 # KVM : UEFI
-run-uefi-kvm: $B/$(NAME).img
+run-uefi-kvm: $B/$(NAME).img $(DATA_IMG)
 	@test -e /dev/kvm || { echo "KVM unavailable: /dev/kvm not found"; exit 1; }
 	@test -n "$(OVMF_CODE)" || { echo "OVMF not found: set OVMF_CODE and OVMF_VARS"; exit 1; }
 	@test -f "$(OVMF_CODE)" || { echo "OVMF_CODE file not found: $(OVMF_CODE)"; exit 1; }
@@ -192,7 +207,7 @@ iso: $B/$(NAME).iso
 		-e esp.img -no-emul-boot -isohybrid-gpt-basdat \
 		-o $@ $B/iso
 
-run-iso: $B/$(NAME).iso
+run-iso: $B/$(NAME).iso $(DATA_IMG)
 	@test -n "$(OVMF_CODE)" || { echo "OVMF not found: set OVMF_CODE and OVMF_VARS"; exit 1; }
 	cp -f $(OVMF_VARS) $B/OVMF_VARS.fd
 	$(QEMU) $(QEMUFLAGS) -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
@@ -201,6 +216,10 @@ run-iso: $B/$(NAME).iso
 		
 test: $B/$(NAME).img
 	$(PYTHON) tests/boot_test.py $< "$(QEMU)" "$(OVMF_CODE)" "$(OVMF_VARS)"
+
+# VFS + ext4 against real images, checked with e2fsck (no QEMU needed).
+fstest:
+	$(PYTHON) tests/fs_test.py
 
 clean:
 	rm -rf $B sys/kern/target

@@ -1,0 +1,11 @@
+[package]
+name = "fstest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "fstest"
+path = "src/main.rs"
