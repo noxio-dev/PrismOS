@@ -9,7 +9,7 @@ mkfont.py - pack a GNU Unifont .hex file into the kernel's console font.
 Input: "XXXX:HEX" lines, 8x16 (32 hex digits) or 16x16 (64 hex digits)
 glyphs, one row per byte (two for wide glyphs), leftmost pixel = MSB.
 
-Output layout (little endian), looked up in O(1) by sys/kern/src/unifont.rs:
+Output layout (little endian), looked up in O(1) by sys/kern/src/console/unifont.rs:
 
     "UNIF"                       magic
     u32 nblocks                  0x1100 blocks of 256 code points

@@ -9,9 +9,7 @@ FreeBSD-style boot: a real **BIOS + UEFI bootloader** whose logic is written in
 Phase 1 (kernel foundations) is feature-complete: the machine boots on BIOS and
 UEFI, the kernel manages memory and interrupts, talks to an AHCI disk and
 mounts an ext4 volume that you can browse and modify from the kernel shell.
-Phase 2.1 adds ring 3: the kernel can run a flat program in user mode with its
-own page tables (see below). There are still **no processes or scheduler** (next:
-phase 2.2).
+There is still **no userspace**: everything runs in ring 0 (next: phase 2).
 
 | Area                     | State   | Notes                                                                 |
 |--------------------------|---------|-----------------------------------------------------------------------|
@@ -23,8 +21,7 @@ phase 2.2).
 | PCI / AHCI               | done    | bus scan, SATA DMA read/write/flush; polled (no interrupts yet)       |
 | VFS                      | done    | mounts, path walk, symlinks, descriptor API                            |
 | ext4                     | partial | R/W, extents, checksums written; no journal, see limits below          |
-| Ring 3                   | done    | user page tables per process, `syscall`/`sysret`, TSS stacks, fault containment (phase 2.1) |
-| Scheduler / processes    | todo    | single flow of control: a user program runs to completion (phases 2.2+) |
+| Scheduler / processes    | todo    | single flow of control, no ring 3                                      |
 | Networking, USB, SMP     | todo    | not started                                                            |
 
 **Testing.** `make fstest` (11 scenarios against `mke2fs` images, each validated
@@ -59,7 +56,7 @@ Phase 1 — kernel foundations
   - [ ] SMP bring-up (AP startup via the LAPIC), per-CPU data, spinlocks
 
 Phase 2 — ring 3 and processes
-- [x] Phase 2.1 — ring 3: user page tables per process, `syscall`/`sysret`, TSS stacks
+- [ ] Phase 2.1 — ring 3: user page tables per process, `syscall`/`sysret`, TSS stacks
 - [ ] Phase 2.2 — processes and threads: PCB, kernel stacks, context switch
 - [ ] Phase 2.3 — scheduler: preemptive round-robin on the LAPIC timer, then priorities, sleep/wakeup
 - [ ] Phase 2.4 — ELF loader: `execve` from the VFS, argv/envp, auxv
@@ -92,29 +89,6 @@ Beyond (nice to have)
 - [ ] AArch64 port of the kernel and loader
 
 *`One day, perhaps, PrismOS will be self-hosted lol`*
-
-## Ring 3 (phase 2.1)
-
-`sys/kern/src/usermode.rs` (+ `AddressSpace` in `vmm.rs`, GDT/TSS/`swapgs` in `int.rs`):
-
-- **GDT**: `0x18` user data, `0x20` user code (RPL 3 -> `0x1b`/`0x23`), ordered so that
-  `sysretq` lands on them (`STAR[63:48] = 0x10`). TSS has `RSP0` (set per run) and IST stacks
-  for #DF, NMI and #MC.
-- **Address spaces**: one PML4 per process. The kernel half and the kernel's low identity
-  slot are shared (never `U/S`), user space is PML4 slots 1..127
-  (`0x80_0000_0000` .. `0x4000_0000_0000`); code at the bottom, stack growing down from the top
-  with an unmapped guard page. W^X is enforced, pages are freed on drop. The kernel reaches
-  user memory only by walking the tables (`AddressSpace::read/write`), never by pointer.
-  SMEP/SMAP/UMIP are enabled when the CPU has them.
-- **Entry/exit**: `syscall`/`sysretq` (LSTAR, SFMASK) plus interrupts and exceptions through
-  the IDT, with `swapgs` on every ring 3 <-> ring 0 transition and a per-CPU block in GS.
-- **Containment**: any exception in ring 3 (or the 3 s tick watchdog) ends the program
-  and returns to the shell; the kernel never panics because of user code.
-- **Syscalls** (rax = number, args rdi/rsi/rdx, result in rax, `-errno` on failure):
-  `0 exit`, `1 write(fd 1|2)`, `2 getpid`, `3 uptime_ms`.
-
-Shell: `user` lists the built-in test programs, `user <name>` runs one, `usertest` runs them
-all (outcome, fault type and page-leak check) -- also part of `make test`.
 
 ## Boot chain
 
@@ -161,14 +135,14 @@ prism# write /note hi\n      prism# mkdir -p /a/b   prism# cp, mv, rm -r, ln -s,
 prism# df                    prism# sync            prism# umount /mnt
 ```
 
-Layers (all in `sys/kern/src/`):
+Layers (all in `sys/kern/src/fs/`, plus the shell commands):
 
-| File          | Role                                                              |
-|---------------|-------------------------------------------------------------------|
-| `vfs.rs`      | `FileSystem` trait, mount table, path walk (symlinks, `..`, mount points), open-file table (`open/read/write/seek/close`) |
-| `ext4/`       | the driver: `mod.rs` (mount, block cache, inodes), `balloc.rs` (group descriptors, bitmaps, allocators), `extent.rs` (extent trees, file data), `dir.rs`, `ops.rs` (create, mkdir, rename, link, ...), `crc.rs` |
-| `fsys.rs`     | kernel glue: global VFS, cwd, GPT partition scan, boot-time mount, RTC clock |
-| `shfs.rs`     | shell commands                                                    |
+| File               | Role                                                          |
+|--------------------|---------------------------------------------------------------|
+| `fs/vfs.rs`        | `FileSystem` trait, mount table, path walk (symlinks, `..`, mount points), open-file table (`open/read/write/seek/close`) |
+| `fs/ext4/`         | the driver: `mod.rs` (mount, block cache, inodes), `balloc.rs` (group descriptors, bitmaps, allocators), `extent.rs` (extent trees, file data), `dir.rs`, `ops.rs` (create, mkdir, rename, link, ...), `crc.rs` |
+| `fs/fsys.rs`       | kernel glue: global VFS, cwd, GPT partition scan, boot-time mount, RTC clock |
+| `shell/shfs.rs`    | shell commands                                                |
 
 ext4 support: extents (or classic block maps for reading), 32/64-bit
 descriptors, flex_bg, uninit_bg and `metadata_csum` (checksums are written, not
@@ -180,7 +154,7 @@ are volumes with unsupported ro_compat features. Refused: inline_data,
 bigalloc, meta_bg, encryption. Run `sync` (or `reboot` / `halt`, which sync)
 before powering off.
 
-`make fstest` compiles `vfs.rs` and `ext4/` unchanged against image files made
+`make fstest` compiles `fs/vfs.rs` and `fs/ext4/` unchanged against image files made
 by `mke2fs` (4k/1k blocks, with/without metadata_csum, 64bit, no journal,
 128-byte inodes), runs read/write scenarios (fragmented files, full disk,
 rename, links, many-entry directories, persistence across mounts) and checks
@@ -241,6 +215,15 @@ boot/lua, boot/conf      Lua scripts and loader.conf
 contrib/lua              Lua 5.4.8 (MIT)
 include/                 prism.inc (shared constants), prism/boot.h
 sys/kern                 Rust kernel (no_std, x86_64-unknown-none)
+  src/main.rs, boot.rs   entry point and bring-up order, boot info parsing
+  src/arch/              x86-64: cpu, gdt, tss, idt, intr (ISR stubs, dispatch), io, regs, vm
+  src/mem/               pmm (bitmap), vmm (page tables), heap (buddy + slab)
+  src/hw/                pic, apic, acpi, pit, rtc, serial, kbd, pci, ahci, blk
+  src/fs/                vfs, fsys (kernel glue), ext4/
+  src/console/           console, fb, vga, font, unifont
+  src/shell/             shell loop, cmds (table), shfs, shmem, shuser
+  src/lib/               line editor, kprint! macros, snake
+  src/user/              ring 3, syscalls, processes (phase 2 placeholders)
 tools/mkimage.py         GPT/FAT32 disk image builder
 tests/boot_test.py       QEMU boot tests (incl. ext4 on AHCI)
 tests/fs_test.py         host VFS/ext4 tests (tests/fstest is the harness)

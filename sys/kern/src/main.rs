@@ -17,41 +17,27 @@
 
 #![no_std]
 #![no_main]
+// `lib/` is the kernel utility module, not a library crate target.
+#![allow(special_module_name)]
 
 extern crate alloc;
 
-mod acpi;
-mod ahci;
-mod apic;
-mod blk;
+mod arch;
 mod boot;
 mod console;
-mod cpu;
-mod ext4;
-mod fb;
-mod fsys;
-mod heap;
-mod int;
-mod io;
-mod kbd;
-mod line;
-mod pci;
-mod pic;
-mod pit;
-mod pmm;
-mod rtc;
-mod serial;
-mod sh;
-mod shfs;
-mod vfs;
-mod vga;
-mod vm;
-mod unifont;
-mod usermode;
-mod vmm;
-mod snake;
+mod fs;
+mod hw;
+mod lib;
+mod mem;
+mod shell;
+mod user;
 
+use arch::{cpu, gdt, idt, intr, vm};
 use boot::BootInfo;
+use fs::fsys;
+use hw::{acpi, ahci, apic, blk, kbd, pci, pic, pit, serial};
+use mem::{heap, pmm, vmm};
+
 use core::arch::asm;
 use core::panic::PanicInfo;
 
@@ -59,7 +45,7 @@ use core::panic::PanicInfo;
 #[link_section = ".text._start"]
 pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // The loader enters with interrupts masked; make it explicit.
-    int::cli();
+    intr::cli();
 
     // SAFETY: the pointer comes straight from the loader.
     let bi = unsafe { BootInfo::from_ptr(boot_info) };
@@ -122,9 +108,9 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     }
 
     // --- Interrupt infrastructure -------------------------------------------
-    int::gdt_init();
-    kprintln!("gdt/tss  : loaded (code {:#x}, data {:#x}, tss {:#x})", int::KERNEL_CS, int::KERNEL_DS, int::TSS_SEL);
-    int::idt_init();
+    gdt::init();
+    kprintln!("gdt/tss  : loaded (code {:#x}, data {:#x}, tss {:#x})", gdt::KERNEL_CS, gdt::KERNEL_DS, gdt::TSS_SEL);
+    idt::init();
     kprintln!("idt      : 256 gates, exceptions 0..20 + irqs 0x20..0x2f");
     pic::init();
     kprintln!("pic      : 8259 remapped to 0x20..0x2f, all lines masked");
@@ -133,7 +119,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     // --- Device IRQs (registered now, unmasked at the end) ------------------
     serial::init();
-    int::register_irq(pic::IRQ_COM1, |_f| serial::on_irq());
+    intr::register_irq(pic::IRQ_COM1, |_f| serial::on_irq());
     // Nothing is unmasked yet: whether the 8259 or the IOAPIC delivers these
     // lines is decided after the ACPI/APIC probe (unmasking on the 8259 and
     // then switching leaves a stale INTR request behind).
@@ -143,13 +129,13 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         if serial::present() { "" } else { " (no UART detected)" }
     );
 
-    int::register_irq(pic::IRQ_TIMER, |_f| pit::on_tick());
-    int::register_irq(pic::IRQ_KBD, |_f| kbd::on_irq());
+    intr::register_irq(pic::IRQ_TIMER, |_f| pit::on_tick());
+    intr::register_irq(pic::IRQ_KBD, |_f| kbd::on_irq());
 
     // --- Memory management ----------------------------------------------------
     let Some(bi) = bi else {
         kprintln!("fatal: cannot set up memory management without boot info");
-        int::park()
+        intr::park()
     };
     let ps = pmm::init(bi);
     kprintln!(
@@ -176,15 +162,6 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     } else {
         kprintln!("heap     : init failed (no memory for the region)");
     }
-
-    // --- Ring 3 (phase 2.1) ---------------------------------------------------
-    let ui = usermode::init();
-    kprintln!(
-        "user     : ring 3 ready (syscall/sysret, per-process page tables, tss rsp0), smep {} smap {} umip {}",
-        if ui.smep { "on" } else { "n/a" },
-        if ui.smap { "on" } else { "n/a" },
-        if ui.umip { "on" } else { "n/a" }
-    );
 
     // --- ACPI / APIC ------------------------------------------------------------
     // Needs the direct map (tables above 4 GiB) so it comes after the VMM.
@@ -242,7 +219,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     }
 
     // --- Lift off --------------------------------------------------------------
-    int::sti();
+    intr::sti();
     kprintln!("interrupts enabled");
 
     // --- PCI / storage (needs the system tick for command time-outs) ----------
@@ -281,8 +258,8 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     kprintln!("dropping to the shell");
     kprintln!();
 
-    sh::set_boot_info(Some(bi));
-    sh::run()
+    shell::set_boot_info(Some(bi));
+    shell::run()
 }
 
 /// Unmask an ISA IRQ on whichever controller is in charge.
@@ -303,7 +280,7 @@ pub(crate) fn halt() -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    int::cli();
+    intr::cli();
     kprintln!("\nKERNEL PANIC: {}", info);
     halt()
 }

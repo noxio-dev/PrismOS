@@ -8,14 +8,13 @@
 
 extern crate alloc;
 
-#[path = "../../../sys/kern/src/blk.rs"]
-mod blk;
-#[path = "../../../sys/kern/src/vfs.rs"]
-mod vfs;
-#[path = "../../../sys/kern/src/ext4/mod.rs"]
-mod ext4;
+// The kernel files are included at the same module paths as in the kernel
+// (crate::hw::blk, crate::fs::vfs, crate::fs::ext4): see hw.rs and fs.rs.
+mod fs;
+mod hw;
 
-use blk::{BlkError, BlockDev, SECTOR};
+use fs::{ext4, vfs};
+use hw::blk::{BlkError, BlockDev, SECTOR};
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
