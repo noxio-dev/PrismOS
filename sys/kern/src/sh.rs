@@ -6,6 +6,7 @@ use crate::boot::{
     MEM_USABLE,
 };
 use crate::io::{inb, outb};
+use crate::usermode;
 use core::arch::asm;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -83,6 +84,8 @@ const COMMANDS: &[Cmd] = &[
     Cmd { name: "touch", usage: "<path...>", desc: "create empty files", run: crate::shfs::cmd_touch },
     Cmd { name: "truncate", usage: "<path> <size>", desc: "resize a file", run: crate::shfs::cmd_truncate },
     Cmd { name: "chmod", usage: "<octal> <path>", desc: "change permission bits", run: crate::shfs::cmd_chmod },
+    Cmd { name: "user", usage: "[<program>]", desc: "run a test program in ring 3 (no argument: list them)", run: cmd_user },
+    Cmd { name: "usertest", usage: "", desc: "run every ring 3 test program and check the outcome", run: cmd_usertest },
     Cmd { name: "clear", usage: "", desc: "clear the screen", run: cmd_clear },
     Cmd { name: "reboot", usage: "", desc: "restart the machine", run: cmd_reboot },
     Cmd { name: "halt", usage: "", desc: "stop the machine", run: cmd_halt },
@@ -750,6 +753,35 @@ pub(crate) fn hexdump(buf: &[u8], base: u64) {
             crate::kprint!("{}", if (0x20..0x7F).contains(&b) { b as char } else { '.' });
         }
         crate::kprintln!("|");
+    }
+}
+
+fn cmd_user(args: &mut Args) {
+    let Some(name) = args.next() else {
+        for p in usermode::PROGRAMS.iter() {
+            crate::kprintln!("  {:8} {}", p.name, p.desc);
+        }
+        return;
+    };
+    let Some(p) = usermode::find(name) else {
+        crate::kprintln!("user: no program '{}' (run 'user' to list them)", name);
+        return;
+    };
+    match p.run() {
+        Ok(o) => {
+            crate::kprint!("user: {} ", p.name);
+            usermode::describe(o);
+        }
+        Err(e) => crate::kprintln!("user: {}", e),
+    }
+}
+
+fn cmd_usertest(_args: &mut Args) {
+    let (ok, total) = usermode::selftest();
+    if ok == total {
+        crate::kprintln!("usertest: all {} passed", total);
+    } else {
+        crate::kprintln!("usertest: {}/{} passed, FAILURES", ok, total);
     }
 }
 

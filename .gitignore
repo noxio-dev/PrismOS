@@ -9,5 +9,6 @@ build/
 
 *.zip
 sys/kern/target/
+tests/fstest/target/
 
 !sys/kern/data/unifont.bin

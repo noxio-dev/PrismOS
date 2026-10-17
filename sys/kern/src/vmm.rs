@@ -39,8 +39,32 @@ pub const CRASH_TEST_ADDR: u64 = 0x0000_5000_0000_0000;
 // PTE bits
 const P: u64 = 1;
 const RW: u64 = 2;
+const US: u64 = 4;
 const PS: u64 = 0x80;
 const NX: u64 = 1 << 63;
+
+// ------------------------------------------------- user address space layout
+//
+// Every process owns a PML4.  The kernel half (slots 256..511) and the
+// lower-half slots the kernel itself uses (slot 0: identity map; a possible
+// framebuffer slot) are shared by pointing at the same lower-level tables;
+// the rest of the lower half belongs to the process:
+//
+//   0x0000_0080_0000_0000 .. 0x0000_4000_0000_0000   user space (slots 1..127)
+//       USER_CODE_BASE  first user page (program image)
+//       USER_STACK_TOP  initial user RSP, the stack grows down from here
+//
+// User pages always carry the U/S bit; kernel pages never do, so ring 3 can
+// not touch anything the kernel mapped (identity map, direct map, image).
+
+/// First byte of user space (PML4 slot 1; slot 0 is the kernel identity map).
+pub const USER_BASE: u64 = 1 << 39;
+/// One past the last byte of user space.
+pub const USER_END: u64 = 128 << 39;
+/// Where programs are loaded.
+pub const USER_CODE_BASE: u64 = USER_BASE;
+/// Initial user stack pointer (first push lands just below).
+pub const USER_STACK_TOP: u64 = USER_END;
 
 const PHYS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const PHYS_MASK_2M: u64 = 0x000F_FFFF_FFE0_0000;
@@ -48,6 +72,9 @@ const PHYS_MASK_1G: u64 = 0x0000_FFFF_C000_0000;
 
 /// Physical address of our PML4 (0 until the switch).
 static mut PML4: u64 = 0;
+/// Lower-half PML4 slots populated when the kernel tables went live: these
+/// belong to the kernel and are shared with every address space.
+static mut KERNEL_SLOTS: [u64; 4] = [0; 4];
 static READY: AtomicBool = AtomicBool::new(false);
 static mut PAGES_MAPPED: u64 = 0;
 
@@ -436,6 +463,18 @@ pub fn init(bi: &BootInfo) -> bool {
     // can be handed out by the PMM too.
     crate::pmm::allow_high();
     READY.store(true, Ordering::Release);
+
+    // Remember which lower-half slots the kernel owns (identity map, maybe a
+    // framebuffer above 4 GiB) so user address spaces share and never reuse
+    // them.
+    // SAFETY: read-only walk of the live PML4 through the direct map.
+    unsafe {
+        for i in 0..256usize {
+            if tr_live(pml4, i) & P != 0 {
+                KERNEL_SLOTS[i / 64] |= 1u64 << (i % 64);
+            }
+        }
+    }
     ok
 }
 
@@ -534,4 +573,288 @@ pub fn handle_page_fault(frame: &mut IsrFrame) {
         frame.rax, frame.rbx, frame.rcx, frame.rdx, frame.rsi, frame.rdi, frame.rbp, frame.rsp
     );
     crate::int::park();
+}
+
+// ============================================================================
+// User address spaces (phase 2.1)
+// ============================================================================
+
+/// Physical address of the kernel's own PML4 (0 before `init`).
+pub fn kernel_cr3() -> u64 {
+    // SAFETY: scalar read of a static written once at boot.
+    unsafe { PML4 }
+}
+
+/// Switch back to the kernel's own page tables.
+pub fn activate_kernel() {
+    let pml4 = kernel_cr3();
+    if pml4 != 0 {
+        // SAFETY: the kernel tables map the running code, stacks and heap.
+        unsafe { asm!("mov cr3, {}", in(reg) pml4, options(nostack, preserves_flags)) };
+    }
+}
+
+fn current_cr3() -> u64 {
+    let v: u64;
+    // SAFETY: plain register read.
+    unsafe { asm!("mov {}, cr3", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v & PHYS_MASK
+}
+
+/// True when PML4 slot `i` is owned by the kernel (shared, never user-mapped).
+fn slot_is_kernel(i: usize) -> bool {
+    // SAFETY: bitmap written once at the end of `init`.
+    i >= 256 || unsafe { (KERNEL_SLOTS[i / 64] >> (i % 64)) & 1 != 0 }
+}
+
+/// Walk one level of a user table, creating the next table with U/S set.
+unsafe fn walk_user(table: u64, idx: usize) -> Option<u64> {
+    let e = tr_live(table, idx);
+    if e & P == 0 {
+        let t = crate::pmm::alloc_page()?;
+        tw_live(table, idx, t | P | RW | US);
+        Some(t)
+    } else if e & PS != 0 {
+        None
+    } else {
+        Some(e & PHYS_MASK)
+    }
+}
+
+/// Free a page-table subtree and every leaf page below it.  `level` is the
+/// level of `table` itself (3 = PDPT, 2 = PD, 1 = PT whose entries are the
+/// user's own pages).
+unsafe fn free_tree(table: u64, level: u32) {
+    for i in 0..512usize {
+        let e = tr_live(table, i);
+        if e & P == 0 {
+            continue;
+        }
+        let child = e & PHYS_MASK;
+        if level == 1 {
+            crate::pmm::free_page(child);
+        } else if e & PS == 0 {
+            free_tree(child, level - 1);
+        }
+    }
+    crate::pmm::free_page(table);
+}
+
+/// `len` bytes at `virt` lie entirely inside user space.
+fn user_range_ok(virt: u64, len: usize) -> bool {
+    len == 0
+        || (virt >= USER_BASE
+            && virt.checked_add(len as u64).map_or(false, |end| end <= USER_END))
+}
+
+/// One process's page tables.  The kernel half is shared with the kernel
+/// PML4, the user half is private and freed on drop.
+pub struct AddressSpace {
+    pml4: u64,
+}
+
+impl AddressSpace {
+    /// New address space: kernel mappings shared, user half empty.
+    pub fn new() -> Option<AddressSpace> {
+        let kpml4 = kernel_cr3();
+        if kpml4 == 0 {
+            return None;
+        }
+        let pml4 = crate::pmm::alloc_page()?;
+        // SAFETY: both tables are reached through the direct map; the new
+        // one is exclusively ours.
+        unsafe {
+            for i in 0..512usize {
+                if slot_is_kernel(i) {
+                    let e = tr_live(kpml4, i);
+                    if e & P != 0 {
+                        tw_live(pml4, i, e);
+                    }
+                }
+            }
+        }
+        Some(AddressSpace { pml4 })
+    }
+
+    /// Value to load into CR3.
+    pub fn cr3(&self) -> u64 {
+        self.pml4
+    }
+
+    /// Make these the live page tables.
+    #[allow(dead_code)] // used by the scheduler (phase 2.2+)
+    pub fn activate(&self) {
+        // SAFETY: the kernel half is shared, so the running code stays mapped.
+        unsafe { asm!("mov cr3, {}", in(reg) self.pml4, options(nostack, preserves_flags)) };
+    }
+
+    /// True when the kernel half (identity map and kernel image) is shared
+    /// with the kernel's own PML4.
+    pub fn shares_kernel(&self) -> bool {
+        let kpml4 = kernel_cr3();
+        // SAFETY: read-only walks through the direct map.
+        unsafe {
+            (0..512usize)
+                .filter(|&i| slot_is_kernel(i))
+                .all(|i| tr_live(kpml4, i) == tr_live(self.pml4, i))
+        }
+    }
+
+    /// Map the physical page `phys` at `virt` for user access.  `w`: writable,
+    /// `x`: executable.  Fails if `virt` is outside user space, unaligned, in
+    /// a kernel-owned slot, already mapped, or out of memory.
+    pub fn map_page(&mut self, virt: u64, phys: u64, w: bool, x: bool) -> bool {
+        if virt & (PAGE - 1) != 0 || phys & (PAGE - 1) != 0 || !user_range_ok(virt, PAGE as usize) {
+            return false;
+        }
+        let i4 = ((virt >> 39) & 0x1FF) as usize;
+        if slot_is_kernel(i4) {
+            return false;
+        }
+        let i3 = ((virt >> 30) & 0x1FF) as usize;
+        let i2 = ((virt >> 21) & 0x1FF) as usize;
+        let i1 = ((virt >> 12) & 0x1FF) as usize;
+        // SAFETY: table walks through the direct map on tables we own.
+        unsafe {
+            let Some(pdpt) = walk_user(self.pml4, i4) else { return false };
+            let Some(pd) = walk_user(pdpt, i3) else { return false };
+            let Some(pt) = walk_user(pd, i2) else { return false };
+            if tr_live(pt, i1) & P != 0 {
+                return false;
+            }
+            let mut f = P | US;
+            if w {
+                f |= RW;
+            }
+            if !x {
+                f |= NX;
+            }
+            tw_live(pt, i1, phys | f);
+        }
+        true
+    }
+
+    /// Allocate zeroed pages covering `[virt, virt + len)` and map them.
+    /// The pages belong to the address space and are freed with it.
+    pub fn alloc_map(&mut self, virt: u64, len: u64, w: bool, x: bool) -> bool {
+        let start = virt & !(PAGE - 1);
+        let Some(end) = virt.checked_add(len).and_then(|e| e.checked_add(PAGE - 1)) else {
+            return false;
+        };
+        let end = end & !(PAGE - 1);
+        let mut v = start;
+        while v < end {
+            let Some(phys) = crate::pmm::alloc_page() else { return false };
+            if !self.map_page(v, phys, w, x) {
+                crate::pmm::free_page(phys);
+                return false;
+            }
+            v += PAGE;
+        }
+        true
+    }
+
+    /// Physical address behind a user byte and whether the page is writable.
+    /// None for anything that is not a present user-accessible page.
+    pub fn translate(&self, virt: u64) -> Option<(u64, bool)> {
+        if !user_range_ok(virt, 1) {
+            return None;
+        }
+        let i4 = ((virt >> 39) & 0x1FF) as usize;
+        if slot_is_kernel(i4) {
+            return None;
+        }
+        let i3 = ((virt >> 30) & 0x1FF) as usize;
+        let i2 = ((virt >> 21) & 0x1FF) as usize;
+        let i1 = ((virt >> 12) & 0x1FF) as usize;
+        // SAFETY: read-only walk through the direct map.
+        unsafe {
+            let e = tr_live(self.pml4, i4);
+            if e & P == 0 {
+                return None;
+            }
+            let e = tr_live(e & PHYS_MASK, i3);
+            if e & P == 0 || e & PS != 0 {
+                return None;
+            }
+            let e = tr_live(e & PHYS_MASK, i2);
+            if e & P == 0 || e & PS != 0 {
+                return None;
+            }
+            let e = tr_live(e & PHYS_MASK, i1);
+            if e & P == 0 || e & US == 0 {
+                return None;
+            }
+            Some(((e & PHYS_MASK) | (virt & (PAGE - 1)), e & RW != 0))
+        }
+    }
+
+    /// Copy user memory into `buf` by walking this address space's tables
+    /// (the kernel never dereferences a user pointer directly).
+    pub fn read(&self, virt: u64, buf: &mut [u8]) -> bool {
+        if !user_range_ok(virt, buf.len()) {
+            return false;
+        }
+        let mut done = 0usize;
+        while done < buf.len() {
+            let va = virt + done as u64;
+            let Some((phys, _)) = self.translate(va) else { return false };
+            let Some(k) = phys_access(phys) else { return false };
+            let off = (va & (PAGE - 1)) as usize;
+            let n = (PAGE as usize - off).min(buf.len() - done);
+            // SAFETY: `k` is the kernel alias of a present page and the copy
+            // stays inside it.
+            unsafe { core::ptr::copy_nonoverlapping(k as *const u8, buf.as_mut_ptr().add(done), n) };
+            done += n;
+        }
+        true
+    }
+
+    /// Copy `data` into user memory.  Without `force`, every page must be
+    /// user-writable (what a syscall may do for the user); with `force` the
+    /// write ignores the user permission bits (what the loader does to fill
+    /// a read-only code page).
+    pub fn write(&self, virt: u64, data: &[u8], force: bool) -> bool {
+        if !user_range_ok(virt, data.len()) {
+            return false;
+        }
+        let mut done = 0usize;
+        while done < data.len() {
+            let va = virt + done as u64;
+            let Some((phys, writable)) = self.translate(va) else { return false };
+            if !writable && !force {
+                return false;
+            }
+            let Some(k) = phys_access(phys) else { return false };
+            let off = (va & (PAGE - 1)) as usize;
+            let n = (PAGE as usize - off).min(data.len() - done);
+            // SAFETY: as in `read`.
+            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr().add(done), k as *mut u8, n) };
+            done += n;
+        }
+        true
+    }
+}
+
+impl Drop for AddressSpace {
+    fn drop(&mut self) {
+        // Never free the tables we are running on.
+        if current_cr3() == self.pml4 {
+            activate_kernel();
+        }
+        // SAFETY: the user half is exclusively ours; kernel slots are shared
+        // and skipped.
+        unsafe {
+            for i in 0..256usize {
+                if slot_is_kernel(i) {
+                    continue;
+                }
+                let e = tr_live(self.pml4, i);
+                if e & P != 0 {
+                    free_tree(e & PHYS_MASK, 3);
+                }
+            }
+        }
+        crate::pmm::free_page(self.pml4);
+    }
 }

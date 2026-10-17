@@ -47,6 +47,7 @@ mod vfs;
 mod vga;
 mod vm;
 mod unifont;
+mod usermode;
 mod vmm;
 mod snake;
 
@@ -175,6 +176,15 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     } else {
         kprintln!("heap     : init failed (no memory for the region)");
     }
+
+    // --- Ring 3 (phase 2.1) ---------------------------------------------------
+    let ui = usermode::init();
+    kprintln!(
+        "user     : ring 3 ready (syscall/sysret, per-process page tables, tss rsp0), smep {} smap {} umip {}",
+        if ui.smep { "on" } else { "n/a" },
+        if ui.smap { "on" } else { "n/a" },
+        if ui.umip { "on" } else { "n/a" }
+    );
 
     // --- ACPI / APIC ------------------------------------------------------------
     // Needs the direct map (tables above 4 GiB) so it comes after the VMM.

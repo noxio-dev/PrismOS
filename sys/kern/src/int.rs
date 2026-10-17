@@ -8,11 +8,17 @@
 // valid across the swap):
 //   0x08  kernel code (64-bit)
 //   0x10  kernel data
-//   0x18  user code (64-bit, for a future ring 3)
-//   0x20  user data
+//   0x18  user data   (0x1b with RPL 3)
+//   0x20  user code   (0x23 with RPL 3)
 //   0x28  TSS
 //
+// The user pair is ordered data-then-code on purpose: `sysretq` loads
+// SS = STAR[63:48] + 8 and CS = STAR[63:48] + 16 (64-bit), so with
+// STAR[63:48] = 0x10 it lands exactly on 0x18/0x20 (see usermode.rs).
+//
 // Entry path: IDT gate -> naked stub -> isr_common -> isr_handler(frame).
+// When the interrupted code was in ring 3, isr_common brackets the handler
+// with `swapgs` so the kernel always runs with its own GS base.
 
 use core::arch::{asm, naked_asm};
 use core::ptr::addr_of_mut;
@@ -20,10 +26,10 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 pub const KERNEL_CS: u16 = 0x08;
 pub const KERNEL_DS: u16 = 0x10;
-#[allow(dead_code)] // ring 3 later
-pub const USER_CS: u16 = 0x18;
-#[allow(dead_code)] // ring 3 later
-pub const USER_DS: u16 = 0x20;
+/// User data / stack selector (RPL 3).
+pub const USER_DS: u16 = 0x18 | 3;
+/// User code selector (RPL 3).
+pub const USER_CS: u16 = 0x20 | 3;
 pub const TSS_SEL: u16 = 0x28;
 
 pub const N_VECTORS: usize = 256;
@@ -101,8 +107,9 @@ const fn tss_high(base: u64) -> u64 {
     (base >> 32) & 0xFFFF_FFFF
 }
 
-/// Hardware task state (64-bit layout, 100 bytes packed).  Only RSP0 (a
-/// future ring 3) and IST1 (double fault) are used.
+/// Hardware task state (64-bit layout, 104 bytes packed).  RSP0 is the stack
+/// the CPU switches to on a ring 3 -> ring 0 transition (set per task with
+/// `set_rsp0`); IST1/IST2/IST3 are dedicated stacks for #DF, NMI and #MC.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct Tss {
@@ -132,6 +139,8 @@ struct Gates {
     tss: Tss,
     gdtr: PseudoDesc,
     df_stack: [u8; 8192], // IST1: dedicated #DF stack
+    nmi_stack: [u8; 8192], // IST2: dedicated NMI stack
+    mc_stack: [u8; 8192], // IST3: dedicated #MC stack
 }
 
 static mut GATES: Gates = Gates {
@@ -139,8 +148,8 @@ static mut GATES: Gates = Gates {
         0,                     // 0x00 null
         flat(0x9A, 0xA),       // 0x08 kernel code (L=1)
         flat(0x92, 0xC),       // 0x10 kernel data
-        flat(0xFA, 0xA),       // 0x18 user code
-        flat(0xF2, 0xC),       // 0x20 user data
+        flat(0xF2, 0xC),       // 0x18 user data (DPL 3)
+        flat(0xFA, 0xA),       // 0x20 user code (DPL 3, L=1)
         0,                     // 0x28 TSS low (patched at init)
         0,                     //      TSS high
         0,                     // padding
@@ -158,7 +167,18 @@ static mut GATES: Gates = Gates {
     },
     gdtr: PseudoDesc { limit: (GDT_WORDS * 8 - 1) as u16, base: 0 },
     df_stack: [0; 8192],
+    nmi_stack: [0; 8192],
+    mc_stack: [0; 8192],
 };
+
+/// Set the kernel stack the CPU switches to when an interrupt or exception
+/// arrives from ring 3 (TSS.RSP0).  Must point at the top of a mapped,
+/// 16-byte aligned stack that is present in every address space.
+pub fn set_rsp0(top: u64) {
+    // SAFETY: single CPU; the field is written with interrupts masked at
+    // every call site, and the CPU only reads it on a privilege change.
+    unsafe { (*addr_of_mut!(GATES)).tss.rsp0 = top };
+}
 
 /// Install the GDT/TSS.  Selector values match the loader's, so the live CS
 /// descriptor stays valid; only the data registers are reloaded, plus LTR.
@@ -172,8 +192,10 @@ pub fn gdt_init() {
     let tss_addr = &g.tss as *const Tss as u64;
     g.gdt[5] = tss_low(tss_addr, (core::mem::size_of::<Tss>() - 1) as u32);
     g.gdt[6] = tss_high(tss_addr);
-    g.tss.rsp0 = 0; // no ring 3 yet
+    g.tss.rsp0 = 0; // set per task by usermode before entering ring 3
     g.tss.ist[0] = g.df_stack.as_ptr() as u64 + g.df_stack.len() as u64;
+    g.tss.ist[1] = g.nmi_stack.as_ptr() as u64 + g.nmi_stack.len() as u64;
+    g.tss.ist[2] = g.mc_stack.as_ptr() as u64 + g.mc_stack.len() as u64;
     g.gdtr.base = g.gdt.as_ptr() as u64;
 
     // SAFETY: the tables live in the kernel image (the PMM never hands
@@ -315,9 +337,19 @@ stub!(stub_irq15, 0x2F);
 
 /// Common prologue/epilogue (naked).  The push order is the reverse of the
 /// `IsrFrame` field order; the pops mirror it exactly.
+///
+/// Entering from ring 3 leaves the user's GS base active, so the prologue
+/// executes `swapgs` when the saved CS has RPL 3 (CS sits at [rsp + 24]
+/// under the vector and error code) and the epilogue undoes it right before
+/// `iretq`.  The kernel therefore always runs with GS pointing at its
+/// per-CPU block (usermode.rs).
 #[unsafe(naked)]
 unsafe extern "C" fn isr_common() {
     naked_asm!(
+        "test qword ptr [rsp + 24], 3",
+        "jz 2f",
+        "swapgs",
+        "2:",
         "push r15",
         "push r14",
         "push r13",
@@ -354,6 +386,10 @@ unsafe extern "C" fn isr_common() {
         "pop r14",
         "pop r15",
         "add rsp, 16",       // drop vector + error code
+        "test qword ptr [rsp + 8], 3", // returning to ring 3?
+        "jz 3f",
+        "swapgs",
+        "3:",
         "iretq",
         sym isr_handler,
     );
@@ -413,11 +449,21 @@ extern "C" fn isr_handler(frame: &mut IsrFrame) {
             park();
         }
     }
+    // A timer tick that interrupted ring 3 is where the watchdog runs (the
+    // EOI has been sent by now, so abandoning this frame is safe).
+    if frame.cs & 3 == 3 && (v == 0x30 || v == 0x20) {
+        crate::usermode::on_tick();
+    }
 }
 
 /// Exception entry: a few are recoverable test hooks, the rest are fatal.
 fn handle_exception(frame: &mut IsrFrame) {
     let v = frame.vector as u8;
+    // Anything that goes wrong in ring 3 is the user program's problem, not
+    // the kernel's: end that program and return to the kernel context.
+    if frame.cs & 3 == 3 {
+        crate::usermode::on_user_exception(frame);
+    }
     match v {
         3 => {
             // int3 smoke test: #BP is a trap, the pushed RIP already sits
@@ -481,7 +527,7 @@ pub fn park() -> ! {
 pub fn idt_init() {
     set_gate(0, stub_de, 0);
     set_gate(1, stub_db, 0);
-    set_gate(2, stub_nmi, 0);
+    set_gate(2, stub_nmi, 2); // NMI on the IST2 stack
     set_gate(3, stub_bp, 0);
     set_gate(4, stub_of, 0);
     set_gate(5, stub_br, 0);
@@ -497,7 +543,7 @@ pub fn idt_init() {
     set_gate(15, stub_rv, 0);
     set_gate(16, stub_mf, 0);
     set_gate(17, stub_ac, 0);
-    set_gate(18, stub_mc, 0);
+    set_gate(18, stub_mc, 3); // machine check on the IST3 stack
     set_gate(19, stub_xm, 0);
     set_gate(20, stub_ve, 0);
 
