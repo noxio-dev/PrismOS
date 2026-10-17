@@ -22,6 +22,20 @@
 //   * Modifiers include AltGr (right alt): the FR AZERTY layout maps
 //     AltGr+8 to backslash, AltGr+9 to ^, AltGr+0 to @ ... which is how
 //     those characters are typed on a French laptop keyboard.
+//   * Every access to ports 0x60/0x64 is paced (~50 us between status
+//     polls) and every wait is bounded in time, like Linux's i8042 driver
+//     (udelay(50) + I8042_CTL_TIMEOUT).  On machines where the firmware
+//     keeps "USB legacy support" on, those ports are trapped by an SMM
+//     handler, and a tight polling loop fires one SMI per microsecond --
+//     which is how a stuck init used to freeze the whole box.  Paced and
+//     bounded, the driver survives behind the trap; a future USB driver
+//     should also take the legacy handoff over, the way Linux's PCI
+//     quirks do.
+//   * The reset fallback (0xFF) waits for the keyboard's BAT completion
+//     (0xAA, 500-750 ms per the PS/2 spec, up to ~4 s behind SMM -- the
+//     same budget Linux's libps2 gives PS2_CMD_RESET_BAT) before
+//     re-sending "enable scanning", so the command is no longer
+//     swallowed in the middle of the keyboard's self-test.
 //   * A controller that answers 0xFF/0x00 on the status port is detected
 //     as absent (pure-USB machines): the shell stays on the serial console
 //     and says so instead of spinning.
@@ -302,7 +316,6 @@ const SET2_TO_SET1: [u8; 128] = {
     t[0x7B] = 0x4A; // -
     t[0x7C] = 0x37; // *
     t[0x7D] = 0x49; // 9
-    t[0x4D] = 0x19; // p (correct entry)
     t
 };
 
@@ -452,6 +465,27 @@ impl Kbd {
 }
 
 // ------------------------------------------------------------ i8042 driver
+//
+// All waiting on the controller goes through paced, bounded helpers, the
+// way Linux's i8042 driver does it (drivers/input/serio/i8042.c):
+//
+//   * i8042_wait_read/i8042_wait_write poll the status register with
+//     udelay(50) between polls, bounded by I8042_CTL_TIMEOUT = 10000
+//     polls of 50 us = 500 ms -- "long enough for the i8042 itself to
+//     timeout on sending a byte to a non-existent mouse" (i8042.h).
+//   * i8042_flush() reads at most I8042_BUFFER_SIZE bytes, pausing
+//     udelay(50) before each one.
+//   * __i8042_command() waits for the input buffer to be free before the
+//     command byte AND before every parameter byte.
+//   * libps2.c gives a keyboard 200 ms to ACK an ordinary command, 1 s to
+//     clock a reset (0xFF), and 4 s to post the BAT completion after it.
+//
+// Pacing matters as much as the bounds: with USB legacy support enabled,
+// the firmware's SMM handler traps 0x60/0x64, and an un-paced polling
+// loop fires an SMI per microsecond -- the machine then spends all its
+// time entering and leaving SMM and the kernel appears hung.  With one
+// poll per ~50 us the trap costs at most ~20k SMI/s during bring-up
+// (init-time only; the IRQ path never polls on a clock).
 
 fn status() -> u8 {
     // SAFETY: fixed legacy port, no memory involved.
@@ -463,99 +497,216 @@ fn data() -> u8 {
     unsafe { inb(KBD_DATA) }
 }
 
-/// Drain the output buffer (bounded), throwing away firmware leftovers.
+/// ~50 us of pacing between two status polls.  io_wait() is a single
+/// write to the POST debug port (~1 us each), looped 50 times -- the
+/// no-timer equivalent of Linux's udelay(50).
+fn pace() {
+    let mut i = 0;
+    while i < 50 {
+        io_wait();
+        i += 1;
+    }
+}
+
+/// Busy-wait `polls` paced polls (~50 us each).  Used where Linux sleeps
+/// between retries (msleep(50) in i8042_controller_selftest), without
+/// requiring a timer this early in bring-up.
+fn delay_polls(polls: u32) {
+    let mut i = 0;
+    while i < polls {
+        pace();
+        i += 1;
+    }
+}
+
+/// Wait until the `mask` bits are SET in the status register, one paced
+/// poll at a time, at most `budget` polls.  False = timeout.
+fn wait_set(mask: u8, budget: u32) -> bool {
+    let mut n = 0u32;
+    while n < budget {
+        if status() & mask != 0 {
+            return true;
+        }
+        pace();
+        n += 1;
+    }
+    false
+}
+
+/// Wait until the `mask` bits are CLEAR in the status register (same
+/// shape as wait_set).
+fn wait_clear(mask: u8, budget: u32) -> bool {
+    let mut n = 0u32;
+    while n < budget {
+        if status() & mask == 0 {
+            return true;
+        }
+        pace();
+        n += 1;
+    }
+    false
+}
+
+// Wait budgets, in polls of ~50 us (see pace()):
+//   10_000 polls ~= 500 ms  -- controller replies: I8042_CTL_TIMEOUT.
+//                          Self-test and port-test answers are slow, and
+//                          SMM emulation only makes them slower.
+//    4_000 polls ~= 200 ms  -- keyboard ACK, libps2.c's default timeout.
+//   20_000 polls ~=   1 s   -- reset (0xFF) ACK: libps2 gives the reset
+//                          command itself a full second.
+//   80_000 polls ~=   4 s   -- BAT completion after a reset: libps2's
+//                          PS2_CMD_RESET_BAT budget.
+const CTL_TIMEOUT: u32 = 10_000;
+const KBD_ACK_TIMEOUT: u32 = 4_000;
+const RESET_ACK_TIMEOUT: u32 = 20_000;
+const BAT_TIMEOUT: u32 = 80_000;
+
+/// Drain the output buffer, throwing away firmware leftovers.  Mirrors
+/// Linux's i8042_flush(): bounded, with a ~50 us pause before each read
+/// so an SMM trap is not hammered 64 times in a row.
 fn drain() {
     let mut n = 0;
-    while status() & 0x01 != 0 && n < 32 {
+    while n < 32 {
+        if status() & 0x01 == 0 {
+            break; // output buffer empty
+        }
+        pace();
         data();
-        io_wait();
         n += 1;
     }
 }
 
-/// Send a controller command and return the (bounded-wait) reply byte.
+/// Write a no-parameter, no-reply controller command (0xAD, 0xA7, 0xAE).
+/// Waits for the input buffer to be free first, like Linux's
+/// __i8042_command() does before every byte it writes to the chip.
+fn ctl_outb(cmd: u8) {
+    if !wait_clear(0x02, CTL_TIMEOUT) {
+        return; // controller wedged: nothing else we can do from here
+    }
+    // SAFETY: controller command on fixed legacy ports.
+    unsafe { outb(KBD_STATUS, cmd) };
+}
+
+/// Send a controller command and return its reply byte, or None on
+/// timeout.  The reply wait gets the full CTL_TIMEOUT budget: the
+/// self-test (0xAA) legitimately takes tens to hundreds of milliseconds
+/// on real controllers, and longer still behind an SMM trap.
 fn ctrl_cmd(cmd: u8) -> Option<u8> {
+    if !wait_clear(0x02, CTL_TIMEOUT) {
+        return None; // input buffer stuck full: controller wedged
+    }
     // SAFETY: controller command protocol on fixed ports.
-    unsafe {
-        let mut spin = 0u32;
-        while status() & 0x02 != 0 && spin < 100_000 {
-            spin += 1;
-        }
-        if spin >= 100_000 {
-            return None;
-        }
-        outb(KBD_STATUS, cmd);
-        spin = 0;
-        while status() & 0x01 == 0 && spin < 10_000_000 {
-            spin += 1;
-        }
-        if spin >= 10_000_000 {
-            return None;
-        }
-        Some(inb(KBD_DATA))
+    unsafe { outb(KBD_STATUS, cmd) };
+    if !wait_set(0x01, CTL_TIMEOUT) {
+        return None; // controller never answered
     }
+    Some(data())
 }
 
-/// Read the controller config byte (command 0x20).
+/// Read the controller config byte (command 0x20), re-reading until two
+/// consecutive reads agree (bounded).  A single read can come back
+/// corrupted -- especially behind SMM emulation -- which is why Linux's
+/// i8042_controller_init() double-reads the CTR the same way before
+/// trusting it.
 fn read_config() -> Option<u8> {
-    ctrl_cmd(0x20)
+    let mut prev = ctrl_cmd(0x20)?;
+    let mut tries = 0;
+    while tries < 10 {
+        match ctrl_cmd(0x20) {
+            Some(cur) if cur == prev => return Some(cur),
+            Some(cur) => {
+                pace(); // udelay(50), like Linux between CTR re-reads
+                prev = cur;
+            }
+            None => return Some(prev), // re-read timed out: trust the first
+        }
+        tries += 1;
+    }
+    Some(prev) // never stabilized: best effort
 }
 
-/// Write the controller config byte (command 0x60).
+/// Write the controller config byte (command 0x60).  Waits for the input
+/// buffer before the command byte *and* before the parameter, exactly
+/// like Linux's __i8042_command().
 fn write_config(cfg: u8) -> bool {
-    // SAFETY: as above.
-    unsafe {
-        let mut spin = 0u32;
-        while status() & 0x02 != 0 && spin < 100_000 {
-            spin += 1;
-        }
-        if spin >= 100_000 {
-            return false;
-        }
-        outb(KBD_STATUS, 0x60);
-        outb(KBD_DATA, cfg);
-        true
+    if !wait_clear(0x02, CTL_TIMEOUT) {
+        return false;
     }
+    // SAFETY: controller command protocol on fixed ports.
+    unsafe { outb(KBD_STATUS, 0x60) };
+    if !wait_clear(0x02, CTL_TIMEOUT) {
+        return false;
+    }
+    // SAFETY: as above.
+    unsafe { outb(KBD_DATA, cfg) };
+    true
 }
 
 /// Send a command TO THE KEYBOARD (through 0x60) and wait for its ACK
-/// (0xFA), handling one resend request (0xFE).  Returns true on ACK.
-fn kbd_cmd(cmd: u8) -> bool {
-    // SAFETY: keyboard command protocol on fixed ports.
-    unsafe {
-        for _attempt in 0..2 {
-            let mut spin = 0u32;
-            while status() & 0x02 != 0 && spin < 100_000 {
-                spin += 1;
+/// (0xFA), handling one resend request (0xFE) per attempt, two attempts
+/// total.  `budget` bounds each ACK wait in polls of ~50 us.
+///
+/// This is the function that used to wedge the box: the old code spun up
+/// to 2 x 20 million un-paced status reads, so behind an SMM trap
+/// (USB legacy support) it fired an SMI per microsecond, and even on sane
+/// hardware a silent keyboard blocked init for tens of seconds.  Paced
+/// and bounded, a missing keyboard costs at most `budget` polls per
+/// attempt -- and the controller itself reports a transmit timeout long
+/// before that anyway (it gives up on a device after ~15 ms, which is
+/// exactly why Linux sized I8042_CTL_TIMEOUT at 500 ms).
+fn kbd_cmd(cmd: u8, budget: u32) -> bool {
+    for _attempt in 0..2 {
+        if !wait_clear(0x02, CTL_TIMEOUT) {
+            return false; // controller input buffer wedged
+        }
+        // SAFETY: keyboard command protocol on fixed ports.
+        unsafe { outb(KBD_DATA, cmd) };
+        let mut noise = 0u32;
+        loop {
+            if !wait_set(0x01, budget) {
+                return false; // keyboard silent: absent or wedged
             }
-            if spin >= 100_000 {
-                return false;
-            }
-            outb(KBD_DATA, cmd);
-            let mut noise = 0u32;
-            loop {
-                let mut spin2 = 0u32;
-                while status() & 0x01 == 0 && spin2 < 20_000_000 {
-                    spin2 += 1;
-                }
-                if spin2 >= 20_000_000 {
-                    return false; // keyboard silent: absent or wedged
-                }
-                match inb(KBD_DATA) {
-                    0xFA => return true, // ACK
-                    0xFE => break,       // resend -> one more attempt
-                    0xAA | 0xEE => {}    // BAT ok / echo: keep waiting
-                    _ => {
-                        noise += 1;
-                        if noise > 64 {
-                            return false;
-                        }
+            // SAFETY: as above.
+            match data() {
+                0xFA => return true, // ACK
+                0xFE => break,       // resend -> one more attempt
+                0xAA | 0xEE => {}    // BAT ok / echo: keep waiting
+                _ => {
+                    noise += 1;
+                    if noise > 64 {
+                        return false; // stream of junk: give up
                     }
                 }
             }
         }
-        false
     }
+    false
+}
+
+/// After a keyboard reset (0xFF), wait for the BAT completion the
+/// keyboard posts when its self-test finishes: 0xAA ok, 0xFC/0xFD error.
+/// The PS/2 spec gives the keyboard 500-750 ms; SMM emulation adds a
+/// lot, so the budget is ~4 s -- the same figure Linux's libps2 waits
+/// for PS2_CMD_RESET_BAT.  Mouse bytes in the shared buffer are skipped.
+fn wait_bat() -> bool {
+    let mut n = 0u32;
+    while n < BAT_TIMEOUT {
+        // SAFETY: status/data reads on fixed legacy ports.
+        let st = status();
+        if st & 0x01 != 0 {
+            let b = data();
+            if st & 0x20 == 0 {
+                match b {
+                    0xAA => return true,       // BAT ok
+                    0xFC | 0xFD => return false, // BAT error
+                    _ => {}                    // late ACK echo / stale byte
+                }
+            }
+        }
+        pace();
+        n += 1;
+    }
+    false
 }
 
 /// Bring up the i8042 + keyboard for real hardware (see module comment).
@@ -582,18 +733,31 @@ pub fn init() -> Status {
     drain();
 
     // 3. Self-test (0xAA -> 0x55) and first-port test (0xAB -> 0x00).
-    let self_test = ctrl_cmd(0xAA) == Some(0x55);
+    //    Like Linux's i8042_controller_selftest(), the self-test is
+    //    retried a few times: on some fragile controllers the first
+    //    answer is garbage.
+    let mut self_test = false;
+    let mut tries = 0;
+    while tries < 5 {
+        match ctrl_cmd(0xAA) {
+            Some(0x55) => {
+                self_test = true;
+                break;
+            }
+            Some(_) => {}   // wrong reply: pause and retry
+            None => break,  // controller silent: retrying is pointless
+        }
+        delay_polls(1000); // ~50 ms, Linux's msleep(50) between tries
+        tries += 1;
+    }
     let port_test = ctrl_cmd(0xAB) == Some(0x00);
     STATUS_SELFTEST.store(self_test, Ordering::Release);
     STATUS_PORTTEST.store(port_test, Ordering::Release);
 
     // 4. Disable both ports while reconfiguring, then rewrite the config
     //    byte: first-port IRQ on, translation on, mouse off.
-    // SAFETY: controller command sequence on fixed ports.
-    unsafe {
-        outb(KBD_STATUS, 0xAD); // disable first port
-        outb(KBD_STATUS, 0xA7); // disable second port (kills AUX bytes)
-    }
+    ctl_outb(0xAD); // disable first port
+    ctl_outb(0xA7); // disable second port (kills AUX bytes)
     drain();
 
     let mut cfg = read_config().unwrap_or(0);
@@ -611,16 +775,19 @@ pub fn init() -> Status {
     unsafe { (*addr_of_mut!(KBD)).set2 = !translated };
 
     // 5. Enable the first port and (re)start scanning.
-    // SAFETY: controller command.
-    unsafe { outb(KBD_STATUS, 0xAE) };
+    ctl_outb(0xAE);
     drain();
-    let mut acked = kbd_cmd(0xF4); // enable scanning
+    let mut acked = kbd_cmd(0xF4, KBD_ACK_TIMEOUT); // enable scanning
     if !acked {
         // Keyboards the firmware never configured (common on UEFI-only
-        // laptops) may need a full reset before they talk to us.
-        if kbd_cmd(0xFF) {
-            drain(); // reset echoes BAT status
-            acked = kbd_cmd(0xF4);
+        // laptops) may need a full reset before they talk to us.  After
+        // the reset the keyboard is busy running its BAT for 500-750 ms
+        // (PS/2 spec, slower behind SMM): wait for the 0xAA completion
+        // *before* re-sending 0xF4, or the command is swallowed in the
+        // middle of the self-test and the keyboard never answers it.
+        if kbd_cmd(0xFF, RESET_ACK_TIMEOUT) && wait_bat() {
+            drain(); // the BAT byte is behind us; drop anything stale
+            acked = kbd_cmd(0xF4, KBD_ACK_TIMEOUT);
         }
     }
     STATUS_ACKED.store(acked, Ordering::Release);
