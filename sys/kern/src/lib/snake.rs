@@ -4,8 +4,8 @@
 //! Snake for PrismOS.
 //!
 //! The rules live in `Game`, a plain state machine with no I/O.  Two front
-//! ends draw it: a pixel-art one on the double-buffered framebuffer (UEFI),
-//! and a text one for VGA text mode (BIOS).  Nothing is printed through the
+//! ends draw it: a pixel-art one on the double-buffered framebuffer (UEFI
+//! GOP or BIOS VBE), and a text one for plain VGA text mode.  Nothing is printed through the
 //! console while the pixel version runs, so the board never scrolls, never
 //! flickers and never goes through the serial line.
 

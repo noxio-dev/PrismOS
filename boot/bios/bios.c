@@ -170,12 +170,15 @@ int plat_alloc(int kind, uint64_t size, uint64_t align, uint64_t *phys)
     return 0;
 }
 
+static void vbe_enter(void);
+
 int plat_exit(struct prism_mmap_entry *buf, int max)
 {
     int n = e820_read(buf, max);
     if (n <= 0) return -1;
     n = mmap_carve(buf, n, max, 0, 0x100000, PRISM_MEM_RESERVED);
     n = mmap_carve(buf, n, max, LOADER_ADDR, LOADER_STACK_TOP - LOADER_ADDR, PRISM_MEM_LOADER);
+    vbe_enter();                                       /* last BIOS call: no way back from here */
     return n;
 }
 
@@ -201,10 +204,158 @@ static int rsdp_ok(const uint8_t *p)
 static int sm_ok(const uint8_t *p) { return checksum_ok(p, p[5]); }
 static int sm3_ok(const uint8_t *p) { return checksum_ok(p, p[6]); }
 
+/* ---- VESA / VBE linear framebuffer ----------------------------------------
+ *
+ * The loader menu stays on the VGA text screen.  Just before the kernel is
+ * entered we look for a 32 bpp linear-framebuffer mode (VBE 2.0+) and, at the
+ * point of no return (plat_exit), switch to it and describe it to the kernel
+ * in struct prism_framebuffer, exactly like the UEFI GOP path does.  When no
+ * usable mode exists the kernel keeps getting VGA text as before.
+ *
+ * loader.conf: vbe_mode="auto" (default), "off", or an exact "1024x768".
+ */
+
+#define VBE_INFO        (BIOS_SCRATCH + 0x100)      /* 512-byte controller block */
+#define VBE_MODEINFO    (BIOS_SCRATCH + 0x400)      /* 256-byte mode block */
+#define VBE_AUTO_MAX_W  1920                        /* auto never goes beyond 1080p ... */
+#define VBE_AUTO_MAX_H  1080                        /* ... unless nothing smaller exists */
+
+static struct prism_bootinfo *vbe_bi;               /* set while a mode is pending */
+static uint16_t vbe_mode_id;
+
+static int vbe_call(uint32_t ax, uint32_t bx, uint32_t cx, uint32_t di)
+{
+    struct bios_regs r = { 0 };
+    r.intno = 0x10; r.eax = ax; r.ebx = bx; r.ecx = cx; r.es = 0; r.edi = di;
+    bios_call(&r);
+    return (r.eax & 0xFFFF) == 0x004F;              /* AL = supported, AH = success */
+}
+
+/* Fill *fb from the mode block of `mode` (already in VBE_MODEINFO). */
+static void vbe_describe(struct prism_framebuffer *fb, uint16_t vbe_version)
+{
+    const uint8_t *mi = (const uint8_t *)VBE_MODEINFO;
+    uint16_t pitch = *(const uint16_t *)(mi + 16);
+    if (vbe_version >= 0x0300 && *(const uint16_t *)(mi + 50))
+        pitch = *(const uint16_t *)(mi + 50);       /* LinBytesPerScanLine */
+    fb->addr = *(const uint32_t *)(mi + 40);        /* PhysBasePtr */
+    fb->width = *(const uint16_t *)(mi + 18);
+    fb->height = *(const uint16_t *)(mi + 20);
+    fb->pitch = pitch;
+    fb->bpp = mi[25];
+    fb->red_bits = mi[31];   fb->red_shift = mi[32];
+    fb->green_bits = mi[33]; fb->green_shift = mi[34];
+    fb->blue_bits = mi[35];  fb->blue_shift = mi[36];
+    fb->reserved = 0;
+}
+
+/* "1024x768" -> 1, anything else -> 0 */
+static int parse_wxh(const char *s, unsigned *w, unsigned *h)
+{
+    unsigned a = 0, b = 0;
+    int digits = 0;
+    for (; *s >= '0' && *s <= '9'; s++, digits++) a = a * 10 + (*s - '0');
+    if (!digits || (*s != 'x' && *s != 'X')) return 0;
+    s++;
+    for (digits = 0; *s >= '0' && *s <= '9'; s++, digits++) b = b * 10 + (*s - '0');
+    if (!digits || *s) return 0;
+    *w = a; *h = b;
+    return a > 0 && b > 0;
+}
+
+/* Pick a mode and fill *fb.  Returns the VBE mode number, or 0 for none. */
+static uint16_t vbe_pick(struct prism_framebuffer *fb)
+{
+    const char *opt = env_get("vbe_mode");
+    unsigned want_w = 0, want_h = 0;
+    if (opt && (!strcmp(opt, "off") || !strcmp(opt, "no") || !strcmp(opt, "0") ||
+                !strcmp(opt, "text") || !strcmp(opt, "NO") || !strcmp(opt, "OFF")))
+        return 0;
+    if (opt) parse_wxh(opt, &want_w, &want_h);       /* anything else means "auto" */
+
+    uint8_t *info = (uint8_t *)VBE_INFO;
+    memset(info, 0, 512);
+    memcpy(info, "VBE2", 4);                         /* ask for the VBE 2.0+ block */
+    if (!vbe_call(0x4F00, 0, 0, VBE_INFO) || memcmp(info, "VESA", 4)) return 0;
+    uint16_t version = *(uint16_t *)(info + 4);
+    if (version < 0x0200) return 0;                  /* no linear framebuffer before 2.0 */
+
+    uint32_t mp = *(uint32_t *)(info + 14);          /* far pointer to the mode list */
+    uint32_t list_at = (mp >> 16) * 16 + (mp & 0xFFFF);
+    if (!list_at || list_at >= 0x100000) return 0;
+    const uint16_t *list = (const uint16_t *)(uintptr_t)list_at;
+
+    /* exact: the mode asked for; best: largest up to 1080p; small: smallest above it */
+    uint16_t exact = 0, best = 0, small = 0;
+    uint64_t best_area = 0, small_area = ~0ULL;
+    uint8_t *mi = (uint8_t *)VBE_MODEINFO;
+    for (int i = 0; i < 512 && list[i] != 0xFFFF; i++) {
+        uint16_t mode = list[i];
+        memset(mi, 0, 256);
+        if (!vbe_call(0x4F01, 0, mode, VBE_MODEINFO)) continue;
+        uint16_t attr = *(uint16_t *)mi;
+        if ((attr & 0x91) != 0x91) continue;         /* supported + graphics + linear fb */
+        if (mi[25] != 32 || mi[27] != 6) continue;   /* 32 bpp direct colour only */
+        struct prism_framebuffer c;
+        vbe_describe(&c, version);
+        if (!c.addr || c.pitch < c.width * 4 || c.width < 640 || c.height < 400) continue;
+        uint64_t area = (uint64_t)c.width * c.height;
+        if (want_w && c.width == want_w && c.height == want_h) exact = mode;
+        if (c.width <= VBE_AUTO_MAX_W && c.height <= VBE_AUTO_MAX_H) {
+            if (area > best_area) { best = mode; best_area = area; }
+        } else if (area < small_area) {
+            small = mode; small_area = area;
+        }
+    }
+    uint16_t pick = exact ? exact : best ? best : small;   /* a mode that is not there: auto */
+    if (!pick) return 0;
+
+    memset(mi, 0, 256);
+    if (!vbe_call(0x4F01, 0, pick, VBE_MODEINFO)) return 0;
+    vbe_describe(fb, version);
+    return pick;
+}
+
+/* Called at the point of no return: switch the display to the chosen mode. */
+static void vbe_enter(void)
+{
+    struct prism_bootinfo *bi = vbe_bi;
+    if (!bi) return;
+    vbe_bi = NULL;
+    if (vbe_call(0x4F02, vbe_mode_id | 0x4000, 0, 0)) {   /* bit 14: linear fb, bit 15 clear: wipe it */
+        /* The pitch can change once the mode is really set: ask again. */
+        struct bios_regs r = { 0 };
+        r.intno = 0x10; r.eax = 0x4F06; r.ebx = 1;        /* get scan line length */
+        bios_call(&r);
+        if ((r.eax & 0xFFFF) == 0x004F && (r.ebx & 0xFFFF) >= bi->fb.width * 4)
+            bi->fb.pitch = r.ebx & 0xFFFF;
+        return;
+    }
+    /* The BIOS refused after all: back to text mode and tell the kernel. */
+    struct bios_regs r = { 0 };
+    r.intno = 0x10; r.eax = 0x0003;
+    bios_call(&r);
+    memset(&bi->fb, 0, sizeof bi->fb);
+    bi->flags = (bi->flags & ~PRISM_FLAG_FB) | PRISM_FLAG_VGATEXT;
+}
+
+/* Choose the kernel's display and describe it in the boot info. */
+static void vbe_setup(struct prism_bootinfo *bi)
+{
+    vbe_mode_id = vbe_pick(&bi->fb);
+    if (vbe_mode_id) {
+        bi->flags |= PRISM_FLAG_FB;                   /* no VGA text: it is invisible in a graphics mode */
+        vbe_bi = bi;
+    } else {
+        memset(&bi->fb, 0, sizeof bi->fb);
+        bi->flags |= PRISM_FLAG_VGATEXT;
+    }
+}
+
 void plat_fill_bootinfo(struct prism_bootinfo *bi)
 {
     bi->firmware = PRISM_FW_BIOS;
-    bi->flags |= PRISM_FLAG_VGATEXT;
+    vbe_setup(bi);
     uint64_t ebda = (uint64_t)*(volatile uint16_t *)0x40E << 4;
     uint64_t rsdp = 0;
     if (ebda >= 0x80000 && ebda < 0xA0000) rsdp = scan_sig(ebda, ebda + 1024, "RSD PTR ", 8, rsdp_ok);

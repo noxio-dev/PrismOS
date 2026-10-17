@@ -80,7 +80,9 @@ def main():
              "pit      : channel 0 at 100 Hz", "pmm      :", "vmm      :",
              "heap     :", "kbd      :", "interrupts enabled", "prism# "]
     scenarios = [
-        ("BIOS autoboot", bios_cmd, [], hello + ["firmware : BIOS"], 40),
+        # BIOS gets a VBE linear framebuffer now: the loader switches to it at the
+        # point of no return and the kernel double-buffers its console.
+        ("BIOS autoboot", bios_cmd, [], hello + ["firmware : BIOS", " framebuffer", "back buffer active"], 40),
         ("BIOS prompt: Esc, then boot", bios_cmd,
          [("Autoboot in", "\x1b"), ("OK ", "version\rboot -v\r")],
          ["OK ", "PrismOS loader 0.1.0", "Hello, world!", 'cmdline  : "-v"'], 40),
@@ -95,7 +97,7 @@ def main():
     ]
     if code and vars_ and os.path.exists(code):
         scenarios += [
-            ("UEFI autoboot", uefi_cmd, [], hello + ["firmware : UEFI"], 90),
+            ("UEFI autoboot", uefi_cmd, [], hello + ["firmware : UEFI", " framebuffer", "back buffer active"], 90),
             ("UEFI prompt: Esc, then boot", uefi_cmd,
              [("Autoboot in", "\x1b"), ("OK ", "lsmem\rboot -v\r")],
              ["OK ", "usable", "Hello, world!", 'cmdline  : "-v"'], 90),

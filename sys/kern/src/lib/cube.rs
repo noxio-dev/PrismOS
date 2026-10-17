@@ -174,7 +174,8 @@ fn draw_cube(s: &mut Surface, cx: i32, cy: i32, d: i32, angles: (i32, i32, i32),
 pub fn run() {
     while crate::hw::kbd::pop_char().is_some() {}
     let Some((w, h)) = crate::console::with_surface(|s| (s.w as i32, s.h as i32)) else {
-        crate::kprintln!("cube: needs a framebuffer (UEFI boot); this machine is in VGA text mode.");
+        crate::kprintln!("cube: needs a graphics framebuffer, but this machine is in VGA text mode.");
+        crate::kprintln!("      (BIOS boot: check that loader.conf does not set vbe_mode=\"off\")");
         return;
     };
 

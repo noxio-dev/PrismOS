@@ -19,7 +19,7 @@ phase 2.2).
 | Memory (PMM, VMM, heap)  | done    | bitmap PMM, own page tables with direct map and W^X, buddy + slab heap |
 | CPU / interrupts         | done    | GDT/TSS, IDT, exception recovery, PIT                                  |
 | ACPI / APIC              | done    | LAPIC + IOAPIC, 8259 masked, LAPIC timer calibrated                    |
-| Input / output           | done    | PS/2 keyboard (us/fr), serial, VGA text and framebuffer console (Unicode, double-buffered in RAM); `snake` and `cube` demos draw pixels on the UEFI framebuffer |
+| Input / output           | done    | PS/2 keyboard (us/fr), serial, VGA text and framebuffer console (Unicode, double-buffered in RAM); `snake` and `cube` demos draw pixels on the framebuffer (UEFI GOP, or a BIOS VBE linear mode chosen by the loader: `vbe_mode` in loader.conf) |
 | PCI / AHCI               | done    | bus scan, SATA DMA read/write/flush; polled (no interrupts yet)       |
 | VFS                      | done    | mounts, path walk, symlinks, descriptor API                            |
 | ext4                     | partial | R/W, extents, checksums written; no journal, see limits below          |
