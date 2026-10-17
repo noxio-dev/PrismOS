@@ -85,7 +85,7 @@ def main():
         ("BIOS autoboot", bios_cmd, [], hello + ["firmware : BIOS", " framebuffer", "back buffer active"], 40),
         ("BIOS prompt: Esc, then boot", bios_cmd,
          [("Autoboot in", "\x1b"), ("OK ", "version\rboot -v\r")],
-         ["OK ", "PrismOS loader 0.1.0", "Hello, world!", 'cmdline  : "-v"'], 40),
+         ["OK ", "PrismOS loader (bios", "Hello, world!", 'cmdline  : "-v"'], 40),
         ("BIOS shell: exception recovery", bios_cmd,
          [("prism# ", "crash int\r"), ("prism# ", "crash page\r"),
           ("prism# ", "crash div\r"), ("prism# ", "uptime\r")],
