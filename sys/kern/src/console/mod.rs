@@ -6,6 +6,8 @@
 // console API (`init`, `clear`, `char_width`, `_print`) is re-exported here.
 
 pub mod fb;
+#[allow(dead_code)] // graphics primitives: not every one is used yet
+pub mod gfx;
 #[allow(dead_code)] // legacy 8x8 font, superseded by unifont
 pub mod font;
 pub mod unifont;

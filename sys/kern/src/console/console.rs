@@ -69,6 +69,10 @@ pub fn _print(args: fmt::Arguments) {
     // SAFETY: single CPU; the guard serializes output paths.
     let c = unsafe { &mut *addr_of_mut!(CONSOLE) };
     let _ = c.write_fmt(args);
+    // One copy to the screen per print call, not one per character.
+    if let Some(f) = c.fb.as_mut() {
+        f.flush();
+    }
 }
 
 /// Cells `c` occupies on screen (0, 1 or 2).  VGA text mode always uses 1.
@@ -92,6 +96,50 @@ pub fn clear() {
         v.clear();
     }
     if let Some(f) = c.fb.as_mut() {
-        f.clear(); // add a clear() to FbConsole if it does not have one yet
+        f.clear();
+        f.flush();
     }
+}
+
+/// Put the text cursor back at the top-left corner without erasing the
+/// screen (redraw a fixed-size text screen in place, without flicker).
+pub fn home() {
+    let _guard = crate::arch::io::IrqGuard::new();
+    // SAFETY: single CPU, guarded against IRQ-context prints.
+    let c = unsafe { &mut *addr_of_mut!(CONSOLE) };
+    if let Some(v) = c.vga.as_mut() {
+        v.home();
+    }
+    if let Some(f) = c.fb.as_mut() {
+        f.home();
+    }
+}
+
+/// Switch the framebuffer console to a RAM back buffer.  Needs the PMM and
+/// the live page tables, so call it right after `vmm::init`.  Returns true
+/// when the back buffer is active (false: no framebuffer, or no memory --
+/// drawing then keeps going straight to the screen).
+pub fn enable_backbuffer() -> bool {
+    let _guard = crate::arch::io::IrqGuard::new();
+    // SAFETY: single CPU, guarded against IRQ-context prints.
+    let c = unsafe { &mut *addr_of_mut!(CONSOLE) };
+    match c.fb.as_mut() {
+        Some(f) => f.enable_backbuffer(),
+        None => false,
+    }
+}
+
+/// Run `f` on the framebuffer surface and present what it drew.  Returns
+/// `None` when there is no framebuffer (BIOS / VGA text boot).
+///
+/// Interrupts stay masked while `f` runs (one frame: well under one 10 ms
+/// timer tick), and `f` must not print: the console is borrowed.
+pub fn with_surface<R>(f: impl FnOnce(&mut crate::console::gfx::Surface) -> R) -> Option<R> {
+    let _guard = crate::arch::io::IrqGuard::new();
+    // SAFETY: single CPU with IRQs masked, so no print can interleave.
+    let c = unsafe { &mut *addr_of_mut!(CONSOLE) };
+    let fbc = c.fb.as_mut()?;
+    let r = f(fbc.surface());
+    fbc.flush();
+    Some(r)
 }

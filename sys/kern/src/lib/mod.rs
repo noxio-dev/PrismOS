@@ -3,6 +3,7 @@
 //
 // Kernel utilities: line editing, print macros and a few extras.
 
+pub mod cube;
 pub mod format;
 pub mod line;
 pub mod snake;

@@ -29,6 +29,13 @@ impl Vga {
         self.cursor();
     }
 
+    /// Cursor to the top-left corner, screen contents untouched.
+    pub fn home(&mut self) {
+        self.x = 0;
+        self.y = 0;
+        self.cursor();
+    }
+
     fn scroll(&mut self) {
         for i in 0..COLS * (ROWS - 1) {
             // SAFETY: indices stay inside the 80x25 buffer.

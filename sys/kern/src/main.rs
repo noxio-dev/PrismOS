@@ -153,6 +153,9 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     } else {
         kprintln!("vmm      : table build failed -- running on loader tables");
     }
+    if console::enable_backbuffer() {
+        kprintln!("display  : back buffer active, text and graphics are double-buffered");
+    }
     if heap::init() {
         kprintln!(
             "heap     : {} KiB at {:#x} (buddy 4 KiB..4 MiB + slab 32..1024)",

@@ -70,7 +70,8 @@ const COMMANDS: &[Cmd] = &[
     Cmd { name: "reboot", usage: "", desc: "restart the machine", run: cmd_reboot },
     Cmd { name: "halt", usage: "", desc: "stop the machine", run: cmd_halt },
     Cmd { name: "unicode", usage: "", desc: "print a Unicode test page", run: cmd_unicode },
-    Cmd { name: "snake", usage: "", desc: "play Snake in the console", run: cmd_snake },
+    Cmd { name: "snake", usage: "", desc: "play Snake (pixel version on UEFI)", run: cmd_snake },
+    Cmd { name: "cube", usage: "", desc: "spinning 3D cube (UEFI framebuffer)", run: cmd_cube },
 ];
 
 pub(super) fn dispatch(name: &str, args: &mut Args) {
@@ -432,6 +433,10 @@ fn cmd_unicode(_args: &mut Args) {
 
 fn cmd_snake(_args: &mut Args) {
     crate::lib::snake::run();
+}
+
+fn cmd_cube(_args: &mut Args) {
+    crate::lib::cube::run();
 }
 
 // ---------------------------------------------------------------- reboot

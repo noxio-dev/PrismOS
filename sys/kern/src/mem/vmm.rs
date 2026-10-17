@@ -13,6 +13,7 @@
 //   0xFFFF_FFFF_8002_0000 ..                         kernel image, W^X:
 //         .text r-x   .rodata r--(NX)   .data/.bss rw-(NX)
 //   0xFFFF_FFFF_9000_0000 .. +16 MiB                 kernel heap (rw-, NX)
+//   0xFFFF_FFFF_A000_0000 .. +<=48 MiB               framebuffer back buffer (rw-, NX)
 //
 // While the tables are being built we still run on the loader's tables, so
 // table pages are reached through the identity map; after the switch the
@@ -443,6 +444,27 @@ pub fn map_heap(size: u64) -> u64 {
         v += PAGE;
     }
     v - HEAP_BASE
+}
+
+/// Back `size` bytes at `virt` with freshly allocated, zeroed 4 KiB pages
+/// (read/write, no-execute).  The PMM is checked up front, with a margin kept
+/// for page tables and other users: when it cannot cover the whole region
+/// nothing is mapped and 0 is returned.  Returns the number of bytes mapped.
+pub fn map_region(virt: u64, size: u64) -> u64 {
+    let pages = size.div_ceil(PAGE);
+    let free = crate::mem::pmm::stats_snapshot().free_pages.load(Ordering::Relaxed);
+    // Keep 1 MiB + the page-table pages we may need for ourselves.
+    if !READY.load(Ordering::Acquire) || virt & (PAGE - 1) != 0 || free < pages + 256 + pages / 512 {
+        return 0;
+    }
+    for i in 0..pages {
+        let Some(phys) = crate::mem::pmm::alloc_page() else { return 0 };
+        if !map_4k(virt + i * PAGE, phys, RW | NX) {
+            crate::mem::pmm::free_page(phys);
+            return 0;
+        }
+    }
+    pages * PAGE
 }
 
 #[allow(dead_code)]
