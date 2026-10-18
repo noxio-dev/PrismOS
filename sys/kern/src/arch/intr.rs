@@ -257,7 +257,7 @@ extern "C" fn isr_handler(frame: &mut IsrFrame) {
                 h(frame);
             }
         }
-        0x30 => crate::hw::apic::on_timer(),
+        0x30 => crate::hw::apic::on_timer(frame.cs & 3 == 3),
         0xFF => {} // spurious: no EOI by definition
         _ => {
             crate::kprintln!("\nunexpected interrupt vector {}", v);
@@ -329,6 +329,16 @@ pub fn park() -> ! {
         // SAFETY: deliberate final halt with interrupts masked.
         unsafe { asm!("cli\nhlt", options(nomem, nostack)) };
     }
+}
+
+/// Sleep until the next interrupt, from a context that runs with IF=0:
+/// `sti; hlt` (the CPU delays interrupt delivery by one instruction after
+/// `sti`, so the wake-up cannot slip between the two), then `cli` again.
+/// Used by the scheduler's idle loop while only sleeping processes remain.
+#[inline]
+pub fn idle_wait() {
+    // SAFETY: deliberate enable/halt/disable sequence, IF is 0 again after.
+    unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
 }
 
 /// Enable interrupts.  (No `preserves_flags`: `sti` modifies RFLAGS.)

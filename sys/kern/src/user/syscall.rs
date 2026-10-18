@@ -12,10 +12,16 @@
 //   (negative errno on failure); rcx and r11 are clobbered by the CPU.
 //     0 exit(code)            1 write(fd, buf, len)       2 getpid()
 //     3 uptime_ms()           4 yield()
+//     5 sleep(ms)             6 setprio(level)   (phase 2.3)
 //
-// `exit` and `yield` never return to the caller: exit tears the process
-// down, yield switches to the next one and comes back here only when the
-// process is scheduled again (the trap frame stayed on its kernel stack).
+// `exit` never returns to the caller.  `yield` and `sleep` switch to another
+// process and come back here only when the process is scheduled again (the
+// trap frame stayed on its kernel stack).  `yield` only hands the CPU to a
+// process of the same priority level or a better one.  `sleep` parks the
+// process for at least `ms` milliseconds (capped at 10 s) and returns 0.
+// `setprio` lowers the caller's priority (levels 0 = best .. 3); it returns
+// the previous level, -EINVAL for a level out of range and -EPERM when the
+// request would raise the priority.
 //
 // The descriptor API of fs/vfs.rs (open / read / write / seek / close) is
 // meant to sit behind this table later (phase 2.6).
@@ -90,6 +96,11 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
             process::yield_current();
             0
         }
+        5 => {
+            process::sleep_current(a0);
+            0
+        }
+        6 => process::setprio_current(a0),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

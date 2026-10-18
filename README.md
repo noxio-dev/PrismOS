@@ -11,8 +11,9 @@ UEFI, the kernel manages memory and interrupts, talks to an AHCI disk and
 mounts an ext4 volume that you can browse and modify from the kernel shell.
 Phase 2.1 adds ring 3: the kernel can run a flat program in user mode with its
 own page tables (see below). Phase 2.2 adds processes: a PCB, a private kernel
-stack and a context switch per program, with cooperative round-robin between
-them (preemption arrives with phase 2.3).
+stack and a context switch per program.  Phase 2.3 makes the scheduler
+preemptive: time slices on the LAPIC timer, strict priorities and
+sleep/wakeup.
 
 | Area                     | State   | Notes                                                                 |
 |--------------------------|---------|-----------------------------------------------------------------------|
@@ -25,7 +26,7 @@ them (preemption arrives with phase 2.3).
 | VFS                      | done    | mounts, path walk, symlinks, descriptor API                            |
 | ext4                     | partial | R/W, extents, checksums written; no journal, see limits below          |
 | Ring 3                   | done    | user page tables per process, `syscall`/`sysret`, TSS stacks, fault containment (phase 2.1) |
-| Processes / context switch | partial | PCB, kernel stacks, cooperative round-robin + yield syscall, watchdog, kernel threads (phase 2.2); no preemption yet (2.3) |
+| Processes / scheduler    | done    | PCB, kernel stacks, context switch, kernel threads (2.2); preemptive round-robin on the timer tick, 4 priority levels, `sleep`/`setprio` syscalls, CPU-time watchdog (2.3); no FPU state saved yet |
 | Networking, USB, SMP     | todo    | not started                                                            |
 
 **Testing.** `make fstest` (11 scenarios against `mke2fs` images, each validated
@@ -63,7 +64,7 @@ Phase 1 — kernel foundations
 Phase 2 — ring 3 and processes
 - [x] Phase 2.1 — ring 3: user page tables per process, `syscall`/`sysret`, TSS stacks
 - [x] Phase 2.2 — processes and threads: PCB, kernel stacks, context switch
-- [ ] Phase 2.3 — scheduler: preemptive round-robin on the LAPIC timer, then priorities, sleep/wakeup
+- [x] Phase 2.3 — scheduler: preemptive round-robin on the LAPIC timer, then priorities, sleep/wakeup
 - [ ] Phase 2.4 — ELF loader: `execve` from the VFS, argv/envp, auxv
 - [ ] Phase 2.5 — `fork`, `wait`, `exit`, signals (basic), copy-on-write
 - [ ] Phase 2.6 — file descriptors per process on top of the VFS, pipes, `/dev` (`console`, `null`, `zero`)
@@ -118,10 +119,11 @@ Beyond (nice to have)
 
 Shell: `user` lists the built-in test programs, `user <name>...` runs one or
 more at once, `usertest` runs them all (outcome, fault type and page-leak check,
-plus a two-process interleaving and a kernel-thread scenario) -- also part of
+plus a two-process interleaving, a kernel-thread scenario and the 2.3
+preemption / priority / wake-up scenarios) -- also part of
 `make test`.
 
-## Processes (phase 2.2)
+## Processes and scheduler (phases 2.2 and 2.3)
 
 `sys/kern/src/user/process.rs`:
 
@@ -140,15 +142,32 @@ plus a two-process interleaving and a kernel-thread scenario) -- also part of
   because the kernel half is mapped in every address space.  A fresh process
   starts on a trampoline that either drops into ring 3 through a prepared
   `iretq` frame (user program) or calls a plain Rust function (kernel thread).
-- **Scheduling** is cooperative round-robin: a process gives the CPU back with
-  the `yield` syscall, ends with `exit`, or is killed by the watchdog (the tick
-  that finds its 3 s budget spent) or a ring 3 exception.  `run_until_idle`
-  drives the queue from the shell; dead processes are reaped once their
-  outcome has been read.  Preemption on the LAPIC timer, priorities and
-  sleep/wakeup arrive with phase 2.3.
+- **Scheduling** (phase 2.3) is preemptive, strict priority + round-robin:
+  4 levels (0 = best, default 2); the CPU goes to the best ready process and
+  processes of one level take turns in table order.  The timer tick
+  (`pit::on_tick` -> `process::on_tick`) wakes sleepers, charges the running
+  process one tick of CPU and, when it interrupted ring 3, switches away from
+  inside the interrupt frame once the 20 ms slice is spent or a strictly better
+  process became ready (a just-woken sleeper preempts at once).  The trap frame
+  stays on the process's own kernel stack, so a preempted process resumes like
+  after a `yield`.  The kernel itself is not preemptible: syscalls and
+  exception handlers run with IF=0 and kernel threads never enable interrupts,
+  which is what lets this single-CPU design go without kernel locks (SMP or
+  kernel preemption will need them).  Syscalls: `yield` (to the same level or
+  better), `sleep(ms)` (parks the process, max 10 s), `setprio(level)` (a
+  process can only lower its own priority).  The watchdog now counts CPU ticks
+  (3 s default), so sleeping is free; a process ends with `exit`, the watchdog,
+  `kill` or a ring 3 exception.  `run_until_idle` drives the queue from the
+  shell, idling with `sti; hlt` while only sleepers remain; dead processes are
+  reaped once their outcome has been read.
+  *Limits:* strict priority means a high priority process that never yields
+  starves lower ones until its budget is gone (no aging yet), and FPU/SSE state
+  is not saved on a switch (needed before the ELF loader, phase 2.4).
 
 Shell: `ps` lists the process table, `kill <pid>` terminates a process,
-`user ping pong` shows two ring 3 programs interleaving through the switch.
+`user ping pong` shows two ring 3 programs interleaving through the switch,
+`user spin:3 spin:1` runs two CPU hogs at different priorities (`name:prio`),
+`ps` shows priority, CPU ticks and preemption count.
 
 ## Boot chain
 

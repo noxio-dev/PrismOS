@@ -46,12 +46,14 @@ const SFMASK: u64 = 0x100 | 0x200 | 0x400 | 0x4000 | 0x4_0000;
 /// User stack: 16 KiB below USER_STACK_TOP (the page under it stays unmapped
 /// as a guard).
 pub const USER_STACK_SIZE: u64 = 4 * PAGE;
-/// Default watchdog: 3 s at the 100 Hz system tick.
+/// Default watchdog: 3 s of CPU time (300 ticks at 100 Hz, charged only while running).
 pub const DEFAULT_TIMEOUT_TICKS: u64 = 300;
 
 pub const ENOSYS: i64 = 38;
 pub const EBADF: i64 = 9;
 pub const EFAULT: i64 = 14;
+pub const EPERM: i64 = 1;
+pub const EINVAL: i64 = 22;
 
 // ------------------------------------------------------------ per-CPU block
 
@@ -374,6 +376,21 @@ global_asm!(
     "    syscall",
     "    test rax, rax",
     "    jne uprog_sys_f5",
+    "    mov eax, 6",                    // setprio(0): raising the priority -> -EPERM
+    "    xor edi, edi",
+    "    syscall",
+    "    cmp rax, -1",
+    "    jne uprog_sys_f6",
+    "    mov eax, 6",                    // setprio(9): out of range -> -EINVAL
+    "    mov edi, 9",
+    "    syscall",
+    "    cmp rax, -22",
+    "    jne uprog_sys_f7",
+    "    mov eax, 6",                    // setprio(3): lowering works, returns the old level (2)
+    "    mov edi, 3",
+    "    syscall",
+    "    cmp rax, 2",
+    "    jne uprog_sys_f8",
     "    xor edi, edi",
     "    jmp uprog_sys_exit",
     "uprog_sys_f1: mov edi, 1",
@@ -385,6 +402,12 @@ global_asm!(
     "uprog_sys_f4: mov edi, 4",
     "    jmp uprog_sys_exit",
     "uprog_sys_f5: mov edi, 5",
+    "    jmp uprog_sys_exit",
+    "uprog_sys_f6: mov edi, 6",
+    "    jmp uprog_sys_exit",
+    "uprog_sys_f7: mov edi, 7",
+    "    jmp uprog_sys_exit",
+    "uprog_sys_f8: mov edi, 8",
     "uprog_sys_exit:",
     "    xor eax, eax",
     "    syscall",
@@ -454,6 +477,54 @@ global_asm!(
     "    mov edi, 3",
     "    syscall",
     "uprog_yield_end:",
+    ".balign 16",
+    // sleep (phase 2.3): sleeps 50 ms, then checks that the uptime moved by
+    // at least 50 ms (exit 0) or not (exit 1).
+    ".globl uprog_sleep_start",
+    ".globl uprog_sleep_end",
+    "uprog_sleep_start:",
+    "    mov eax, 3",                    // uptime_ms
+    "    syscall",
+    "    mov rbx, rax",
+    "    mov eax, 5",                    // sleep(50)
+    "    mov edi, 50",
+    "    syscall",
+    "    mov eax, 3",
+    "    syscall",
+    "    sub rax, rbx",
+    "    cmp rax, 50",
+    "    jb uprog_sleep_fail",
+    "    xor edi, edi",
+    "    jmp uprog_sleep_exit",
+    "uprog_sleep_fail: mov edi, 1",
+    "uprog_sleep_exit:",
+    "    xor eax, eax",
+    "    syscall",
+    "uprog_sleep_end:",
+    ".balign 16",
+    // spin (phase 2.3): burns the CPU in user mode, never yielding, until
+    // the uptime moved by 120 ms, then exits 0.  The only way another process
+    // gets the CPU meanwhile is the timer tick preempting it.
+    ".globl uprog_spin_start",
+    ".globl uprog_spin_end",
+    "uprog_spin_start:",
+    "    mov eax, 3",                    // uptime_ms
+    "    syscall",
+    "    mov rbx, rax",
+    "uprog_spin_loop:",
+    "    mov ecx, 200000",
+    "uprog_spin_burn:",
+    "    dec ecx",
+    "    jnz uprog_spin_burn",
+    "    mov eax, 3",
+    "    syscall",
+    "    sub rax, rbx",
+    "    cmp rax, 120",
+    "    jb uprog_spin_loop",
+    "    xor eax, eax",
+    "    xor edi, edi",
+    "    syscall",
+    "uprog_spin_end:",
     ".balign 16",
     // kread: read kernel memory (supervisor-only page) -> #PF
     ".globl uprog_kread_start",
@@ -528,6 +599,10 @@ unsafe extern "C" {
     static uprog_pong_end: u8;
     static uprog_yield_start: u8;
     static uprog_yield_end: u8;
+    static uprog_sleep_start: u8;
+    static uprog_sleep_end: u8;
+    static uprog_spin_start: u8;
+    static uprog_spin_end: u8;
     static uprog_kread_start: u8;
     static uprog_kread_end: u8;
     static uprog_lowmem_start: u8;
@@ -582,12 +657,14 @@ macro_rules! prog {
 }
 
 // #PF error code bits: 1 = protection (page present), 2 = write, 4 = user, 16 = instruction fetch.
-pub static PROGRAMS: [Prog; 13] = [
+pub static PROGRAMS: [Prog; 15] = [
     prog!("hello", "prints a line, exits with status 7", uprog_hello_start, uprog_hello_end, Expect::Exit(7), 0),
     prog!("sys", "syscall error paths (EFAULT, EBADF, ENOSYS, getpid)", uprog_sys_start, uprog_sys_end, Expect::Exit(0), 0),
     prog!("ping", "prints and yields 5 times (pairs with pong)", uprog_ping_start, uprog_ping_end, Expect::Exit(0), 0),
     prog!("pong", "the other half of the ping-pong, exits with status 3", uprog_pong_start, uprog_pong_end, Expect::Exit(3), 0),
     prog!("yield", "yields to the scheduler 3 times, exit status 3", uprog_yield_start, uprog_yield_end, Expect::Exit(3), 0),
+    prog!("sleep", "sleeps 50 ms and checks the uptime moved", uprog_sleep_start, uprog_sleep_end, Expect::Exit(0), 0),
+    prog!("spin", "burns the CPU ~120 ms without yielding (preemption)", uprog_spin_start, uprog_spin_end, Expect::Exit(0), 0),
     prog!("kread", "reads kernel memory -> #PF (user, protection)", uprog_kread_start, uprog_kread_end,
           Expect::Fault { vector: 14, set: 0x5, clear: 0x12 }, 0),
     prog!("lowmem", "reads the kernel identity map -> #PF", uprog_lowmem_start, uprog_lowmem_end,

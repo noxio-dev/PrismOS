@@ -132,7 +132,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         if serial::present() { "" } else { " (no UART detected)" }
     );
 
-    intr::register_irq(pic::IRQ_TIMER, |_f| pit::on_tick());
+    intr::register_irq(pic::IRQ_TIMER, |f| pit::on_tick(f.cs & 3 == 3));
     intr::register_irq(pic::IRQ_KBD, |_f| kbd::on_irq());
 
     // --- Memory management ----------------------------------------------------
@@ -181,7 +181,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     );
     process::init();
     kprintln!(
-        "proc     : pcb + {} KiB kernel stacks per process, cooperative round-robin (yield)",
+        "proc     : pcb + {} KiB kernel stacks per process, preemptive priority scheduler",
         process::KSTACK_SIZE >> 10
     );
 

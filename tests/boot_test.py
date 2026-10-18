@@ -94,16 +94,19 @@ def main():
         ("BIOS shell: memory + layout", bios_cmd,
          [("prism# ", "meminfo\r"), ("prism# ", "layout fr\r"), ("prism# ", "kbd\r")],
          ["pages total", "self-test: ok", "switched to fr", "i8042"], 60),
-        # Phase 2: ring 3 processes, cooperative context switch, watchdog.
-        ("BIOS shell: ring 3 processes (phase 2.2)", bios_cmd,
-         [("prism# ", "user ping pong\r"), ("prism# ", "usertest\r"),
-          ("prism# ", "ps\r")],
+        # Phase 2: ring 3 processes, context switch, preemptive scheduler
+        # (time slices, priorities, sleep/wakeup), watchdog.
+        ("BIOS shell: ring 3 processes + scheduler (phase 2.3)", bios_cmd,
+         [("prism# ", "user ping pong\r"), ("prism# ", "user spin:3 sleep:0\r"),
+          ("prism# ", "usertest\r"), ("prism# ", "ps\r")],
          ["user     : syscall/sysret ready",
           "proc     : pcb + 16 KiB kernel stacks per process",
           "[ring 3] ping", "[ring 3] pong",
           "pid 1 ping", "pid 2 pong",
-          "usertest: all 16 passed",
-          "process table empty"], 180),
+          "pid 3 spin", "pid 4 sleep",
+          "preempt  ok", "prio     ok", "wakeup   ok",
+          "usertest: all 21 passed",
+          "process table empty"], 240),
     ]
     if code and vars_ and os.path.exists(code):
         scenarios += [

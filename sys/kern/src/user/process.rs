@@ -19,22 +19,49 @@
 //     the switch, *before* the asm switch, which is safe because the kernel
 //     half is mapped in every address space.
 //
-// Scheduling in 2.2 is cooperative round-robin: a process gives the CPU back
-// with the `yield` syscall, ends with `exit`, or is killed by the watchdog
-// (a tick that finds its deadline passed) or a ring 3 exception.  Preemption
-// on the LAPIC timer, priorities and sleep/wakeup arrive with phase 2.3.
+// Scheduling (phase 2.3): preemptive, strict priority + round-robin.
+//
+//   * priorities: `PRIO_LEVELS` levels, 0 is the best.  The CPU always goes
+//     to the best ready process; processes of the same level take turns in
+//     table order.  A lower level only runs when no better process is ready
+//     (strict priority: a never-yielding high priority process starves the
+//     others until its watchdog budget runs out);
+//   * time slice: `SLICE_TICKS` ticks (20 ms at 100 Hz).  The LAPIC timer
+//     tick (pit::on_tick -> `on_tick` below) charges the running process and,
+//     when its slice is used up or a strictly better process became ready,
+//     switches away from inside the interrupt frame -- the whole trap frame
+//     stays on the process's private kernel stack, exactly like a `yield`;
+//   * sleep / wakeup: `sleep(ms)` parks the process (`State::Sleeping`); the
+//     tick wakes it when its time is up, and a woken process that beats the
+//     running one preempts it at once;
+//   * a process also leaves the CPU with `yield` (to its own level or
+//     better), ends with `exit`, or is killed by the watchdog (CPU budget in
+//     ticks, charged only while it runs: sleeping is free) or by a ring 3
+//     exception.
+//
+// The kernel is NOT preemptible: only a tick that interrupted ring 3 may
+// switch.  Syscalls and exception handlers run with IF=0 (SFMASK / interrupt
+// gates) and kernel threads never enable interrupts, so no kernel data
+// structure needs a lock on this single CPU.  That stops being true with SMP
+// or kernel preemption (phase 1.5 / later).
 //
 // The shell/kernel itself is the implicit PID 0 ("main" context): it runs on
 // the boot stack, `run_until_idle()` drives the run queue until every
-// process is dead, and returns to the caller with the outcomes.
+// process is dead (idling with `sti; hlt` while the only survivors sleep),
+// and returns to the caller with the outcomes.
 //
 // Invariants (single CPU):
 //   * every context switch runs with interrupts masked, and both sides'
 //     saved RFLAGS have IF=0;
 //   * `CURRENT` points at the running process, or is null while the kernel
 //     (shell) runs;
-//   * the process table is only touched from the main context (spawn, reap,
-//     kill) or from the running process itself (yield, exit) with IF=0.
+//   * the process table's *structure* is only changed (spawn, reap, kill)
+//     with interrupts masked, because the tick walks it to wake sleepers;
+//     the tick itself only flips `state` fields.
+//
+// Not saved on a switch yet: FPU/SSE state.  The test programs and the
+// soft-float kernel never touch it; fxsave/xsave is required before the ELF
+// loader (phase 2.4) runs compiled code.
 
 use alloc::alloc::{alloc_zeroed, dealloc, Layout};
 use alloc::boxed::Box;
@@ -52,6 +79,16 @@ pub use crate::user::usermode::Outcome;
 /// bytes, nested interrupt frames, handler frames) must fit in it.
 pub const KSTACK_SIZE: usize = 16 * 1024;
 
+/// Number of priority levels (0 = best .. PRIO_LEVELS-1 = worst).
+pub const PRIO_LEVELS: u8 = 4;
+/// Level of a process spawned without an explicit priority.
+pub const PRIO_DEFAULT: u8 = 2;
+/// Time slice in ticks (100 Hz: 20 ms).
+pub const SLICE_TICKS: u32 = 2;
+/// Longest single `sleep` in milliseconds: the shell is blocked while a
+/// process sleeps, so an absurd request must not wedge the machine.
+pub const MAX_SLEEP_MS: u64 = 10_000;
+
 // ------------------------------------------------------------------- state
 
 /// Life cycle of a process.
@@ -61,6 +98,8 @@ pub enum State {
     Ready,
     /// On the CPU right now.
     Running,
+    /// Parked by `sleep` until `wake_at`.
+    Sleeping,
     /// Terminated; resources freed by the reaper, outcome kept for the shell.
     Zombie,
 }
@@ -120,8 +159,22 @@ pub struct Process {
     saved: SavedCtx,
     /// Thread entry, taken by the trampoline on first run.
     entry: Option<Entry>,
-    /// Watchdog deadline in ticks.
-    deadline: u64,
+    /// Priority level, 0 = best.
+    pub prio: u8,
+    /// Ticks left in the current time slice.
+    slice_left: u32,
+    /// CPU ticks charged so far (only while running).
+    pub used: u64,
+    /// Watchdog: CPU ticks the process may use in total.
+    budget: u64,
+    /// Tick at which a sleeping process becomes ready again.
+    wake_at: u64,
+    /// Times the process was given the CPU.
+    pub switches: u64,
+    /// Times the tick took the CPU away (slice used up or better process).
+    pub preempts: u64,
+    /// Order of death (1 = first to end since boot), 0 while alive.
+    pub exit_seq: u64,
 }
 
 /// The saved context of the main context (the shell / boot flow): the other
@@ -134,6 +187,17 @@ static mut CURRENT: *mut Process = core::ptr::null_mut();
 /// The process table, in pid order (pushed at spawn, drained by reap).
 static mut TABLE: Vec<Box<Process>> = Vec::new();
 static mut NEXT_PID: u64 = 1;
+/// Death counter behind `Process::exit_seq`.
+static mut EXIT_SEQ: u64 = 0;
+
+/// Next death number (interrupts masked at every call site).
+fn next_exit_seq() -> u64 {
+    // SAFETY: single CPU, callers run with IF=0.
+    unsafe {
+        EXIT_SEQ += 1;
+        EXIT_SEQ
+    }
+}
 
 /// Bring-up: nothing to do beyond the static initialisers (the table is
 /// empty and PIDs restart at 1); the call site logs the phase line.
@@ -185,7 +249,11 @@ fn spawn_common(
     aspace: Option<AddressSpace>,
     entry: Entry,
     timeout_ticks: u64,
+    prio: u8,
 ) -> Result<u64, &'static str> {
+    if prio >= PRIO_LEVELS {
+        return Err("bad priority");
+    }
     let layout = Layout::from_size_align(KSTACK_SIZE, 4096).map_err(|_| "bad layout")?;
     // SAFETY: valid non-zero layout.
     let kstack = unsafe { alloc_zeroed(layout) };
@@ -201,11 +269,8 @@ fn spawn_common(
         *(ktop as *mut u64).wrapping_sub(1) = proc_trampoline as usize as u64;
     }
 
-    // SAFETY: main context, no process running, interrupts masked.
-    let pid = unsafe { NEXT_PID };
-    unsafe { NEXT_PID += 1 }
     let proc = Process {
-        pid,
+        pid: 0, // assigned below, under the interrupt guard
         name,
         state: State::Ready,
         outcome: Outcome::None,
@@ -214,28 +279,48 @@ fn spawn_common(
         kstack_top: ktop,
         saved: SavedCtx { rsp: ktop - 8, ..SavedCtx::ZERO },
         entry: Some(entry),
-        deadline: crate::hw::pit::ticks()
-            + if timeout_ticks == 0 { DEFAULT_TIMEOUT_TICKS } else { timeout_ticks },
+        prio,
+        slice_left: SLICE_TICKS,
+        used: 0,
+        budget: if timeout_ticks == 0 { DEFAULT_TIMEOUT_TICKS } else { timeout_ticks },
+        wake_at: 0,
+        switches: 0,
+        preempts: 0,
+        exit_seq: 0,
     };
-    // SAFETY: as above.
+    // The tick walks the table to wake sleepers, and the shell calls us with
+    // interrupts on: the push (which may reallocate) must not be interrupted.
+    let _g = crate::arch::io::IrqGuard::new();
+    // SAFETY: interrupts masked by the guard, single CPU.
     unsafe {
-        (*addr_of_mut!(TABLE)).push(Box::new(proc));
+        let pid = NEXT_PID;
+        NEXT_PID += 1;
+        let mut b = Box::new(proc);
+        b.pid = pid;
+        (*addr_of_mut!(TABLE)).push(b);
+        Ok(pid)
     }
-    Ok(pid)
 }
 
-/// Spawn a user program from its flat image (built-in test programs).
+/// Spawn a user program from its flat image (built-in test programs) at the
+/// default priority.
 pub fn spawn_user(prog: &Prog) -> Result<u64, &'static str> {
+    spawn_user_prio(prog, PRIO_DEFAULT)
+}
+
+/// Spawn a user program at priority `prio` (0 = best).
+pub fn spawn_user_prio(prog: &Prog, prio: u8) -> Result<u64, &'static str> {
     // On a late failure the address space is dropped here with the locals
     // (RAII: its Drop frees the user half through the direct map).
     let aspace = usermode::build_aspace(prog.image())?;
-    spawn_common(prog.name, Some(aspace), Entry::User, prog.timeout)
+    spawn_common(prog.name, Some(aspace), Entry::User, prog.timeout, prio)
 }
 
 /// Spawn a kernel thread (runs `f` in ring 0 on its own kernel stack).
-/// Kernel threads have no watchdog: they must cooperate on their own.
+/// Kernel threads have no watchdog and are never preempted: they must
+/// cooperate on their own.
 pub fn spawn_kernel(name: &'static str, f: fn()) -> Result<u64, &'static str> {
-    spawn_common(name, None, Entry::Kernel(f), 0)
+    spawn_common(name, None, Entry::Kernel(f), 0, PRIO_DEFAULT)
 }
 
 // ----------------------------------------------------------- context switch
@@ -321,6 +406,8 @@ unsafe fn cpu_state_for(next: *mut Process) {
     let p = &mut *next;
     CURRENT = next;
     p.state = State::Running;
+    p.slice_left = SLICE_TICKS;
+    p.switches += 1;
     match &p.aspace {
         Some(a) => a.activate(),
         None => vmm::activate_kernel(),
@@ -340,51 +427,118 @@ unsafe fn switch_to_main(cur: *mut SavedCtx) {
     switch_ctx(cur, addr_of_mut!(MAIN_SAVED));
 }
 
-/// Give up the CPU: round-robin to the next ready process, or back to the
-/// main context when nobody else can run.  Returns once somebody switched
-/// back to us (the `yield` syscall path, and the tick watchdog's way back).
+/// Give up the CPU to a ready process of the same priority level or a better
+/// one (round-robin in table order inside a level).  When nobody qualifies
+/// the call returns at once: the caller keeps the CPU.  Returns, in the
+/// switching case, once somebody switched back to us (the `yield` syscall
+/// path).
 pub fn yield_current() {
     // SAFETY: the running process exists; interrupts are masked (syscall
-    // entry clears IF via SFMASK; the tick path runs in a handler).
+    // entry clears IF via SFMASK).
     unsafe {
         let cur = CURRENT;
         if cur.is_null() {
             return; // the kernel context never yields to itself
         }
-        (*cur).state = State::Ready;
-
-        match pick_ready_after((*cur).pid) {
-            Some(next) => {
-                cpu_state_for(next);
-                switch_ctx(&mut (*cur).saved, &(*next).saved);
-            }
-            None => switch_to_main(&mut (*cur).saved),
+        if let Some(next) = pick_ready((*cur).pid, (*cur).prio) {
+            (*cur).state = State::Ready;
+            cpu_state_for(next);
+            switch_ctx(&mut (*cur).saved, &(*next).saved);
+            // Back in our own context: the switcher republished the CPU
+            // state (CURRENT, CR3, RSP0) for us before the switch.
+            (*CURRENT).state = State::Running;
         }
-        // Back in our own context: the switcher republished the CPU state
-        // (CURRENT, CR3, RSP0) for us before the switch.
-        (*CURRENT).state = State::Running;
     }
 }
 
-/// First ready process in the table strictly after `pid` (pid order,
-/// wrapping around); None when no *other* process is ready.
-fn pick_ready_after(pid: u64) -> Option<*mut Process> {
-    // SAFETY: table walk with interrupts masked; the returned pointer stays
-    // owned by the table.
+/// The ready process to run next, or None.  Candidates are ready processes
+/// other than `after` whose level is `limit` or better (numerically <=);
+/// the best level wins, and inside a level the first one in table order after
+/// `after` (round-robin; `after` = 0 means "from the start of the table").
+fn pick_ready(after: u64, limit: u8) -> Option<*mut Process> {
+    // SAFETY: table walk with interrupts masked (main context under cli, a
+    // syscall, or the tick handler); the pointer stays owned by the table.
     unsafe {
         let table = &mut *addr_of_mut!(TABLE);
         let n = table.len();
         if n == 0 {
             return None;
         }
-        let start = table.iter().position(|p| p.pid == pid).unwrap_or(0);
+        let start = table.iter().position(|p| p.pid == after).unwrap_or(n - 1);
+        let mut best: Option<*mut Process> = None;
+        let mut best_prio = u8::MAX;
         for k in 1..=n {
-            let idx = (start + k) % n;
-            if table[idx].pid != pid && table[idx].state == State::Ready {
-                return Some(&mut *table[idx] as *mut Process);
+            let p = &mut *table[(start + k) % n];
+            if p.pid != after
+                && p.state == State::Ready
+                && p.prio <= limit
+                && (best.is_none() || p.prio < best_prio)
+            {
+                best_prio = p.prio;
+                best = Some(p as *mut Process);
             }
         }
-        None
+        best
+    }
+}
+
+/// Park the running process for at least `ms` milliseconds (rounded up to
+/// the tick, plus the partial tick in progress) and run somebody else; the
+/// call returns once the process is woken and scheduled again.  `sleep(0)`
+/// is a `yield`.
+pub fn sleep_current(ms: u64) {
+    // SAFETY: as `yield_current`: interrupts are masked in the syscall path,
+    // so the tick cannot slip between the state change and the switch.
+    unsafe {
+        let cur = CURRENT;
+        if cur.is_null() {
+            return;
+        }
+        if ms == 0 {
+            return yield_current();
+        }
+        let ticks = ms.min(MAX_SLEEP_MS).div_ceil(10) + 1;
+        (*cur).wake_at = crate::hw::pit::ticks() + ticks;
+        (*cur).state = State::Sleeping;
+        match pick_ready((*cur).pid, u8::MAX) {
+            Some(next) => {
+                cpu_state_for(next);
+                switch_ctx(&mut (*cur).saved, &(*next).saved);
+            }
+            None => switch_to_main(&mut (*cur).saved),
+        }
+        (*CURRENT).state = State::Running;
+    }
+}
+
+/// `setprio`: a process may lower its own priority (raise the level number),
+/// never raise it -- there are no users or permissions yet, so the safe rule
+/// is that nobody can promote itself.  Returns the previous level, or a
+/// negative errno.
+pub fn setprio_current(new: u64) -> i64 {
+    let Some(p) = current() else { return -(usermode::EFAULT) };
+    if new >= PRIO_LEVELS as u64 {
+        return -(usermode::EINVAL);
+    }
+    if (new as u8) < p.prio {
+        return -(usermode::EPERM);
+    }
+    let old = p.prio;
+    p.prio = new as u8;
+    old as i64
+}
+
+/// Wake every sleeper whose time is up.  Tick handler, IF=0; only flips
+/// `state`, never changes the table's structure.
+fn wake_sleepers(now: u64) {
+    // SAFETY: structure changes are made with interrupts masked (spawn,
+    // reap, kill), so this walk cannot overlap one.
+    unsafe {
+        for p in (*addr_of_mut!(TABLE)).iter_mut() {
+            if p.state == State::Sleeping && now >= p.wake_at {
+                p.state = State::Ready;
+            }
+        }
     }
 }
 
@@ -407,6 +561,7 @@ pub fn exit_current(outcome: Outcome) -> ! {
         let p = &mut *cur;
         p.outcome = outcome;
         p.state = State::Zombie;
+        p.exit_seq = next_exit_seq();
         // Free the user half now; the kernel stack is still in use -- the
         // reaper frees it from the main context once we are off it.
         drop(p.aspace.take());
@@ -451,22 +606,25 @@ pub fn run_until_idle() {
             if table.is_empty() {
                 break;
             }
-            // First ready process in table order.
-            let mut next: *mut Process = core::ptr::null_mut();
-            for p in table.iter_mut() {
-                if p.state == State::Ready {
-                    next = p.as_mut() as *mut Process;
-                    break;
+            // Best ready process (first in table order inside its level).
+            match pick_ready(0, u8::MAX) {
+                Some(next) => {
+                    cpu_state_for(next);
+                    switch_ctx(addr_of_mut!(MAIN_SAVED), &(*next).saved);
+                    // Back from the process (it slept or died).  Loop.
+                }
+                None => {
+                    if table.iter().any(|p| p.state == State::Sleeping) {
+                        // Only sleepers left: let the tick wake one up.
+                        crate::arch::intr::idle_wait();
+                    } else {
+                        // Nobody ready, nobody sleeping, nobody running
+                        // (a process is Ready before it switches away, dead
+                        // ones are zombies): all done.
+                        break;
+                    }
                 }
             }
-            if next.is_null() {
-                // Nobody ready and nobody running (a process is Ready before
-                // it switches away, dead ones are zombies): all done.
-                break;
-            }
-            cpu_state_for(next);
-            switch_ctx(addr_of_mut!(MAIN_SAVED), &(*next).saved);
-            // Back from the process (it yielded or died).  Loop.
         }
         usermode::set_kstack_top(0);
     }
@@ -488,20 +646,60 @@ pub fn on_user_exception(frame: &mut IsrFrame) -> ! {
     });
 }
 
-/// Called from the tick handler (pit::on_tick): kill a process that used up
-/// its watchdog budget without yielding.  The tick EOI is already sent and
-/// interrupts are masked in the handler, so switching away from the
-/// interrupt frame is safe (the dying stack is freed by the reaper).
-pub fn on_tick() {
-    // SAFETY: read-only access to the running process from the handler.
+/// Called from the tick handler (pit::on_tick), `from_user` = the tick
+/// interrupted ring 3.  The tick EOI is already sent and interrupts are
+/// masked in the handler, so switching away from the interrupt frame is safe
+/// (the trap frame stays on the process's kernel stack; a dying process's
+/// stack is freed by the reaper).
+///
+///   1. wake the sleepers whose time is up;
+///   2. charge the running process one tick and kill it when its CPU budget
+///      is gone (watchdog; user processes only);
+///   3. preempt, only if the tick interrupted ring 3: when the slice is over
+///      hand the CPU to a ready process of the same level or better, and
+///      before that to a strictly better one (just woken, say).
+pub fn on_tick(from_user: bool) {
+    // SAFETY: handler context with IF=0; `CURRENT` and the table are only
+    // changed with interrupts masked.
     unsafe {
+        wake_sleepers(crate::hw::pit::ticks());
+
         let cur = CURRENT;
         if cur.is_null() {
-            return;
+            return; // the shell or the idle loop was interrupted
         }
-        let p = &mut *cur;
-        if p.aspace.is_some() && crate::hw::pit::ticks() >= p.deadline {
+        (*cur).used += 1;
+        if (*cur).aspace.is_some() && (*cur).used >= (*cur).budget {
             exit_current(Outcome::Timeout);
+        }
+        if !from_user {
+            return; // the kernel is not preemptible
+        }
+
+        if (*cur).slice_left > 0 {
+            (*cur).slice_left -= 1;
+        }
+        let limit = if (*cur).slice_left == 0 {
+            (*cur).prio
+        } else if (*cur).prio > 0 {
+            (*cur).prio - 1
+        } else {
+            return;
+        };
+        match pick_ready((*cur).pid, limit) {
+            Some(next) => {
+                (*cur).state = State::Ready;
+                (*cur).preempts += 1;
+                cpu_state_for(next);
+                switch_ctx(&mut (*cur).saved, &(*next).saved);
+                // Resumed: whoever switched back republished our CPU state.
+                (*CURRENT).state = State::Running;
+            }
+            None => {
+                if (*cur).slice_left == 0 {
+                    (*cur).slice_left = SLICE_TICKS; // alone at our level: new slice
+                }
+            }
         }
     }
 }
@@ -520,6 +718,7 @@ pub fn kill(pid: u64) -> bool {
             if p.pid == pid && p.state != State::Zombie {
                 p.outcome = Outcome::Killed;
                 p.state = State::Zombie;
+                p.exit_seq = next_exit_seq();
                 drop(p.aspace.take());
                 found = true;
             }

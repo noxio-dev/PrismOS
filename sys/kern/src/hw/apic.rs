@@ -269,9 +269,9 @@ fn calibrate(ms: u32) -> Option<u64> {
 }
 
 /// Periodic tick: this handler is the new PIT.
-pub fn on_timer() {
+pub fn on_timer(from_user: bool) {
     lapic_eoi();
-    crate::hw::pit::on_tick();
+    crate::hw::pit::on_tick(from_user);
 }
 
 // ------------------------------------------------------------------- init
