@@ -69,7 +69,7 @@ EFI_OBJS  := $(patsubst %.c,$B/efi/%.o,$(COMMON_SRCS) boot/loader/ext4.c $(wildc
 
 # ---- default target ----------------------------------------------------
 
-.PHONY: all clean run run-uefi run-iso test kernel esp root iso run-kvm run-uefi-kvm data fstest
+.PHONY: all clean run run-uefi run-iso test kernel esp root iso run-kvm run-uefi-kvm data fstest usr
 all: $B/$(NAME).img
 
 # ---- compile rules -------------------------------------------------------
@@ -136,6 +136,43 @@ $B/kernel: FORCE
 	@cmp -s $(KERNEL_ELF) $@ || cp -f $(KERNEL_ELF) $@
 FORCE:
 
+# ---- user space (phase 2.4) -----------------------------------------------------
+# Programs are static PIE ELF files (the kernel's loader applies the RELATIVE
+# relocations at USER_BASE), linked with page-aligned segments so each one
+# gets its own protection (W^X).  usr/lib = crt0 + mini libc, usr/<name>/<name>.c
+# = one program, installed as /bin/<name> in the ext4 root.
+
+LLD       ?= ld.lld
+USR_PROGS := hello
+USR_CFLAGS := -target x86_64-unknown-none-elf -ffreestanding -fPIE -fno-stack-protector \
+              -fno-asynchronous-unwind-tables -fno-math-errno -O2 -Wall -Wextra \
+              -nostdinc -isystem $(CCRES) -I usr/include
+USR_LDFLAGS := -pie --no-dynamic-linker -z separate-code -z max-page-size=4096 \
+               -z noexecstack -z norelro -e _start
+USR_LIB_OBJS := $B/usr/lib/crt0.o $B/usr/lib/prism.o
+USR_BINS  := $(addprefix $B/usr/bin/,$(USR_PROGS))
+
+$B/usr/lib/%.o: usr/lib/%.c usr/include/prism.h
+	@mkdir -p $(@D)
+	$(CC) $(USR_CFLAGS) -c -o $@ $<
+
+$B/usr/lib/%.o: usr/lib/%.S
+	@mkdir -p $(@D)
+	$(CC) $(USR_CFLAGS) -c -o $@ $<
+
+$B/usr/%.o: usr/%.c usr/include/prism.h
+	@mkdir -p $(@D)
+	$(CC) $(USR_CFLAGS) -c -o $@ $<
+
+define USR_PROG_RULE
+$B/usr/bin/$(1): $B/usr/$(1)/$(1).o $(USR_LIB_OBJS)
+	@mkdir -p $$(@D)
+	$(LLD) $(USR_LDFLAGS) -o $$@ $(USR_LIB_OBJS) $$<
+endef
+$(foreach p,$(USR_PROGS),$(eval $(call USR_PROG_RULE,$(p))))
+
+usr: $(USR_BINS)
+
 # ---- P1 (ESP) and P3 (ext4 root) trees -------------------------------------------
 
 # P1: minimal FAT ESP - only the UEFI stub the firmware launches.
@@ -148,7 +185,7 @@ $B/esp.stamp: $B/loader.efi
 
 # P3: ext4 root, read by the loader (boot tree) and the kernel (root fs).
 root: $B/root.stamp
-$B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*)
+$B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) $(USR_BINS)
 	rm -rf $B/root
 	mkdir -p $B/root/boot/lua $B/root/boot/defaults $B/root/boot/kernel \
                  $B/root/bin $B/root/etc $B/root/usr
@@ -156,6 +193,9 @@ $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*)
 	cp boot/conf/defaults-loader.conf $B/root/boot/defaults/loader.conf
 	cp boot/conf/loader.conf $B/root/boot/loader.conf
 	cp $B/kernel $B/root/boot/kernel/kernel
+	cp $(USR_BINS) $B/root/bin/
+	printf '#!/bin/sh\necho "not an ELF file"\n' > $B/root/bin/notelf
+	chmod 755 $B/root/bin/*
 	touch $@
 
 $B/$(NAME).img: $B/boot0.bin $B/boot1.bin $B/loader.bin $B/esp.stamp $B/root.stamp tools/mkimage.py include/prism.inc

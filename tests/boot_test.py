@@ -135,6 +135,28 @@ def main():
           "preempt  ok", "prio     ok", "wakeup   ok",
           "usertest: all 21 passed",
           "process table empty"], 240),
+        # Phase 2.4: ELF programs from the ext4 root (/bin/hello is a static PIE
+        # built by `make`): loader, argv/envp/auxv, execve, per-process FPU
+        # state (two float workloads interleaved by the scheduler), fault
+        # containment, exit status.  pids are sequential since boot.
+        ("BIOS shell: ELF programs + execve (phase 2.4)", bios_cmd,
+         [("prism# ", "exec hello info alpha\r"),
+          ("pid 1 hello -- exited with status 0", "exec hello chain x y\r"),
+          ("pid 2 hello -- exited with status 0", "exec hello errors\r"),
+          ("pid 3 hello -- exited with status 0", "exec hello fpu 1 -- hello fpu 2\r"),
+          ("pid 5 hello -- exited with status 0", "exec hello fault\r"),
+          ("pid 6 hello -- killed by exception 14", "exec hello exit 42\r"),
+          ("pid 7 hello -- exited with status 42", "exec notelf\r")],
+         ['argv[2] = "alpha"', "env: PRISMOS=2.4", "main() runs at 0x80", "AT_PAGESZ = 4096",
+          "float check: ok",
+          "hello chain: pid 2 calls execve()", 'argv[2] = "(after execve)"', 'argv[4] = "y"',
+          "execve(/nonexistent)         -> -2", "execve(/boot/loader.conf)    -> -13",
+          "execve(/bin/notelf)          -> -8", "execve(/bin) directory       -> -21",
+          "execve(bad pointer)          -> -14", "execve(path too long)        -> -36",
+          "execve(70 arguments)         -> -7", "still alive after 0 failures",
+          "fpu 1: 40 rounds ok", "fpu 2: 40 rounds ok",
+          "hello fault: about to dereference NULL", "pid 6 hello -- killed by exception 14",
+          "pid 7 hello -- exited with status 42", "/bin/notelf: not an ELF file"], 240),
     ]
     if code and vars_ and os.path.exists(code):
         scenarios += [

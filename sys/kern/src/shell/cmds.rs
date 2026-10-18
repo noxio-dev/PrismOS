@@ -74,6 +74,7 @@ const COMMANDS: &[Cmd] = &[
     Cmd { name: "cube", usage: "", desc: "spinning 3D cube (needs a framebuffer)", run: cmd_cube },
     Cmd { name: "user", usage: "[<program>...]", desc: "run ring 3 test programs as processes (none: list)", run: shuser::cmd_user },
     Cmd { name: "usertest", usage: "", desc: "run every ring 3 test and check the outcomes", run: shuser::cmd_usertest },
+    Cmd { name: "exec", usage: "[-p prio] <program> [args...] [-- ...]", desc: "run ELF programs from the file system (bare name: /bin)", run: shuser::cmd_exec },
     Cmd { name: "ps", usage: "", desc: "list the process table", run: shuser::cmd_ps },
     Cmd { name: "kill", usage: "<pid>", desc: "terminate a process", run: shuser::cmd_kill },
     Cmd { name: "dmesg", usage: "[-l level]", desc: "kernel log ring (debug/info/warn/error)", run: cmd_dmesg },

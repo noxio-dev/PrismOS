@@ -13,7 +13,9 @@ Phase 2.1 adds ring 3: the kernel can run a flat program in user mode with its
 own page tables (see below). Phase 2.2 adds processes: a PCB, a private kernel
 stack and a context switch per program.  Phase 2.3 makes the scheduler
 preemptive: time slices on the LAPIC timer, strict priorities and
-sleep/wakeup.
+sleep/wakeup.  Phase 2.4 adds an ELF loader: compiled C programs (static PIE)
+are loaded from the ext4 root, started with argv/envp/auxv, and can replace
+themselves with `execve`; the FPU/SSE state is now saved per process.
 
 | Area                     | State   | Notes                                                                 |
 |--------------------------|---------|-----------------------------------------------------------------------|
@@ -26,15 +28,18 @@ sleep/wakeup.
 | VFS                      | done    | mounts, path walk, symlinks, descriptor API                            |
 | ext4                     | partial | R/W, extents, checksums written; no journal, see limits below          |
 | Ring 3                   | done    | user page tables per process, `syscall`/`sysret`, TSS stacks, fault containment (phase 2.1) |
-| Processes / scheduler    | done    | PCB, kernel stacks, context switch, kernel threads (2.2); preemptive round-robin on the timer tick, 4 priority levels, `sleep`/`setprio` syscalls, CPU-time watchdog (2.3); no FPU state saved yet |
+| Processes / scheduler    | done    | PCB, kernel stacks, context switch, kernel threads (2.2); preemptive round-robin on the timer tick, 4 priority levels, `sleep`/`setprio` syscalls, CPU-time watchdog (2.3); FXSAVE state per process (2.4) |
+| ELF loader / `execve`    | done    | static ELF64 (`ET_EXEC` / static PIE with RELATIVE relocations), W^X segments, System V initial stack with argv / envp / auxv, `execve` syscall, `/bin/hello` demo built from `usr/` (2.4) |
 | Networking, USB, SMP     | todo    | not started                                                            |
 
 **Testing.** `make fstest` (11 scenarios against `mke2fs` images, each validated
 by `e2fsck -fn`) covers the VFS and ext4 on the host. `make test` boots the image
 under QEMU on BIOS and UEFI and drives the shell over the serial line, including
 the ext4 root partition (read-write, re-checked with `e2fsck` on the host), a
-partition-layout assertion and a ring 3 process / context switch scenario
-(phase 2.2).
+partition-layout assertion, a ring 3 process / context switch scenario
+(phase 2.2) and an ELF scenario (phase 2.4: `/bin/hello` with argv/envp/auxv,
+`execve`, its error paths, two float workloads interleaved by the scheduler,
+fault containment, exit status).
 
 **Known limits of phase 1.4.** No journal (writes go straight to disk; a crash
 mid-operation can need an `fsck`; journals that need recovery mount read-only),
@@ -65,7 +70,7 @@ Phase 2 — ring 3 and processes
 - [x] Phase 2.1 — ring 3: user page tables per process, `syscall`/`sysret`, TSS stacks
 - [x] Phase 2.2 — processes and threads: PCB, kernel stacks, context switch
 - [x] Phase 2.3 — scheduler: preemptive round-robin on the LAPIC timer, then priorities, sleep/wakeup
-- [ ] Phase 2.4 — ELF loader: `execve` from the VFS, argv/envp, auxv
+- [x] Phase 2.4 — ELF loader: `execve` from the VFS, argv/envp, auxv
 - [ ] Phase 2.5 — `fork`, `wait`, `exit`, signals (basic), copy-on-write
 - [ ] Phase 2.6 — file descriptors per process on top of the VFS, pipes, `/dev` (`console`, `null`, `zero`)
 
@@ -115,7 +120,8 @@ Beyond (nice to have)
 - **Containment**: any exception in ring 3 (or the watchdog) ends the program
   and returns to the scheduler; the kernel never panics because of user code.
 - **Syscalls** (rax = number, args rdi/rsi/rdx, result in rax, `-errno` on failure):
-  `0 exit`, `1 write(fd 1|2)`, `2 getpid`, `3 uptime_ms`, `4 yield` (phase 2.2).
+  `0 exit`, `1 write(fd 1|2)`, `2 getpid`, `3 uptime_ms`, `4 yield` (phase 2.2),
+  `5 sleep`, `6 setprio` (2.3), `7 execve` (2.4).
 
 Shell: `user` lists the built-in test programs, `user <name>...` runs one or
 more at once, `usertest` runs them all (outcome, fault type and page-leak check,
@@ -161,13 +167,55 @@ preemption / priority / wake-up scenarios) -- also part of
   shell, idling with `sti; hlt` while only sleepers remain; dead processes are
   reaped once their outcome has been read.
   *Limits:* strict priority means a high priority process that never yields
-  starves lower ones until its budget is gone (no aging yet), and FPU/SSE state
-  is not saved on a switch (needed before the ELF loader, phase 2.4).
+  starves lower ones until its budget is gone (no aging yet).  x87/SSE state
+  is saved per process since phase 2.4 (FXSAVE, eager switch; no AVX).
 
 Shell: `ps` lists the process table, `kill <pid>` terminates a process,
 `user ping pong` shows two ring 3 programs interleaving through the switch,
 `user spin:3 spin:1` runs two CPU hogs at different priorities (`name:prio`),
 `ps` shows priority, CPU ticks and preemption count.
+
+## ELF programs (phase 2.4)
+
+`sys/kern/src/user/elf.rs` (loader), `user/fpu.rs`, `execve` in
+`user/syscall.rs`, shell command `exec`; user side in `usr/`.
+
+- **Format**: ELF64 little endian x86-64, `ET_EXEC` linked inside user space or,
+  the usual case, a **static PIE** (`ET_DYN`, `-pie --no-dynamic-linker`): user
+  space starts at 512 GiB, out of reach of the small code model, so the image is
+  loaded at `USER_CODE_BASE` and its `R_X86_64_RELATIVE` relocations are applied
+  by the loader.  `PT_INTERP` / `DT_NEEDED` are refused (no dynamic linker yet).
+- **Segments**: every `PT_LOAD` is mapped page by page with its own protection
+  (a writable *and* executable segment is refused, segments sharing a page too,
+  so link with `-z separate-code -z max-page-size=4096`); the file part is
+  copied, `.bss` stays zero; the entry point must be in an executable segment.
+- **Initial stack** (System V x86-64 process entry): 64 KiB, `rsp` 16-byte
+  aligned on `argc`, then `argv[]`, NULL, `envp[]`, NULL and the auxiliary vector
+  (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_ENTRY`, `AT_RANDOM`,
+  `AT_EXECFN`, `AT_UID`..., `AT_NULL`); at most 64 + 64 strings, 24 KiB.
+- **`execve(path, argv, envp)`** (syscall 7): builds the new address space first,
+  so a failure (`-ENOENT`, `-EACCES` when not executable, `-ENOEXEC`, `-E2BIG`,
+  `-EFAULT`, `-ENAMETOOLONG`, `-EISDIR`, `-ENOMEM`) leaves the caller untouched;
+  on success the process keeps its pid, priority and CPU budget but gets a new
+  image, name, stack and a pristine FPU state.
+- **FPU / SSE**: the kernel is soft-float, user programs are not.  Each process
+  has a 512-byte FXSAVE area, saved when it leaves the CPU and restored when it
+  returns (eager; CR0.EM/TS clear, CR4.OSFXSR/OSXMMEXCPT set at boot).
+
+Shell: `exec [-p prio] <program> [args...] [-- <program> [args...]]...` loads the
+programs (a bare name is looked up in `/bin`), runs them as processes and reports
+how they ended; several programs separated by `--` run concurrently.
+
+`usr/` holds the user side: `usr/lib/crt0.S` (`_start`), `usr/lib/prism.c`
+(freestanding mini libc: memcpy & co, `printf`, `getauxval`, ...),
+`usr/include/prism.h` (syscall wrappers) and one directory per program.
+`make` builds every program listed in `USR_PROGS` (static PIE, `ld.lld`) and
+installs it as `/bin/<name>` in the ext4 root.  `/bin/hello` is the demo and test:
+`hello [info]`, `hello fpu <tag>` (x87 + SSE workload, run two at once to check the
+per-process FPU state), `hello chain` (`execve` of itself), `hello errors` (all
+the `execve` error paths), `hello exit <n>`, `hello fault` (NULL dereference,
+contained by the kernel).  `/bin/notelf` is an executable text file used to check
+`-ENOEXEC`.
 
 ## Boot chain
 
@@ -310,6 +358,7 @@ contrib/lua              Lua 5.4.8 (MIT)
 include/                 prism.inc (shared constants), prism/boot.h
 sys/kern                 Rust kernel (no_std, x86_64-unknown-none)
 tools/mkimage.py         GPT disk image builder (ESP + BIOS boot + ext4 root)
+usr/                     user space: crt0 + mini libc (usr/lib), headers, programs (usr/hello)
 tests/boot_test.py       QEMU boot tests (incl. ext4 root, layout assertion)
 tests/fs_test.py         host VFS/ext4 tests (tests/fstest is the harness)
 ```

@@ -59,18 +59,21 @@
 //     with interrupts masked, because the tick walks it to wake sleepers;
 //     the tick itself only flips `state` fields.
 //
-// Not saved on a switch yet: FPU/SSE state.  The test programs and the
-// soft-float kernel never touch it; fxsave/xsave is required before the ELF
-// loader (phase 2.4) runs compiled code.
+// FPU/SSE state (phase 2.4): the kernel is soft-float, compiled user programs
+// are not, so every process carries an FXSAVE area (user/fpu.rs) that is saved
+// when it leaves the CPU and restored when it gets it back.
 
 use alloc::alloc::{alloc_zeroed, dealloc, Layout};
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::naked_asm;
 use core::ptr::addr_of_mut;
 
 use crate::arch::intr::IsrFrame;
 use crate::mem::vmm::{self, AddressSpace};
+use crate::user::elf::Loaded;
+use crate::user::fpu::FpuState;
 use crate::user::usermode::{self, Prog, DEFAULT_TIMEOUT_TICKS};
 
 pub use crate::user::usermode::Outcome;
@@ -143,8 +146,8 @@ pub enum Entry {
 pub struct Process {
     /// Sequential process id (0 belongs to the kernel itself).
     pub pid: u64,
-    /// Program name (shell display, `ps`).
-    pub name: &'static str,
+    /// Program name (shell display, `ps`); `execve` renames the process.
+    pub name: String,
     /// Life cycle state.
     pub state: State,
     /// Set when the process left the stage.
@@ -159,6 +162,10 @@ pub struct Process {
     saved: SavedCtx,
     /// Thread entry, taken by the trampoline on first run.
     entry: Option<Entry>,
+    /// Initial ring 3 (rip, rsp) of a user process.
+    start: (u64, u64),
+    /// x87 / SSE registers while the process is off the CPU.
+    pub fpu: FpuState,
     /// Priority level, 0 = best.
     pub prio: u8,
     /// Ticks left in the current time slice.
@@ -245,9 +252,10 @@ pub fn count() -> usize {
 /// Create a process, ready to be scheduled.  `timeout_ticks` is the
 /// watchdog budget (0 = default 3 s).
 fn spawn_common(
-    name: &'static str,
+    name: String,
     aspace: Option<AddressSpace>,
     entry: Entry,
+    start: (u64, u64),
     timeout_ticks: u64,
     prio: u8,
 ) -> Result<u64, &'static str> {
@@ -279,6 +287,8 @@ fn spawn_common(
         kstack_top: ktop,
         saved: SavedCtx { rsp: ktop - 8, ..SavedCtx::ZERO },
         entry: Some(entry),
+        start,
+        fpu: FpuState::new(),
         prio,
         slice_left: SLICE_TICKS,
         used: 0,
@@ -313,14 +323,20 @@ pub fn spawn_user_prio(prog: &Prog, prio: u8) -> Result<u64, &'static str> {
     // On a late failure the address space is dropped here with the locals
     // (RAII: its Drop frees the user half through the direct map).
     let aspace = usermode::build_aspace(prog.image())?;
-    spawn_common(prog.name, Some(aspace), Entry::User, prog.timeout, prio)
+    let start = (vmm::USER_CODE_BASE, vmm::USER_STACK_TOP);
+    spawn_common(String::from(prog.name), Some(aspace), Entry::User, start, prog.timeout, prio)
+}
+
+/// Spawn a process from a loaded ELF image (phase 2.4).
+pub fn spawn_loaded(name: String, prog: Loaded, prio: u8) -> Result<u64, &'static str> {
+    spawn_common(name, Some(prog.aspace), Entry::User, (prog.entry, prog.rsp), 0, prio)
 }
 
 /// Spawn a kernel thread (runs `f` in ring 0 on its own kernel stack).
 /// Kernel threads have no watchdog and are never preempted: they must
 /// cooperate on their own.
 pub fn spawn_kernel(name: &'static str, f: fn()) -> Result<u64, &'static str> {
-    spawn_common(name, None, Entry::Kernel(f), 0, PRIO_DEFAULT)
+    spawn_common(String::from(name), None, Entry::Kernel(f), (0, 0), 0, PRIO_DEFAULT)
 }
 
 // ----------------------------------------------------------- context switch
@@ -383,7 +399,9 @@ extern "C" fn proc_start() -> ! {
     let entry = unsafe { (*CURRENT).entry.take() };
     match entry {
         Some(Entry::User) => {
-            let mut frame = usermode::initial_user_frame();
+            // SAFETY: CURRENT points at us (set by the switcher).
+            let (rip, rsp) = unsafe { (*CURRENT).start };
+            let mut frame = usermode::user_frame(rip, rsp);
             // SAFETY: fully initialised ring 3 frame; interrupts masked, so
             // no window between the (kernel) GS hand-off and iretq.
             unsafe { usermode::iretq_to_user(&mut frame) }
@@ -403,6 +421,11 @@ extern "C" fn proc_start() -> ! {
 /// # Safety
 /// Interrupts must be masked; `next` must be owned by the table.
 unsafe fn cpu_state_for(next: *mut Process) {
+    // The FPU registers still hold the outgoing process's state (the kernel
+    // itself is soft-float and never disturbs them).
+    if !CURRENT.is_null() {
+        (*CURRENT).fpu.save();
+    }
     let p = &mut *next;
     CURRENT = next;
     p.state = State::Running;
@@ -413,6 +436,7 @@ unsafe fn cpu_state_for(next: *mut Process) {
         None => vmm::activate_kernel(),
     }
     usermode::set_kstack_top(p.kstack_top);
+    p.fpu.restore();
 }
 
 /// Switch from the running process to the main (kernel/shell) context.
@@ -421,6 +445,9 @@ unsafe fn cpu_state_for(next: *mut Process) {
 /// # Safety
 /// Interrupts masked; called from the process being suspended.
 unsafe fn switch_to_main(cur: *mut SavedCtx) {
+    if !CURRENT.is_null() {
+        (*CURRENT).fpu.save();
+    }
     CURRENT = core::ptr::null_mut();
     vmm::activate_kernel();
     usermode::set_kstack_top(0);

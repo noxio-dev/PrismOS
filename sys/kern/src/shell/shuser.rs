@@ -9,6 +9,10 @@
 //   `usertest`        run every program, check outcome and page accounting,
 //                     plus the context-switch, kernel-thread, preemption,
 //                     priority and wake-up scenarios
+//   `exec [-p prio] <program> [args...] [-- <program> [args...]]...`
+//                     load ELF executables from the VFS (a bare name is
+//                     looked up in /bin), run them as processes and report
+//                     how they ended (phase 2.4)
 //   `ps`              list the process table
 //   `kill <pid>`      terminate a process from the shell
 
@@ -363,6 +367,87 @@ pub(super) fn cmd_usertest(_args: &mut Args) {
         crate::kprintln!("usertest: all {} passed", total);
     } else {
         crate::kprintln!("usertest: {}/{} passed, FAILURES", ok, total);
+    }
+}
+
+/// Default environment of programs started from the shell.
+const DEFAULT_ENV: [&str; 3] = ["PATH=/bin", "HOME=/", "PRISMOS=2.4"];
+
+pub(super) fn cmd_exec(args: &mut Args) {
+    use crate::user::elf;
+    use core::sync::atomic::Ordering;
+
+    // Split the command line into one argv per program ("--" separates).
+    let mut prio = PRIO_DEFAULT;
+    let mut cmds: Vec<Vec<&str>> = Vec::new();
+    let mut cur: Vec<&str> = Vec::new();
+    let mut first = true;
+    while let Some(t) = args.next() {
+        if first && t == "-p" {
+            match args.next().and_then(parse_u64) {
+                Some(v) if v < PRIO_LEVELS as u64 => prio = v as u8,
+                _ => {
+                    crate::kprintln!("exec: -p needs a priority 0..{}", PRIO_LEVELS - 1);
+                    return;
+                }
+            }
+            continue;
+        }
+        first = false;
+        if t == "--" {
+            if !cur.is_empty() {
+                cmds.push(core::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(t);
+        }
+    }
+    if !cur.is_empty() {
+        cmds.push(cur);
+    }
+    if cmds.is_empty() {
+        crate::kprintln!("usage: exec [-p prio] <program> [args...] [-- <program> [args...]]...");
+        crate::kprintln!("       a bare name is looked up in /bin; try 'ls /bin'");
+        return;
+    }
+
+    let free = || pmm::stats_snapshot().free_pages.load(Ordering::Relaxed);
+    let before = free();
+    let env: Vec<Vec<u8>> = DEFAULT_ENV.iter().map(|e| e.as_bytes().to_vec()).collect();
+    let mut pids = Vec::<u64>::new();
+    for c in &cmds {
+        let prog = c[0];
+        let path = if prog.contains('/') {
+            crate::fs::fsys::abs(prog)
+        } else {
+            alloc::format!("/bin/{}", prog)
+        };
+        let argv: Vec<Vec<u8>> = c.iter().map(|a| a.as_bytes().to_vec()).collect();
+        let spawned = elf::load_path(&path, &argv, &env)
+            .map_err(|e| e.what())
+            .and_then(|l| process::spawn_loaded(elf::base_name(&path), l, prio));
+        match spawned {
+            Ok(pid) => pids.push(pid),
+            Err(e) => {
+                crate::kprintln!("exec: {}: {}", path, e);
+                process::drain_and_reap();
+                return;
+            }
+        }
+    }
+    process::run_until_idle();
+    for pid in &pids {
+        process::for_each(|p| {
+            if p.pid == *pid {
+                crate::kprint!("exec: pid {} {} -- ", p.pid, p.name);
+                usermode::describe(p.outcome);
+            }
+        });
+    }
+    process::drain_and_reap();
+    let after = free();
+    if before != after {
+        crate::kprintln!("exec: WARNING {} page(s) not given back", before.wrapping_sub(after) as i64);
     }
 }
 

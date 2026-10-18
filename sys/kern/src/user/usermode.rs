@@ -282,6 +282,8 @@ pub fn init() -> InitInfo {
         }
         crate::arch::regs::write_cr4(cr4);
     }
+    // Compiled programs use x87 / SSE (state saved per process, user/fpu.rs).
+    crate::user::fpu::init_cpu();
     READY.store(true, Ordering::Release);
     InitInfo { smep, smap, umip }
 }
@@ -293,6 +295,12 @@ pub fn ready() -> bool {
 /// An `IsrFrame` holding the initial ring 3 context of a program: image
 /// entered at its first byte, private stack, IF on, every register zero.
 pub fn initial_user_frame() -> IsrFrame {
+    user_frame(USER_CODE_BASE, USER_STACK_TOP)
+}
+
+/// Like `initial_user_frame`, with an explicit entry point and stack (ELF
+/// programs: the entry and initial `rsp` come from the loader).
+pub fn user_frame(rip: u64, rsp: u64) -> IsrFrame {
     IsrFrame {
         dummy: 0,
         rax: 0,
@@ -312,10 +320,10 @@ pub fn initial_user_frame() -> IsrFrame {
         r15: 0,
         vector: 0x100, // "syscall-like": not an exception
         errcode: 0,
-        rip: USER_CODE_BASE,
+        rip,
         cs: USER_CS as u64 + 3,
         rflags: 0x202, // IF set, IOPL 0
-        rsp: USER_STACK_TOP,
+        rsp,
         ss: USER_DS as u64 + 3,
     }
 }
