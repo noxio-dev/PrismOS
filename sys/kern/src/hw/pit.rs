@@ -75,9 +75,14 @@ pub fn wait_ms_ch2(ms: u32) -> bool {
 }
 
 /// IRQ0 / LAPIC timer tick handler body (called from the dispatch table).
+/// Both delivery paths (8259 IRQ0 and LAPIC vector 0x30, EOI already sent)
+/// end here, which makes it the single place to drive per-tick kernel work:
+/// the run queue watchdog (user/process.rs) kills a process that used up
+/// its slice without yielding.
 pub fn on_tick() {
     let t = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     BOOT_MS.store(t * 10, Ordering::Relaxed); // 100 Hz -> 10 ms per tick
+    crate::user::process::on_tick();
 }
 
 pub fn ticks() -> u64 {

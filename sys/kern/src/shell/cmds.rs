@@ -6,7 +6,7 @@
 // Memory, file system and user-space commands live in shmem.rs, shfs.rs and
 // shuser.rs.
 
-use super::{bad_number, hexdump, parse_u64, shfs, shmem, yn, Args, Size};
+use super::{bad_number, hexdump, parse_u64, shfs, shmem, shuser, yn, Args, Size};
 use crate::arch::io::{inb, outb};
 use core::arch::asm;
 
@@ -72,6 +72,10 @@ const COMMANDS: &[Cmd] = &[
     Cmd { name: "unicode", usage: "", desc: "print a Unicode test page", run: cmd_unicode },
     Cmd { name: "snake", usage: "", desc: "play Snake (pixels on a framebuffer, text on VGA)", run: cmd_snake },
     Cmd { name: "cube", usage: "", desc: "spinning 3D cube (needs a framebuffer)", run: cmd_cube },
+    Cmd { name: "user", usage: "[<program>...]", desc: "run ring 3 test programs as processes (none: list)", run: shuser::cmd_user },
+    Cmd { name: "usertest", usage: "", desc: "run every ring 3 test and check the outcomes", run: shuser::cmd_usertest },
+    Cmd { name: "ps", usage: "", desc: "list the process table", run: shuser::cmd_ps },
+    Cmd { name: "kill", usage: "<pid>", desc: "terminate a process", run: shuser::cmd_kill },
 ];
 
 pub(super) fn dispatch(name: &str, args: &mut Args) {

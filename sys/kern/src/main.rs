@@ -9,9 +9,11 @@
 //
 // Bring-up order:
 //   console -> GDT/TSS -> IDT -> PIC (masked) -> PIT -> serial IRQ
-//   -> PMM -> VMM (own tables, CR3 switch) -> heap -> ACPI -> APIC/IOAPIC
-//   (8259 off, LAPIC timer takes over from the PIT) -> keyboard (i8042)
-//   -> sti -> PCI/AHCI -> VFS (ext4 on the first volume found) -> shell
+//   -> PMM -> VMM (own tables, CR3 switch) -> heap -> ring 3 MSRs
+//   (syscall/sysret, per-CPU GS, SMEP/SMAP/UMIP) -> process table
+//   -> ACPI -> APIC/IOAPIC (8259 off, LAPIC timer takes over from the PIT)
+//   -> keyboard (i8042) -> sti -> PCI/AHCI -> VFS (ext4 on the first
+//   volume found) -> shell
 //
 // Every step logs one line so the boot output doubles as a bring-up check.
 
@@ -37,6 +39,7 @@ use boot::BootInfo;
 use fs::fsys;
 use hw::{acpi, ahci, apic, blk, kbd, pci, pic, pit, serial};
 use mem::{heap, pmm, vmm};
+use user::process;
 
 use core::arch::asm;
 use core::panic::PanicInfo;
@@ -166,6 +169,22 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         kprintln!("heap     : init failed (no memory for the region)");
     }
 
+    // --- Ring 3 / processes (phase 2) ---------------------------------------
+    // Needs the GDT (selector layout), the heap (process stacks) and the
+    // VMM (per-process page tables).
+    let ui = user::usermode::init();
+    kprintln!(
+        "user     : syscall/sysret ready, SMEP {} SMAP {} UMIP {}",
+        yn(ui.smep),
+        yn(ui.smap),
+        yn(ui.umip)
+    );
+    process::init();
+    kprintln!(
+        "proc     : pcb + {} KiB kernel stacks per process, cooperative round-robin (yield)",
+        process::KSTACK_SIZE >> 10
+    );
+
     // --- ACPI / APIC ------------------------------------------------------------
     // Needs the direct map (tables above 4 GiB) so it comes after the VMM.
     if acpi::init(bi) {
@@ -279,6 +298,11 @@ pub(crate) fn halt() -> ! {
         // SAFETY: nothing left to run, sleep forever.
         unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
     }
+}
+
+/// Yes/no helper for boot-time log lines.
+fn yn(b: bool) -> &'static str {
+    if b { "yes" } else { "no" }
 }
 
 #[panic_handler]

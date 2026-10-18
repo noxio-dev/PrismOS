@@ -6,6 +6,13 @@
 // The tables themselves live in gdt.rs / tss.rs / idt.rs.
 //
 // Entry path: IDT gate -> naked stub -> isr_common -> isr_handler(frame).
+//
+// Ring 3: `isr_common` swaps GS whenever the trapped context comes from user
+// mode (the saved CS at [rsp+24] has RPL 3), so the kernel always runs with
+// its own GS base, and swaps back on the way out (see user/usermode.rs for
+// the per-CPU block and the GS convention).  Any exception raised in ring 3
+// is routed to user/process.rs, which kills the program instead of the
+// kernel.
 
 use core::arch::{asm, naked_asm};
 use core::ptr::addr_of_mut;
@@ -148,10 +155,17 @@ stub!(stub_irq14, 0x2E);
 stub!(stub_irq15, 0x2F);
 
 /// Common prologue/epilogue (naked).  The push order is the reverse of the
-/// `IsrFrame` field order; the pops mirror it exactly.
+/// `IsrFrame` field order; the pops mirror it exactly.  The conditional
+/// `swapgs` pair (CS RPL 3 test) keeps the kernel on its own GS base while
+// it handles a trap from ring 3, and hands the user's value back before
+/// `iretq`.
 #[unsafe(naked)]
 unsafe extern "C" fn isr_common() {
     naked_asm!(
+        "test qword ptr [rsp + 24], 3", // saved CS RPL 3?  (cs is [rsp+24])
+        "jz 2f",
+        "swapgs",
+        "2:",
         "push r15",
         "push r14",
         "push r13",
@@ -188,6 +202,10 @@ unsafe extern "C" fn isr_common() {
         "pop r14",
         "pop r15",
         "add rsp, 16",       // drop vector + error code
+        "test qword ptr [rsp + 8], 3", // returning to ring 3?  (cs at [rsp+8])
+        "jz 3f",
+        "swapgs",
+        "3:",
         "iretq",
         sym isr_handler,
     );
@@ -250,8 +268,14 @@ extern "C" fn isr_handler(frame: &mut IsrFrame) {
 }
 
 /// Exception entry: a few are recoverable test hooks, the rest are fatal.
+/// Anything raised in ring 3 is the program's own fault: the process is
+/// killed and the kernel returns to the scheduler (never a kernel panic).
 fn handle_exception(frame: &mut IsrFrame) {
     let v = frame.vector as u8;
+    if frame.cs & 3 == 3 && v != 2 {
+        // NMI is never the program's fault; everything else ends it.
+        crate::user::process::on_user_exception(frame);
+    }
     match v {
         3 => {
             // int3 smoke test: #BP is a trap, the pushed RIP already sits

@@ -10,8 +10,9 @@ Phase 1 (kernel foundations) is feature-complete: the machine boots on BIOS and
 UEFI, the kernel manages memory and interrupts, talks to an AHCI disk and
 mounts an ext4 volume that you can browse and modify from the kernel shell.
 Phase 2.1 adds ring 3: the kernel can run a flat program in user mode with its
-own page tables (see below). There are still **no processes or scheduler** (next:
-phase 2.2).
+own page tables (see below). Phase 2.2 adds processes: a PCB, a private kernel
+stack and a context switch per program, with cooperative round-robin between
+them (preemption arrives with phase 2.3).
 
 | Area                     | State   | Notes                                                                 |
 |--------------------------|---------|-----------------------------------------------------------------------|
@@ -24,13 +25,14 @@ phase 2.2).
 | VFS                      | done    | mounts, path walk, symlinks, descriptor API                            |
 | ext4                     | partial | R/W, extents, checksums written; no journal, see limits below          |
 | Ring 3                   | done    | user page tables per process, `syscall`/`sysret`, TSS stacks, fault containment (phase 2.1) |
-| Scheduler / processes    | todo    | single flow of control: a user program runs to completion (phases 2.2+) |
+| Processes / context switch | partial | PCB, kernel stacks, cooperative round-robin + yield syscall, watchdog, kernel threads (phase 2.2); no preemption yet (2.3) |
 | Networking, USB, SMP     | todo    | not started                                                            |
 
 **Testing.** `make fstest` (11 scenarios against `mke2fs` images, each validated
 by `e2fsck -fn`) covers the VFS and ext4 on the host. `make test` boots the image
 under QEMU on BIOS and UEFI and drives the shell over the serial line, including
-an ext4-on-AHCI scenario. The phase 1.4 code was type-checked and host-tested,
+an ext4-on-AHCI scenario and a ring 3 process / context switch scenario (phase
+2.2). The phase 1.4 code was type-checked and host-tested,
 but its QEMU scenario had not been run when it was written: run `make test`
 before relying on it.
 
@@ -60,7 +62,7 @@ Phase 1 — kernel foundations
 
 Phase 2 — ring 3 and processes
 - [x] Phase 2.1 — ring 3: user page tables per process, `syscall`/`sysret`, TSS stacks
-- [ ] Phase 2.2 — processes and threads: PCB, kernel stacks, context switch
+- [x] Phase 2.2 — processes and threads: PCB, kernel stacks, context switch
 - [ ] Phase 2.3 — scheduler: preemptive round-robin on the LAPIC timer, then priorities, sleep/wakeup
 - [ ] Phase 2.4 — ELF loader: `execve` from the VFS, argv/envp, auxv
 - [ ] Phase 2.5 — `fork`, `wait`, `exit`, signals (basic), copy-on-write
@@ -95,7 +97,8 @@ Beyond (nice to have)
 
 ## Ring 3 (phase 2.1)
 
-`sys/kern/src/usermode.rs` (+ `AddressSpace` in `vmm.rs`, GDT/TSS/`swapgs` in `int.rs`):
+`sys/kern/src/user/usermode.rs` (+ `AddressSpace` in `mem/vmm.rs`, `swapgs` in
+`arch/intr.rs`):
 
 - **GDT**: `0x18` user data, `0x20` user code (RPL 3 -> `0x1b`/`0x23`), ordered so that
   `sysretq` lands on them (`STAR[63:48] = 0x10`). TSS has `RSP0` (set per run) and IST stacks
@@ -108,13 +111,44 @@ Beyond (nice to have)
   SMEP/SMAP/UMIP are enabled when the CPU has them.
 - **Entry/exit**: `syscall`/`sysretq` (LSTAR, SFMASK) plus interrupts and exceptions through
   the IDT, with `swapgs` on every ring 3 <-> ring 0 transition and a per-CPU block in GS.
-- **Containment**: any exception in ring 3 (or the 3 s tick watchdog) ends the program
-  and returns to the shell; the kernel never panics because of user code.
+- **Containment**: any exception in ring 3 (or the watchdog) ends the program
+  and returns to the scheduler; the kernel never panics because of user code.
 - **Syscalls** (rax = number, args rdi/rsi/rdx, result in rax, `-errno` on failure):
-  `0 exit`, `1 write(fd 1|2)`, `2 getpid`, `3 uptime_ms`.
+  `0 exit`, `1 write(fd 1|2)`, `2 getpid`, `3 uptime_ms`, `4 yield` (phase 2.2).
 
-Shell: `user` lists the built-in test programs, `user <name>` runs one, `usertest` runs them
-all (outcome, fault type and page-leak check) -- also part of `make test`.
+Shell: `user` lists the built-in test programs, `user <name>...` runs one or
+more at once, `usertest` runs them all (outcome, fault type and page-leak check,
+plus a two-process interleaving and a kernel-thread scenario) -- also part of
+`make test`.
+
+## Processes (phase 2.2)
+
+`sys/kern/src/user/process.rs`:
+
+- **PCB**: `Process` holds the pid, name, state (ready / running / zombie),
+  outcome, its `AddressSpace` and its saved kernel context; the process table
+  is a Vec in pid order, and the kernel itself is the implicit pid 0 ("main"
+  context, running on the boot stack).
+- **Kernel stacks**: every process gets a private 16 KiB stack from the kernel
+  heap (which lives in the shared kernel half, so it is reachable whichever
+  CR3 is loaded).  `TSS.RSP0` and `gs:[0]` point at it, so every trap from
+  ring 3 lands on it -- a suspended process keeps its whole syscall / interrupt
+  frame intact and resumes exactly where it stopped.
+- **Context switch** (`switch_ctx`, naked asm): callee-saved registers + RSP +
+  RFLAGS, setjmp/longjmp style; the switcher republishes the CPU-side state
+  (CR3, RSP0, current-process pointer) *before* the stack switch, which is safe
+  because the kernel half is mapped in every address space.  A fresh process
+  starts on a trampoline that either drops into ring 3 through a prepared
+  `iretq` frame (user program) or calls a plain Rust function (kernel thread).
+- **Scheduling** is cooperative round-robin: a process gives the CPU back with
+  the `yield` syscall, ends with `exit`, or is killed by the watchdog (the tick
+  that finds its 3 s budget spent) or a ring 3 exception.  `run_until_idle`
+  drives the queue from the shell; dead processes are reaped once their
+  outcome has been read.  Preemption on the LAPIC timer, priorities and
+  sleep/wakeup arrive with phase 2.3.
+
+Shell: `ps` lists the process table, `kill <pid>` terminates a process,
+`user ping pong` shows two ring 3 programs interleaving through the switch.
 
 ## Boot chain
 

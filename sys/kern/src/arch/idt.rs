@@ -2,8 +2,9 @@
 // Copyright (c) 2026 noxio-dev
 //
 // Interrupt descriptor table: 256 interrupt gates pointing at the naked stubs
-// of intr.rs.  CPU exceptions use gates 0..=20 (#DF on IST1), the remapped
-// 8259 lines 0x20..=0x2F, the LAPIC timer 0x30 and the spurious vector 0xFF.
+// of intr.rs.  CPU exceptions use gates 0..=20 (#DF on IST1, NMI on IST2,
+// #MC on IST3), the remapped 8259 lines 0x20..=0x2F, the LAPIC timer 0x30 and
+// the spurious vector 0xFF.
 
 use super::gdt::{PseudoDesc, KERNEL_CS};
 use super::intr as isr;
@@ -43,7 +44,7 @@ fn set_gate(vector: u8, handler: unsafe extern "C" fn(), ist: u8) {
 pub fn init() {
     set_gate(0, isr::stub_de, 0);
     set_gate(1, isr::stub_db, 0);
-    set_gate(2, isr::stub_nmi, 0);
+    set_gate(2, isr::stub_nmi, 2); // NMI on the IST2 stack
     set_gate(3, isr::stub_bp, 0);
     set_gate(4, isr::stub_of, 0);
     set_gate(5, isr::stub_br, 0);
@@ -59,7 +60,7 @@ pub fn init() {
     set_gate(15, isr::stub_rv, 0);
     set_gate(16, isr::stub_mf, 0);
     set_gate(17, isr::stub_ac, 0);
-    set_gate(18, isr::stub_mc, 0);
+    set_gate(18, isr::stub_mc, 3); // machine check on the IST3 stack
     set_gate(19, isr::stub_xm, 0);
     set_gate(20, isr::stub_ve, 0);
 

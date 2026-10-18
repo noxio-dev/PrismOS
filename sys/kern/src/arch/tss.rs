@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 noxio-dev
 //
-// Task state segment: the 64-bit hardware TSS plus the dedicated double-fault
-// stack (IST1).  Only RSP0 (for a future ring 3) and IST1 are used.  The GDT
-// descriptor pointing at the TSS is built here and installed by gdt.rs.
+// Task state segment: the 64-bit hardware TSS plus dedicated exception
+// stacks.  RSP0 is the ring 0 stack the CPU switches to for interrupts and
+// exceptions coming from ring 3 -- per process, patched by the scheduler
+// (user/process.rs) through `set_rsp0`.  IST1/IST2/IST3 are dedicated stacks
+// for #DF, NMI and #MC, so those faults never depend on the state of a
+// process's kernel stack.  The GDT descriptor pointing at the TSS is built
+// here and installed by gdt.rs.
 
 use core::ptr::addr_of_mut;
 
 const DF_STACK_SIZE: usize = 8192;
+const IST_STACK_SIZE: usize = 4096;
 
 /// Hardware task state (64-bit layout, 100 bytes packed).
 #[repr(C, packed)]
@@ -27,6 +32,12 @@ struct Tss {
 /// IST1: dedicated #DF stack.
 #[repr(C, align(16))]
 struct DfStack([u8; DF_STACK_SIZE]);
+/// IST2: dedicated NMI stack.
+#[repr(C, align(16))]
+struct NmiStack([u8; IST_STACK_SIZE]);
+/// IST3: dedicated #MC stack.
+#[repr(C, align(16))]
+struct McStack([u8; IST_STACK_SIZE]);
 
 static mut TSS: Tss = Tss {
     reserved1: 0,
@@ -41,6 +52,8 @@ static mut TSS: Tss = Tss {
 };
 
 static mut DF_STACK: DfStack = DfStack([0; DF_STACK_SIZE]);
+static mut NMI_STACK: NmiStack = NmiStack([0; IST_STACK_SIZE]);
+static mut MC_STACK: McStack = McStack([0; IST_STACK_SIZE]);
 
 /// 16-byte system-segment descriptor pointing at the TSS -> two GDT words:
 ///   word 0: limit[15:0] | base[23:0]<<16 | access(0x89)<<40 | (flags+limit[19:16])<<48 | base[31:24]<<56
@@ -61,8 +74,25 @@ pub(super) const fn desc_high(base: u64) -> u64 {
 /// GDT descriptor.
 pub(super) fn init() -> (u64, u32) {
     // SAFETY: single-CPU boot context, no concurrency yet.
-    let (tss, stack) = unsafe { (&mut *addr_of_mut!(TSS), &*addr_of_mut!(DF_STACK)) };
-    tss.rsp0 = 0; // no ring 3 yet
-    tss.ist[0] = stack.0.as_ptr() as u64 + DF_STACK_SIZE as u64;
+    let (tss, df, nmi, mc) = unsafe {
+        (
+            &mut *addr_of_mut!(TSS),
+            &*addr_of_mut!(DF_STACK),
+            &*addr_of_mut!(NMI_STACK),
+            &*addr_of_mut!(MC_STACK),
+        )
+    };
+    tss.rsp0 = 0; // no ring 3 yet; set per process by the scheduler
+    tss.ist[0] = df.0.as_ptr() as u64 + DF_STACK_SIZE as u64;
+    tss.ist[1] = nmi.0.as_ptr() as u64 + IST_STACK_SIZE as u64;
+    tss.ist[2] = mc.0.as_ptr() as u64 + IST_STACK_SIZE as u64;
     (tss as *const Tss as u64, (core::mem::size_of::<Tss>() - 1) as u32)
+}
+
+/// Point RSP0 at the top of the current process's kernel stack (used for
+/// every trap coming from ring 3).  0 = no ring 3 program is running.
+pub fn set_rsp0(top: u64) {
+    // SAFETY: scalar write, called with interrupts masked by the scheduler
+    // and by the syscall entry path.
+    unsafe { (*addr_of_mut!(TSS)).rsp0 = top };
 }

@@ -85,7 +85,7 @@ def main():
         ("BIOS autoboot", bios_cmd, [], hello + ["firmware : BIOS", " framebuffer", "back buffer active"], 40),
         ("BIOS prompt: Esc, then boot", bios_cmd,
          [("Autoboot in", "\x1b"), ("OK ", "version\rboot -v\r")],
-         ["OK ", "PrismOS loader (bios", "Hello, world!", 'cmdline  : "-v"'], 40),
+         ["OK ", "PrismOS loader 0.1.0", "Hello, world!", 'cmdline  : "-v"'], 40),
         ("BIOS shell: exception recovery", bios_cmd,
          [("prism# ", "crash int\r"), ("prism# ", "crash page\r"),
           ("prism# ", "crash div\r"), ("prism# ", "uptime\r")],
@@ -94,6 +94,16 @@ def main():
         ("BIOS shell: memory + layout", bios_cmd,
          [("prism# ", "meminfo\r"), ("prism# ", "layout fr\r"), ("prism# ", "kbd\r")],
          ["pages total", "self-test: ok", "switched to fr", "i8042"], 60),
+        # Phase 2: ring 3 processes, cooperative context switch, watchdog.
+        ("BIOS shell: ring 3 processes (phase 2.2)", bios_cmd,
+         [("prism# ", "user ping pong\r"), ("prism# ", "usertest\r"),
+          ("prism# ", "ps\r")],
+         ["user     : syscall/sysret ready",
+          "proc     : pcb + 16 KiB kernel stacks per process",
+          "[ring 3] ping", "[ring 3] pong",
+          "pid 1 ping", "pid 2 pong",
+          "usertest: all 16 passed",
+          "process table empty"], 180),
     ]
     if code and vars_ and os.path.exists(code):
         scenarios += [

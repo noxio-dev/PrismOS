@@ -7,9 +7,13 @@
 // valid across the swap):
 //   0x08  kernel code (64-bit)
 //   0x10  kernel data
-//   0x18  user code (64-bit, for a future ring 3)
-//   0x20  user data
+//   0x18  user data (64-bit)
+//   0x20  user code (64-bit, for ring 3)
 //   0x28  TSS (see tss.rs)
+//
+// The user segments are ordered for `sysretq`: SYSRET loads
+// CS = STAR[63:48]+16 and SS = STAR[63:48]+8 (STAR[63:48] = 0x10), so the
+// user code selector must sit 8 above the user data selector.
 
 use super::tss;
 use core::arch::asm;
@@ -18,9 +22,9 @@ use core::ptr::addr_of_mut;
 pub const KERNEL_CS: u16 = 0x08;
 pub const KERNEL_DS: u16 = 0x10;
 #[allow(dead_code)] // ring 3 later
-pub const USER_CS: u16 = 0x18;
+pub const USER_DS: u16 = 0x18;
 #[allow(dead_code)] // ring 3 later
-pub const USER_DS: u16 = 0x20;
+pub const USER_CS: u16 = 0x20;
 pub const TSS_SEL: u16 = 0x28;
 
 // The GDT is an array of 8-byte words: code/data descriptors take one word
@@ -61,8 +65,8 @@ static mut GDT: Gdt = Gdt {
         0,               // 0x00 null
         flat(0x9A, 0xA), // 0x08 kernel code (L=1)
         flat(0x92, 0xC), // 0x10 kernel data
-        flat(0xFA, 0xA), // 0x18 user code
-        flat(0xF2, 0xC), // 0x20 user data
+        flat(0xF2, 0xC), // 0x18 user data (sysretq: SS = STAR[63:48]+8)
+        flat(0xFA, 0xA), // 0x20 user code (sysretq: CS = STAR[63:48]+16)
         0,               // 0x28 TSS low (patched at init)
         0,               //      TSS high
         0,               // padding
