@@ -2,16 +2,15 @@
 /* Copyright (c) 2026 noxio-dev */
 /*
  * Read-only FAT32 driver with long file name support, used by the BIOS
- * loader.  The block layer is blk_read() (see bios/disk.c); the UEFI loader
- * uses the firmware's file system protocol instead.
+ * loader over the blk_read() block layer (see bios/disk.c).  The ext4
+ * backend (ext4.c) sits next to it; the UEFI loader uses the firmware's
+ * file system protocol instead.
  */
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include "fs.h"
-
-extern int blk_read(uint64_t lba, uint32_t count, void *buf);
-int fat_mount(uint64_t part_lba);
+#include "fsback.h"
 
 static struct {
     int mounted;
@@ -169,9 +168,9 @@ static int lookup(const char *path, struct dent *out)
     return 0;
 }
 
-/* ---- fs.h ------------------------------------------------------------- */
+/* ---- fs.h (dispatched by bios/disk.c) -------------------------------- */
 
-int fs_stat(const char *path, int *isdir, uint64_t *size)
+int fat_stat(const char *path, int *isdir, uint64_t *size)
 {
     struct dent d;
     int r = lookup(path, &d);
@@ -181,7 +180,7 @@ int fs_stat(const char *path, int *isdir, uint64_t *size)
     return 0;
 }
 
-int fs_open(const char *path, fs_file **out)
+int fat_open(const char *path, fs_file **out)
 {
     struct dent d;
     int r = lookup(path, &d);
@@ -195,10 +194,10 @@ int fs_open(const char *path, fs_file **out)
     return 0;
 }
 
-void fs_close(fs_file *f) { free(f); }
-uint64_t fs_size(fs_file *f) { return f->size; }
+void fat_close(fs_file *f) { free(f); }
+uint64_t fat_size(fs_file *f) { return f->size; }
 
-int fs_seek(fs_file *f, uint64_t off)
+int fat_seek(fs_file *f, uint64_t off)
 {
     if (off > f->size) return -EINVAL;
     f->pos = (uint32_t)off;
@@ -218,7 +217,7 @@ static int goto_cluster(fs_file *f)
     return valid(f->cur) ? 0 : -EIO;
 }
 
-long fs_read(fs_file *f, void *buf, size_t n)
+long fat_read(fs_file *f, void *buf, size_t n)
 {
     uint8_t *dst = buf, sec[512];
     size_t total = 0;
@@ -254,7 +253,7 @@ static int rd_cb(struct dent *d, void *arg)
     return r->cb(d->name, d->isdir, d->isdir ? 0 : d->size, r->arg);
 }
 
-int fs_readdir(const char *path, fs_dir_cb cb, void *arg)
+int fat_readdir(const char *path, fs_dir_cb cb, void *arg)
 {
     struct dent d;
     int r = lookup(path, &d);

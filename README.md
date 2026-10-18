@@ -17,7 +17,7 @@ sleep/wakeup.
 
 | Area                     | State   | Notes                                                                 |
 |--------------------------|---------|-----------------------------------------------------------------------|
-| BIOS + UEFI loader (C/Lua) | done    | GPT/FAT32 image, Lua menu and CLI, ELF64 kernel loader                |
+| BIOS + UEFI loader (C/Lua) | done    | 3-partition GPT image (ESP / BIOS boot / ext4 root), Lua menu and CLI, ELF64 kernel loader |
 | Memory (PMM, VMM, heap)  | done    | bitmap PMM, own page tables with direct map and W^X, buddy + slab heap |
 | CPU / interrupts         | done    | GDT/TSS, IDT, exception recovery, PIT                                  |
 | ACPI / APIC              | done    | LAPIC + IOAPIC, 8259 masked, LAPIC timer calibrated                    |
@@ -32,10 +32,9 @@ sleep/wakeup.
 **Testing.** `make fstest` (11 scenarios against `mke2fs` images, each validated
 by `e2fsck -fn`) covers the VFS and ext4 on the host. `make test` boots the image
 under QEMU on BIOS and UEFI and drives the shell over the serial line, including
-an ext4-on-AHCI scenario and a ring 3 process / context switch scenario (phase
-2.2). The phase 1.4 code was type-checked and host-tested,
-but its QEMU scenario had not been run when it was written: run `make test`
-before relying on it.
+the ext4 root partition (read-write, re-checked with `e2fsck` on the host), a
+partition-layout assertion and a ring 3 process / context switch scenario
+(phase 2.2).
 
 **Known limits of phase 1.4.** No journal (writes go straight to disk; a crash
 mid-operation can need an `fsck`; journals that need recovery mount read-only),
@@ -57,7 +56,8 @@ Phase 1 — kernel foundations
   - [ ] ext4: verify metadata checksums on read, htree insert, `fallocate`-style preallocation
   - [ ] block cache for file data (write-back, `sync` / periodic flush)
   - [ ] AHCI: interrupt-driven completion and NCQ instead of polling
-  - [ ] boot from the ext4 volume (loader ext4 driver) instead of the FAT32 ESP only
+  - [x] boot from the ext4 volume (loader ext4 driver) instead of the FAT32 ESP only (BIOS loader; UEFI still needs a FAT32 ESP)
+  - [x] three-partition layout: minimal ESP (UEFI stub only), BIOS boot partition, ext4 root read by both the loader and the kernel
   - [ ] kernel logging (`dmesg` ring buffer), proper `panic` backtrace, unit tests in-kernel
   - [ ] SMP bring-up (AP startup via the LAPIC), per-CPU data, spinlocks
 
@@ -171,20 +171,29 @@ Shell: `ps` lists the process table, `kill <pid>` terminates a process,
 
 ## Boot chain
 
-One disk image boots both ways (GPT with a protective MBR):
+One disk image boots both ways (GPT with a protective MBR, three partitions):
 
-| Partition       | Content                                                       |
-|-----------------|---------------------------------------------------------------|
-| `PrismOS boot`  | raw: boot1 + the 64-bit BIOS loader                           |
-| `PrismOS ESP`   | FAT32: `EFI/BOOT/BOOTX64.EFI`, `boot/` (Lua, conf, kernel)    |
+| Partition      | Type (GPT) | Content                                                          |
+|----------------|------------|-------------------------------------------------------------------|
+| `PrismOS ESP`  | EFI system | FAT32: `EFI/BOOT/BOOTX64.EFI` only - the UEFI stub                |
+| `PrismOS boot` | BIOS boot | raw sectors: boot1 + the 64-bit BIOS loader (no filesystem)       |
+| `PrismOS root` | Linux ext4 | `/boot/kernel`, `/boot/lua`, `loader.conf`, `/bin`, `/etc`, `/usr` |
 
-The BIOS loader mounts the ESP with its own FAT32 driver, the UEFI loader uses
-the firmware's. The Lua scripts and the kernel are therefore the same files.
+The boot volume of both loaders is the ext4 root: the BIOS loader mounts it
+with its own ext2/3/4 driver over `int 13h`, the UEFI stub (whose only job is
+to be launched by the firmware) mounts it over the firmware block I/O
+protocol, with a fallback to the volume the stub was started from (the ISO
+keeps that legacy single-volume layout). The kernel mounts the same ext4
+root partition on `/`, so the Lua scripts, the configuration and the kernel
+are one set of files for everyone. A Linux-filesystem partition only counts
+as the boot volume when it carries the boot tree (`/boot/loader.conf` or
+`/boot/kernel/kernel`), so plain ext4 data disks are skipped.
 
 ## Build & run
 
 Requirements: `clang` + `lld` (loader, `lld-link`), `gcc`/`binutils` (boot
-sectors), `make`, `python3`, `mkfs.fat` + `mtools`, Rust with the bare-metal
+sectors), `make`, `python3`, `mkfs.fat` + `mtools` (ESP), `mke2fs` (ext4 root),
+Rust with the bare-metal
 target (`rustup target add x86_64-unknown-none`). To run: `qemu-system-x86_64`
 and, for UEFI, OVMF.
 
@@ -194,7 +203,8 @@ make run          # boot it in QEMU (BIOS), serial on stdio
 make run-uefi     # boot it in QEMU with OVMF (UEFI)
 make test         # automated BIOS + UEFI boot tests through the serial console
 make fstest       # VFS + ext4 tests on the host, checked with e2fsck
-make data         # (re)create build/data.img, the ext4 disk `make run` attaches
+make data         # (re)create build/data.img, the extra ext4 disk `make run` attaches
+make iso          # legacy single-volume ISO (UEFI)
 make clean
 ```
 
@@ -203,9 +213,10 @@ Write it to a USB stick with `dd if=build/prismos.img of=/dev/sdX bs=1M`
 
 ## File systems (phase 1.4)
 
-`make run` attaches a second disk, `build/data.img`, on an AHCI controller; the
-kernel mounts the first ext2/3/4 volume it finds (a whole disk or a GPT
-partition) on `/` at boot. Everything is also reachable from the shell:
+`make run` attaches the boot disk on AHCI port 0 and a second disk,
+`build/data.img`, on port 1: the kernel mounts the ext4 root partition of the
+boot disk (`disk 0 partition 3`) on `/` at boot, the extra volume stays
+available for shell experiments. Everything is also reachable from the shell:
 
 ```
 prism# mount -l              volumes found      prism# mount [-r] 0:2 /mnt
@@ -242,10 +253,14 @@ every result with `e2fsck -fn` and `debugfs`.
 ## The loader
 
 `boot/loader/` is the common part: ELF64 kernel loader, memory map, page
-tables, ANSI terminal, Lua bindings. `boot/bios/` and `boot/efi/` are the two
-platform backends (disk/console/memory/firmware tables). `boot/libsa/` is a
-tiny freestanding libc (string, printf with floats, malloc, setjmp, math...)
-so that stock Lua 5.4 (`contrib/lua`) builds unmodified.
+tables, ANSI terminal, Lua bindings, plus the two read-only boot filesystems
+of the BIOS loader (`fat.c` FAT32 and `ext4.c` ext2/3/4 -- extents or classic
+block maps, symlinks, sparse files; checksums are not verified, and the same
+features are refused as in the kernel driver). `boot/bios/` and `boot/efi/`
+are the two platform backends (disk/console/memory/firmware tables).
+`boot/libsa/` is a tiny freestanding libc (string, printf with floats,
+malloc, setjmp, math...) so that stock Lua 5.4 (`contrib/lua`) builds
+unmodified.
 
 ### Lua scripts (`boot/lua/`)
 
@@ -294,8 +309,8 @@ boot/lua, boot/conf      Lua scripts and loader.conf
 contrib/lua              Lua 5.4.8 (MIT)
 include/                 prism.inc (shared constants), prism/boot.h
 sys/kern                 Rust kernel (no_std, x86_64-unknown-none)
-tools/mkimage.py         GPT/FAT32 disk image builder
-tests/boot_test.py       QEMU boot tests (incl. ext4 on AHCI)
+tools/mkimage.py         GPT disk image builder (ESP + BIOS boot + ext4 root)
+tests/boot_test.py       QEMU boot tests (incl. ext4 root, layout assertion)
 tests/fs_test.py         host VFS/ext4 tests (tests/fstest is the harness)
 ```
 

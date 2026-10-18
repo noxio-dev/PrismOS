@@ -7,9 +7,13 @@
 #include <stdint.h>
 
 /*
- * Minimal read-only filesystem API implemented by each platform backend
- * (FAT32 over BIOS int 13h, or the EFI simple file system protocol).
- * Paths are absolute, '/' separated and case-insensitive (FAT).
+ * Minimal read-only filesystem API implemented by each platform backend.
+ * The boot tree lives on the ext4 root partition: the BIOS loader mounts it
+ * over its int 13h block layer (FAT32 fallback for legacy layouts), the
+ * UEFI stub over the firmware block I/O protocol (simple file system
+ * fallback).  Paths are absolute and '/' separated.  FAT matches
+ * case-insensitively; ext4 matches exactly, then falls back to
+ * case-insensitive.
  * Functions return 0 or a positive count on success, -errno on failure.
  */
 typedef struct fs_file fs_file;

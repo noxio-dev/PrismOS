@@ -433,7 +433,7 @@ void bios_main(struct boot1_info *info)
         console_panic("not enough memory: PrismOS needs at least 40 MiB of RAM");
 
     if (fs_init() < 0)
-        console_panic("cannot mount the boot volume (FAT32 EFI System Partition)");
+        console_panic("cannot mount the boot volume (FAT32 or ext4)");
 
     loader_main();
     for (;;) __asm__ volatile("hlt");

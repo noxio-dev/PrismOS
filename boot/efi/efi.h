@@ -104,14 +104,17 @@ typedef struct {
     void *create_event, *set_timer, *wait_for_event, *signal_event, *close_event, *check_event;
     void *install_protocol_interface, *reinstall_protocol_interface, *uninstall_protocol_interface;
     EFI_STATUS (*handle_protocol)(EFI_HANDLE, EFI_GUID *, void **);
-    void *reserved, *register_protocol_notify, *locate_handle, *locate_device_path;
+    void *reserved, *register_protocol_notify;
+    EFI_STATUS (*locate_handle)(int, EFI_GUID *, void *, UINTN *, EFI_HANDLE *);
+    void *locate_device_path;
     void *install_configuration_table, *load_image, *start_image, *exit, *unload_image;
     EFI_STATUS (*exit_boot_services)(EFI_HANDLE, UINTN);
     void *get_next_monotonic_count;
     EFI_STATUS (*stall)(UINTN);
     EFI_STATUS (*set_watchdog_timer)(UINTN, uint64_t, UINTN, CHAR16 *);
     void *connect_controller, *disconnect_controller, *open_protocol, *close_protocol;
-    void *open_protocol_information, *protocols_per_handle, *locate_handle_buffer;
+    void *open_protocol_information, *protocols_per_handle;
+    EFI_STATUS (*locate_handle_buffer)(int, EFI_GUID *, void *, UINTN *, EFI_HANDLE **);
     EFI_STATUS (*locate_protocol)(EFI_GUID *, void *, void **);
 } EFI_BOOT_SERVICES;
 
@@ -142,6 +145,27 @@ typedef struct {
 } EFI_SYSTEM_TABLE;
 
 /* ---- loaded image, file system ---------------------------------------------- */
+
+/* LocateHandle search types */
+enum { ByAllHandles, ByRegisterNotify, ByProtocol };
+
+typedef struct {
+    uint32_t media_id;
+    uint8_t  removable_media, media_present, logical_partition, read_only;
+    uint8_t  write_protected, cacheable, erase_polarity;
+    uint32_t block_size;
+    uint32_t io_align;
+    uint64_t last_block;
+} EFI_BLOCK_IO_MEDIA;
+
+typedef struct EFI_BLOCK_IO_PROTOCOL {
+    uint64_t revision;
+    EFI_BLOCK_IO_MEDIA *media;
+    EFI_STATUS (*reset)(struct EFI_BLOCK_IO_PROTOCOL *, uint8_t);
+    EFI_STATUS (*read_blocks)(struct EFI_BLOCK_IO_PROTOCOL *, uint32_t, uint64_t, UINTN, void *);
+    EFI_STATUS (*write_blocks)(struct EFI_BLOCK_IO_PROTOCOL *, uint32_t, uint64_t, UINTN, void *);
+    EFI_STATUS (*flush_blocks)(struct EFI_BLOCK_IO_PROTOCOL *);
+} EFI_BLOCK_IO_PROTOCOL, EFI_BLOCK_IO;
 
 typedef struct {
     uint32_t revision;
@@ -204,6 +228,7 @@ enum { PixelRedGreenBlueReserved8BitPerColor, PixelBlueGreenRedReserved8BitPerCo
 /* ---- GUIDs --------------------------------------------------------------------- */
 
 #define GUID_LOADED_IMAGE   { 0x5B1B31A1, 0x9562, 0x11D2, { 0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B } }
+#define GUID_BLOCK_IO       { 0x964E5B21, 0x6459, 0x11D2, { 0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B } }
 #define GUID_SIMPLE_FS      { 0x964E5B22, 0x6459, 0x11D2, { 0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B } }
 #define GUID_FILE_INFO      { 0x09576E92, 0x6D3F, 0x11D2, { 0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B } }
 #define GUID_GOP            { 0x9042A9DE, 0x23DC, 0x4A38, { 0x96, 0xFB, 0x7A, 0xDE, 0xD0, 0x80, 0x51, 0x6A } }
