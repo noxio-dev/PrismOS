@@ -205,8 +205,8 @@ void banner()
     outLine(std::string("  ") + PRISM_INSTALLER_TARGET + " - installer "
             + PRISM_INSTALLER_VERSION);
     outLine(std::string(C_DIM())
-            + "  BIOS+UEFI bootloader · kernel on ESP · ext4 partition "
-              "with reserve" + C_RESET());
+            + "  BIOS+UEFI bootloader · minimal ESP · kernel on the ext4 "
+              "root" + C_RESET());
     outLine("");
 }
 
@@ -238,14 +238,13 @@ void printPlan(const PartitionPlan& plan, const TargetInfo& target,
 
     line("GPT",    "partition table (start + end)", 34 * 512,
          target.bytes);
-    line("ESP",    "FAT32 (FIRST partition): EFI/BOOT, scripts, kernel",
+    line("ESP",    "FAT32 (FIRST partition): EFI/BOOT/BOOTX64.EFI",
          plan.espBytes(), target.bytes);
-    line("reserve", "unallocated - headroom for a bigger future kernel",
-         plan.reserveBytes(), target.bytes);
     line("boot",   "boot1 + BIOS bootloader (raw sectors)",
          plan.bootSectors * SECTOR, target.bytes);
-    line("ext4",   "data (\"" + plan.ext4Label + "\", mounted on /)",
-         plan.ext4Bytes(), target.bytes);
+    line("root",   "ext4 \"" + plan.rootLabel
+                   + "\": kernel, Lua, loader.conf, mounted on /",
+         plan.rootBytes(), target.bytes);
 
     outLine("");
 }
@@ -260,24 +259,27 @@ namespace {
 
 const char* OPTS = R"(Options:
   -s, --source DIR       PrismOS build directory
-                         (contains boot0.bin, boot1.bin, loader.bin, esp/)
+                         (contains boot0.bin, boot1.bin, loader.bin,
+                         esp/ and root/)
       --esp-dir DIR      overrides the ESP tree <source>/esp
+                         (EFI/BOOT/BOOTX64.EFI)
+      --root-dir DIR     overrides the ext4 root tree <source>/root
+                         (boot/kernel/kernel, boot/lua, ...)
   -d, --disk PATH        target disk (/dev/sdX, /dev/nvme0n1) or image
       --image-size SIZE  size of the image to create if the file is absent
                          (e.g. 512M, 8G) - test/QEMU mode
-      --esp-size MIB     size of the FAT32 ESP (default 64)
-      --reserve MIB      unallocated space right after the ESP,
-                         to absorb a bigger future kernel (default 128)
-      --ext4-size MIB    size of the ext4 partition (default: rest of
-                         the disk)
-      --esp-label L      FAT32 label (default PRISMOS)
-      --ext4-label L     ext4 label (default PRISMDATA)
+      --esp-size MIB     size of the FAT32 ESP (default 36, min 34)
+      --root-size MIB    size of the ext4 root partition (default: rest
+                         of the disk)
+      --esp-label L      FAT32 label (default PRISMESP)
+      --root-label L     ext4 label (default PRISMROOT)
       --mke2fs PATH      mke2fs path (default: $PATH)
       --dry-run          validate everything, write nothing
       --check            READ-ONLY AUDIT of an already installed target:
                          --cli --check --disk /dev/sdX (or an image)
                          checks MBR/GPT, FAT32 ESP, EFI/BOOT/BOOTX64.EFI
-                         (PE/COFF) and the BIOS boot partition
+                         (PE/COFF), the BIOS boot partition and the ext4
+                         root (superblock, kernel)
       --efi-boot-entry   after installation, create a "PrismOS" entry
                          in the firmware menu (efibootmgr) - for
                          firmwares that treat the USB drive as a fixed
@@ -343,6 +345,9 @@ Args parseArgs(int argc, char** argv)
         else if (arg == "--esp-dir") {
             if (needValue(i, "--esp-dir", val)) a.options.espDir = val;
         }
+        else if (arg == "--root-dir") {
+            if (needValue(i, "--root-dir", val)) a.options.rootDir = val;
+        }
         else if (arg == "-d" || arg == "--disk") {
             if (needValue(i, "--disk", val)) a.options.target = val;
         }
@@ -360,25 +365,18 @@ Args parseArgs(int argc, char** argv)
                     a.errors.push_back("--esp-size: invalid value: " + val);
             }
         }
-        else if (arg == "--reserve") {
-            if (needValue(i, "--reserve", val)) {
-                a.options.reserveMiB = parseSize(val + "M") / MIB;
-                if (a.options.reserveMiB == 0 && val != "0")
-                    a.errors.push_back("--reserve: invalid value: " + val);
-            }
-        }
-        else if (arg == "--ext4-size") {
-            if (needValue(i, "--ext4-size", val)) {
-                a.options.ext4MiB = parseSize(val + "M") / MIB;
-                if (a.options.ext4MiB == 0 && val != "0")
-                    a.errors.push_back("--ext4-size: invalid value: " + val);
+        else if (arg == "--root-size") {
+            if (needValue(i, "--root-size", val)) {
+                a.options.rootMiB = parseSize(val + "M") / MIB;
+                if (a.options.rootMiB == 0 && val != "0")
+                    a.errors.push_back("--root-size: invalid value: " + val);
             }
         }
         else if (arg == "--esp-label") {
             if (needValue(i, "--esp-label", val)) a.options.espLabel = val;
         }
-        else if (arg == "--ext4-label") {
-            if (needValue(i, "--ext4-label", val)) a.options.ext4Label = val;
+        else if (arg == "--root-label") {
+            if (needValue(i, "--root-label", val)) a.options.rootLabel = val;
         }
         else if (arg == "--mke2fs") {
             if (needValue(i, "--mke2fs", val)) a.options.mke2fsPath = val;
@@ -467,7 +465,8 @@ std::vector<std::string> guessSources()
     std::vector<std::string> candidates;
     for (const char* c : {"build", "../build", ".", ".."}) {
         fs::path p(c);
-        if (fs::exists(p / "boot0.bin") && fs::exists(p / "esp"))
+        if (fs::exists(p / "boot0.bin") && fs::exists(p / "esp")
+            && fs::exists(p / "root"))
             candidates.push_back(p.string());
     }
     return candidates;
@@ -499,7 +498,9 @@ int runAssistant(const Args& args)
         src = installer0.loadSource();
         ok("source: " + opts.sourceDir + " - kernel "
            + humanSize(src.kernelBytes) + ", " + std::to_string(src.espFiles)
-           + " ESP files (" + humanSize(src.espTreeBytes) + ")");
+           + " ESP files (" + humanSize(src.espTreeBytes) + "), "
+           + std::to_string(src.rootFiles) + " root files ("
+           + humanSize(src.rootTreeBytes) + ")");
     } catch (const InstallError& ex) {
         fail(ex.what());
         if (!args.yes) {
@@ -613,17 +614,14 @@ int runAssistant(const Args& args)
     if (!args.yes) {
         outLine("");
         note("Sizes (Enter = default):");
-        opts.espMiB = promptMiB("ESP (FAT32: kernel included), MiB",
+        opts.espMiB = promptMiB("ESP (FAT32: UEFI stub only), MiB",
                                 opts.espMiB, ESP_MIN_MIB, ESP_MAX_MIB);
-        opts.reserveMiB = promptMiB(
-            "Reserve AFTER the ESP (to absorb a bigger future kernel), MiB",
-            opts.reserveMiB, RESERVE_MIN_MIB, RESERVE_MAX_MIB);
-        std::string ext4 = prompt(
-            "ext4 partition, MiB (Enter = all remaining space)", "");
-        if (!ext4.empty()) {
-            uint64_t v = parseSize(ext4 + "M");
+        std::string rootSize = prompt(
+            "ext4 root partition, MiB (Enter = all remaining space)", "");
+        if (!rootSize.empty()) {
+            uint64_t v = parseSize(rootSize + "M");
             if (v == 0) { warn("invalid value, rest of the disk used"); }
-            else opts.ext4MiB = v / MIB;
+            else opts.rootMiB = v / MIB;
         }
     }
 
@@ -691,9 +689,10 @@ int runAssistant(const Args& args)
             outLine("    - boot0 (MBR) -> boot1 -> bootloader (BIOS)");
             outLine("    - EFI/BOOT/BOOTX64.EFI (UEFI)");
             outLine("    - kernel: " + humanSize(summary.kernelBytes)
-                    + " on the ESP (/boot/kernel/kernel)");
-            outLine("    - ext4 \"" + plan.ext4Label + "\": "
-                    + humanSize(plan.ext4Bytes()));
+                    + " on the ext4 root (/boot/kernel/kernel)");
+            outLine("    - ext4 \"" + plan.rootLabel + "\": "
+                    + humanSize(plan.rootBytes()) + ", "
+                    + std::to_string(summary.rootFiles) + " files seeded");
             if (target.isImage)
                 outLine("  Test: qemu-system-x86_64 -drive file="
                         + target.path + ",format=raw -serial stdio");

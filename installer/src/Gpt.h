@@ -12,10 +12,11 @@
  *   LBA 0            protective MBR: boot0 code, signature, 0xEE entry
  *   LBA 1            GPT header
  *   LBA 2..33        128 partition entries
- *   LBA 2048..4095   "PrismOS boot"  : boot1 + loader (raw sectors)
- *   LBA 4096..       "PrismOS ESP"   : FAT32 (EFI, scripts, kernel)
- *                    (unallocated reserved space, for kernel growth)
- *                    "PrismOS data"  : ext4
+ *   LBA 2048..       P1 "PrismOS ESP"  : FAT32, only EFI/BOOT/BOOTX64.EFI
+ *   next             P2 "PrismOS boot" : boot1 + loader (raw sectors)
+ *   next             P3 "PrismOS root" : ext4 (/boot with the kernel, Lua
+ *                                        scripts and loader.conf, /bin,
+ *                                        /etc, /usr)
  *   last 33 LBAs     backup GPT (entries + header)
  */
 
@@ -38,35 +39,32 @@ struct PartitionPlan {
     uint64_t firstUsable   = 34;
     uint64_t lastUsable    = 0;
 
-    /* Order on the disk: ESP (P1) first, then the unallocated
-     * reserve, then the BIOS boot partition (P2), then ext4 (P3).
-     * The ESP is first because some OEM firmwares only try the
-     * default boot path on the FIRST partition of removable media. */
+    /* Order on the disk: ESP (P1), BIOS boot partition (P2), ext4
+     * root (P3), back to back.  The ESP is first because some OEM
+     * firmwares only try the default boot path on the FIRST partition
+     * of removable media. */
     uint64_t espStart      = ESP_START;
     uint64_t espSectors    = 0;
 
-    /* Unallocated growth margin, right after the ESP. */
-    uint64_t reserveSectors = 0;
-
-    /* BIOS boot partition (P2): LBA computed by the plan (after the
-     * reserve); boot0/boot1 are patched with it at install time. */
+    /* BIOS boot partition (P2): boot0/boot1 are patched with its LBA
+     * at install time. */
     uint64_t bootStart     = 0;
     uint64_t bootSectors   = BOOT_PART_SECTORS;
 
-    uint64_t ext4Start     = 0;
-    uint64_t ext4Sectors   = 0;
+    /* ext4 root (P3). */
+    uint64_t rootStart     = 0;
+    uint64_t rootSectors   = 0;
 
     /* Identifiers (logical representation). */
     util::Uuid diskGuid;
-    util::Uuid bootGuid, espGuid, ext4Guid;
+    util::Uuid bootGuid, espGuid, rootGuid;
 
     std::string espLabel;             /* FAT32 label (11 bytes max)  */
-    std::string ext4Label;            /* ext4 label (16 bytes max)   */
+    std::string rootLabel;            /* ext4 label (16 bytes max)   */
 
     uint64_t diskBytes()  const { return totalSectors * SECTOR; }
     uint64_t espBytes()   const { return espSectors * SECTOR; }
-    uint64_t ext4Bytes()  const { return ext4Sectors * SECTOR; }
-    uint64_t reserveBytes() const { return reserveSectors * SECTOR; }
+    uint64_t rootBytes()  const { return rootSectors * SECTOR; }
 };
 
 /* Raw components to write to the disk. */

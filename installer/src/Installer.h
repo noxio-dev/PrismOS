@@ -5,12 +5,15 @@
  * prism-installer - installation orchestrator.
  *
  * Steps:
- *   1. load/check the artifacts (boot0, boot1, loader, ESP),
+ *   1. load/check the artifacts (boot0, boot1, loader, ESP tree,
+ *      root tree),
  *   2. probe the target (block device or image) and safety,
- *   3. compute the partition plan (GPT),
- *   4. write: protective MBR, GPT, BIOS boot partition,
- *      FAT32 ESP (native writer), ext4 partition (mke2fs),
- *   5. a posteriori verification (re-read + CRC).
+ *   3. compute the partition plan (GPT: ESP, boot, ext4 root),
+ *   4. write: protective MBR, GPT, ext4 root populated from the root
+ *      tree (mke2fs -d), BIOS boot partition, FAT32 ESP (native
+ *      writer, only the UEFI stub),
+ *   5. a posteriori verification (re-read + CRC, ext4 superblock and
+ *      kernel).
  *
  * The engine is synchronous and Qt-free: the GUI runs it in a thread,
  * the CLI directly.  Progress is reported through callbacks.
@@ -40,14 +43,17 @@ public:
 /* Source artifacts loaded in memory / described. */
 struct SourceInfo {
     std::string sourceDir;
-    std::string espDir;
-    std::string kernelPath;           /* <espDir>/boot/kernel/kernel     */
+    std::string espDir;               /* tree of P1: EFI/BOOT/BOOTX64.EFI */
+    std::string rootDir;              /* tree of P3 (ext4 root)          */
+    std::string kernelPath;           /* <rootDir>/boot/kernel/kernel    */
     std::vector<uint8_t> boot0;
     std::vector<uint8_t> boot1;
     std::vector<uint8_t> loader;
 
     size_t espFiles = 0;              /* files in the ESP tree           */
-    uint64_t espTreeBytes = 0;        /* total data of the tree          */
+    uint64_t espTreeBytes = 0;        /* total data of the ESP tree      */
+    size_t rootFiles = 0;             /* files in the root tree          */
+    uint64_t rootTreeBytes = 0;       /* total data of the root tree     */
     uint64_t kernelBytes = 0;
 
     BootArtifacts artifacts() const
@@ -74,6 +80,7 @@ struct InstallSummary {
     PartitionPlan plan;
     fat32::BuildResult esp;
     uint64_t kernelBytes = 0;
+    size_t rootFiles = 0;             /* files seeded into the ext4 root */
     bool dryRun = false;
 };
 

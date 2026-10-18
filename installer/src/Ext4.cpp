@@ -7,7 +7,9 @@
 
 #include "Ext4.h"
 
+#include <sstream>
 #include <stdexcept>
+#include <unistd.h>
 
 namespace prism::ext4 {
 
@@ -68,6 +70,78 @@ void format(const FormatRequest& req)
             "mke2fs failed (code " + std::to_string(r.exitCode) + "): "
             + detail);
     }
+}
+
+StatResult statFile(const std::string& target, uint64_t offsetBytes,
+                    const std::string& path)
+{
+    StatResult res;
+
+    std::string debugfs = which("debugfs");
+    if (debugfs.empty()) {
+        /* sbin directories are often missing from a user's PATH. */
+        for (const char* dir : {"/usr/sbin", "/sbin", "/usr/local/sbin"}) {
+            std::string cand = std::string(dir) + "/debugfs";
+            if (::access(cand.c_str(), X_OK) == 0) { debugfs = cand; break; }
+        }
+    }
+    if (debugfs.empty()) {
+        res.detail = "debugfs not found (e2fsprogs)";
+        return res;
+    }
+
+    /* libext2fs syntax for a region inside a file: "image?offset=N". */
+    std::string spec = target;
+    if (offsetBytes > 0)
+        spec += "?offset=" + std::to_string(offsetBytes);
+
+    ProcessResult r;
+    try {
+        r = runProcess(debugfs, {"-R", "stat " + path, spec}, {}, 60);
+    } catch (const std::exception& ex) {
+        res.detail = std::string("debugfs: ") + ex.what();
+        return res;
+    }
+
+    /* debugfs exits 0 even when the command fails: read its output. */
+    const std::string out = r.stdoutText + "\n" + r.stderrText;
+
+    if (out.find("File not found") != std::string::npos) {
+        res.kind = StatKind::NotFound;
+        res.detail = path + " is not in the ext4 filesystem";
+        return res;
+    }
+
+    /* "User: 0 Group: 0 Project: 0   Size: 3145728" - the first "Size:"
+     * of the output is the inode's (the "Fragment: ... Size: 0" field
+     * comes after it). */
+    auto pos = out.find("Size:");
+    if (r.ok() && out.find("Inode:") != std::string::npos
+        && pos != std::string::npos) {
+        size_t i = pos + 5;
+        while (i < out.size() && out[i] == ' ') ++i;
+        size_t j = i;
+        while (j < out.size() && out[j] >= '0' && out[j] <= '9') ++j;
+        if (j > i) {
+            res.size = std::stoull(out.substr(i, j - i));
+            res.kind = StatKind::Ok;
+            return res;
+        }
+    }
+
+    /* Last meaningful line (the first one is debugfs's version banner). */
+    std::string reason;
+    {
+        std::istringstream is(out);
+        std::string line;
+        while (std::getline(is, line))
+            if (!line.empty() && line.rfind("debugfs ", 0) != 0)
+                reason = line;
+    }
+    if (reason.size() > 160) reason.resize(160);
+    res.detail = "debugfs could not read the filesystem"
+                 + (reason.empty() ? std::string() : " (" + reason + ")");
+    return res;
 }
 
 } // namespace prism::ext4

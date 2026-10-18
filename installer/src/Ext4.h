@@ -40,4 +40,24 @@ void format(const FormatRequest& req);
 /* Returns the path of mke2fs (PATH or override), "" if absent. */
 std::string findMke2fs(const std::string& overridePath);
 
+/* Result of statFile(). */
+enum class StatKind {
+    Ok,           /* the file exists, `size` is valid                       */
+    NotFound,     /* the filesystem was read and the file is NOT in it      */
+    Unavailable,  /* could not tell (no debugfs, unreadable filesystem...)  */
+};
+
+struct StatResult {
+    StatKind kind = StatKind::Unavailable;
+    uint64_t size = 0;
+    std::string detail;              /* human-readable reason when != Ok */
+};
+
+/* Looks a file up INSIDE the ext4 filesystem with debugfs (e2fsprogs),
+ * read-only: `target` is a block device (offsetBytes = 0) or an image
+ * file (offsetBytes = start of the partition).  Used after the install
+ * to prove that the kernel really landed in the root filesystem. */
+StatResult statFile(const std::string& target, uint64_t offsetBytes,
+                    const std::string& path);
+
 } // namespace prism::ext4

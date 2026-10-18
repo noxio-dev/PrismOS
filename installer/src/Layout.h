@@ -19,12 +19,18 @@ constexpr uint64_t SECTOR         = 512;             /* logical sector size     
 constexpr uint64_t MIB            = 1024 * 1024;
 constexpr uint64_t MIB_SECTORS    = MIB / SECTOR;    /* 2048 */
 
-/* Start LBA of the ESP (P1, first partition of the disk).  Some OEM
+/* Disk layout (identical to tools/mkimage.py):
+ *
+ *   P1 "PrismOS ESP"   FAT32, minimal: only EFI/BOOT/BOOTX64.EFI
+ *   P2 "PrismOS boot"  BIOS boot partition: boot1 + 64-bit loader
+ *   P3 "PrismOS root"  ext4: /boot (kernel, Lua, loader.conf), /bin, /etc, /usr
+ *
+ * Start LBA of the ESP (P1, first partition of the disk).  Some OEM
  * firmwares only try the default boot path (EFI/BOOT/BOOTX64.EFI) on
  * the FIRST partition of a removable medium: the ESP must therefore
- * come first.  The BIOS boot partition position does not matter -
- * boot0/boot1 are patched with its actual LBA at install time, and
- * the loader finds the ESP by scanning the GPT for its type GUID. */
+ * come first.  P2 and P3 follow it back to back; boot0/boot1 are
+ * patched with the actual LBA of P2 at install time, and the loader
+ * finds the ext4 root by scanning the GPT for its type GUID. */
 constexpr uint64_t ESP_START         = 2048;
 /* BIOS boot partition size: 2 MiB. */
 constexpr uint64_t BOOT_PART_SECTORS = 4096;
@@ -39,28 +45,27 @@ constexpr uint32_t MBR_DISK_SIG      = 0x5052534D;    /* upstream disk signature
 
 /* ---- Option bounds ----------------------------------------------------- */
 
-constexpr uint64_t ESP_MIN_MIB       = 48;
+/* The ESP only holds the UEFI stub (BOOTX64.EFI).  A spec-valid FAT32
+ * needs at least 65525 clusters, i.e. roughly 33 MiB with 512-byte
+ * clusters: below 34 MiB some firmwares (EDK2 classifies by cluster
+ * count) refuse to mount the volume (same bound as mkimage.py). */
+constexpr uint64_t ESP_MIN_MIB       = 34;
 constexpr uint64_t ESP_MAX_MIB       = 2048;
-constexpr uint64_t ESP_DEFAULT_MIB   = 64;
+constexpr uint64_t ESP_DEFAULT_MIB   = 36;
 
-/* Unallocated margin right after the ESP: this is where a larger
- * future kernel will be able to expand (the ESP will be grown into
- * this space during an update, without moving the other partitions). */
-constexpr uint64_t RESERVE_MIN_MIB   = 0;
-constexpr uint64_t RESERVE_MAX_MIB   = 4096;
-constexpr uint64_t RESERVE_DEFAULT_MIB = 128;
+/* ext4 root: read by the loader (boot tree) and mounted on / by the
+ * kernel. */
+constexpr uint64_t ROOT_MIN_MIB      = 32;
+constexpr uint64_t ROOT_MAX_MIB      = 8 * 1024 * 1024;   /* 8 TiB and up */
 
-constexpr uint64_t EXT4_MIN_MIB      = 32;
-constexpr uint64_t EXT4_MAX_MIB      = 8 * 1024 * 1024;   /* 8 TiB and up */
-
-/* Default labels. */
-inline constexpr const char* ESP_LABEL   = "PRISMOS";
-inline constexpr const char* EXT4_LABEL  = "PRISMDATA";
+/* Default labels (same as mkimage.py). */
+inline constexpr const char* ESP_LABEL   = "PRISMESP";
+inline constexpr const char* ROOT_LABEL  = "PRISMROOT";
 
 /* GPT partition names. */
 inline constexpr const char* PART_NAME_BOOT = "PrismOS boot";
 inline constexpr const char* PART_NAME_ESP  = "PrismOS ESP";
-inline constexpr const char* PART_NAME_DATA = "PrismOS data";
+inline constexpr const char* PART_NAME_ROOT = "PrismOS root";
 
 /* GPT partition type GUIDs. */
 inline constexpr const char* GUID_BIOS_BOOT =

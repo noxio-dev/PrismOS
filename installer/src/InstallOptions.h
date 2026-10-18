@@ -16,11 +16,17 @@ namespace prism {
 
 struct InstallOptions {
     /* PrismOS build directory (contains boot0.bin,
-     * boot1.bin, loader.bin and esp/). */
+     * boot1.bin, loader.bin, esp/ and root/). */
     std::string sourceDir;
 
-    /* Optional ESP directory override (otherwise <sourceDir>/esp). */
+    /* Optional ESP directory override (otherwise <sourceDir>/esp):
+     * tree copied into the FAT32 ESP (P1), i.e. EFI/BOOT/BOOTX64.EFI. */
     std::string espDir;
+
+    /* Optional root directory override (otherwise <sourceDir>/root):
+     * tree copied into the ext4 root (P3), i.e. boot/kernel/kernel,
+     * boot/lua, boot/loader.conf, bin, etc, usr. */
+    std::string rootDir;
 
     /* Target: block device (/dev/sdX) or image file. */
     std::string target;
@@ -29,20 +35,14 @@ struct InstallOptions {
      * size (K/M/G/T suffixes, powers of 1024). 0 = disabled. */
     uint64_t imageSize = 0;
 
-    /* ESP size (FAT32: UEFI loader + scripts + kernel). */
+    /* ESP size (FAT32: only the UEFI stub). */
     uint64_t espMiB = ESP_DEFAULT_MIB;
 
-    /* Unallocated margin AFTER the ESP and BEFORE the ext4 partition:
-     * this is where a larger future kernel will be able to expand
-     * (the ESP will be grown into this free space during an update,
-     * without moving the ext4 partition). */
-    uint64_t reserveMiB = RESERVE_DEFAULT_MIB;
-
-    /* ext4 partition size; 0 = all remaining space. */
-    uint64_t ext4MiB = 0;
+    /* ext4 root partition size; 0 = all remaining space. */
+    uint64_t rootMiB = 0;
 
     std::string espLabel  = ESP_LABEL;
-    std::string ext4Label = EXT4_LABEL;
+    std::string rootLabel = ROOT_LABEL;
 
     /* mke2fs path override (automated tests). */
     std::string mke2fsPath;

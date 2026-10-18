@@ -67,13 +67,13 @@ echo "== T1: complete installation (512 MiB, ESP 64, reserve 128) =="
 rm -f "$TMP/t1.img" "$TMP/stub.log"
 NO_COLOR=1 PRISM_STUB_LOG="$TMP/stub.log" \
     "$BIN" --cli --yes --source "$TMP/src" --disk "$TMP/t1.img" \
-    --image-size 512M --esp-size 64 --reserve 128 \
+    --image-size 512M --esp-size 64 --root-size 0 \
     --mke2fs "$TMP/bin/mke2fs" > "$TMP/t1.log" 2>&1
 rc=$?
 report $rc "installation completed (exit 0)" \
     "installation failed - see $TMP/t1.log"
 [ $rc -eq 0 ] && $PY "$HERE/verify_image.py" "$TMP/t1.img" "$TMP/src" \
-    --esp-size 64 --reserve 128 --stub-log "$TMP/stub.log" \
+    --esp-size 64 --stub-log "$TMP/stub.log" \
     > "$TMP/t1.verify" 2>&1
 report $? "independent verification compliant" \
     "independent verification - see $TMP/t1.verify"
@@ -125,13 +125,13 @@ echo
 echo "== T7: reinstallation on an existing image (idempotence) =="
 NO_COLOR=1 PRISM_STUB_LOG="$TMP/stub7.log" \
     "$BIN" --cli --yes --source "$TMP/src" --disk "$TMP/t1.img" \
-    --esp-size 64 --reserve 128 --mke2fs "$TMP/bin/mke2fs" \
+    --esp-size 64 --root-size 0 --mke2fs "$TMP/bin/mke2fs" \
     > "$TMP/t7.log" 2>&1
 rc=$?
 report $rc "reinstallation succeeded" "reinstallation failed - $TMP/t7.log"
 if [ $rc -eq 0 ]; then
     $PY "$HERE/verify_image.py" "$TMP/t1.img" "$TMP/src" \
-        --esp-size 64 --reserve 128 --stub-log "$TMP/stub7.log" \
+        --esp-size 64 --stub-log "$TMP/stub7.log" \
         > "$TMP/t7.verify" 2>&1
     report $? "verification after reinstallation" \
         "verification after reinstallation - $TMP/t7.verify"
@@ -142,13 +142,13 @@ echo "== T8: other parameters (ESP 128 MiB, reserve 0) =="
 rm -f "$TMP/t8.img" "$TMP/stub8.log"
 NO_COLOR=1 PRISM_STUB_LOG="$TMP/stub8.log" \
     "$BIN" --cli --yes --source "$TMP/src" --disk "$TMP/t8.img" \
-    --image-size 1G --esp-size 128 --reserve 0 \
+    --image-size 1G --esp-size 128 --root-size 0 \
     --mke2fs "$TMP/bin/mke2fs" > "$TMP/t8.log" 2>&1
 rc=$?
 report $rc "installation with ESP 128 / reserve 0" "T8 installation - $TMP/t8.log"
 if [ $rc -eq 0 ]; then
     $PY "$HERE/verify_image.py" "$TMP/t8.img" "$TMP/src" \
-        --esp-size 128 --reserve 0 --stub-log "$TMP/stub8.log" \
+        --esp-size 128 --stub-log "$TMP/stub8.log" \
         > "$TMP/t8.verify" 2>&1
     report $? "T8 verification compliant" "T8 verification - $TMP/t8.verify"
 fi
@@ -158,13 +158,13 @@ echo "== T9: custom labels =="
 rm -f "$TMP/t9.img" "$TMP/stub9.log"
 NO_COLOR=1 PRISM_STUB_LOG="$TMP/stub9.log" \
     "$BIN" --cli --yes --source "$TMP/src" --disk "$TMP/t9.img" \
-    --image-size 512M --esp-label TESTESP --ext4-label TESTDATA \
+    --image-size 512M --esp-label TESTESP --root-label TESTDATA \
     --mke2fs "$TMP/bin/mke2fs" > "$TMP/t9.log" 2>&1
 rc=$?
 if [ $rc -eq 0 ]; then
     $PY "$HERE/verify_image.py" "$TMP/t9.img" "$TMP/src" \
-        --esp-size 64 --reserve 128 --stub-log "$TMP/stub9.log" \
-        --label-ext4 TESTDATA > "$TMP/t9.verify" 2>&1
+        --esp-size 64 --stub-log "$TMP/stub9.log" \
+        --label-root TESTDATA > "$TMP/t9.verify" 2>&1
     # the FAT32 label TESTESP must appear in the boot sector
     $PY - "$TMP/t9.img" <<'EOF'
 import sys
@@ -187,17 +187,17 @@ rm -f "$TMP/t10.img" "$TMP/stub10.log"
 # ESP 64 / reserve 128 / ext4 = remainder), then "t10.img" to confirm.
 # Regression: promptMiB compared bytes against MiB bounds and
 # rejected even a plain Enter keypress.
-printf '\n\n\nt10.img\n' | \
+printf '\n\nt10.img\n' | \
     NO_COLOR=1 PRISM_STUB_LOG="$TMP/stub10.log" \
     "$BIN" --cli --source "$TMP/src" --disk "$TMP/t10.img" \
-    --image-size 512M --mke2fs "$TMP/bin/mke2fs" > "$TMP/t10.log" 2>&1
+    --image-size 512M --root-size 0 --mke2fs "$TMP/bin/mke2fs" > "$TMP/t10.log" 2>&1
 rc=$?
 if [ $rc -eq 0 ] && ! grep -q "out of range" "$TMP/t10.log" \
-    && grep -q "Installation complete" "$TMP/t10.log"; then
+    && grep -qE "Installation (complete|terminée|réussie)" "$TMP/t10.log"; then
     report 0 "Enter = default accepted, installation completed" \
         "interactive prompts broken - $TMP/t10.log"
     $PY "$HERE/verify_image.py" "$TMP/t10.img" "$TMP/src" \
-        --esp-size 64 --reserve 128 --stub-log "$TMP/stub10.log" \
+        --esp-size 36 --stub-log "$TMP/stub10.log" \
         > "$TMP/t10.verify" 2>&1
     report $? "T10 verification compliant" \
         "T10 verification - $TMP/t10.verify"
@@ -360,14 +360,14 @@ with open(path, "wb") as f:
 EOF
 NO_COLOR=1 PRISM_STUB_LOG="$TMP/stub16.log" \
     "$BIN" --cli --yes --source "$TMP/src" --disk "$TMP/t16.img" \
-    --esp-size 64 --reserve 128 \
+    --esp-size 64 --root-size 0 \
     --mke2fs "$TMP/bin/mke2fs" > "$TMP/t16.log" 2>&1
 rc=$?
 report $rc "installation on dirty media (fake LFN residue)" \
     "installation on dirty media - $TMP/t16.log"
 if [ $rc -eq 0 ]; then
     $PY "$HERE/verify_image.py" "$TMP/t16.img" "$TMP/src" \
-        --esp-size 64 --reserve 128 --stub-log "$TMP/stub16.log" \
+        --esp-size 64 --stub-log "$TMP/stub16.log" \
         > "$TMP/t16.verify" 2>&1
     report $? "independent verification on dirty media" \
         "dirty media verification - $TMP/t16.verify"

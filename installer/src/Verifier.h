@@ -68,6 +68,12 @@ EspAudit auditEsp(int fd, uint64_t baseOffset);
  * Returns the list of problems (empty = bootable). */
 std::vector<std::string> verifyUefiBoot(int fd, uint64_t baseOffset);
 
+/* Verifies the ext4 root (P3) at baseOffset: superblock magic (0xEF53)
+ * and volume label.  The CONTENT (kernel...) is checked separately
+ * through ext4::statFile(), which needs e2fsprogs. */
+std::vector<std::string> verifyExt4Root(int fd, uint64_t baseOffset,
+                                        const std::string& label);
+
 /* Verifies the low-level structures: protective MBR, GPT headers
  * (primary and backup), entry CRCs, range consistency,
  * boot partition (magic + patches + bootloader bytes). */

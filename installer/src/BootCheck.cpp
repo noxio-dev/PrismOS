@@ -6,6 +6,7 @@
  */
 
 #include "BootCheck.h"
+#include "Ext4.h"
 #include "Layout.h"
 #include "Util.h"
 #include "Verifier.h"
@@ -201,6 +202,8 @@ Report auditTarget(const std::string& path)
         std::vector<uint8_t> espType = util::Uuid::parse(GUID_ESP).bytesLe();
         std::vector<uint8_t> biosType =
             util::Uuid::parse(GUID_BIOS_BOOT).bytesLe();
+        std::vector<uint8_t> linuxType =
+            util::Uuid::parse(GUID_LINUX_FS).bytesLe();
 
         for (uint32_t i = 0; i < nEntries; ++i) {
             const uint8_t* e = entries.data() + size_t(i) * entrySize;
@@ -264,9 +267,11 @@ Report auditTarget(const std::string& path)
         /* ---- 3+4. ESP FAT32 + UEFI boot ------------------------------- */
         const PartitionEntry* esp = nullptr;
         const PartitionEntry* bios = nullptr;
+        const PartitionEntry* root = nullptr;
         for (const auto& p : parts) {
             if (!esp && p.typeGuid == guidToString(espType.data())) esp = &p;
             if (!bios && p.typeGuid == guidToString(biosType.data())) bios = &p;
+            if (!root && p.typeGuid == guidToString(linuxType.data())) root = &p;
         }
         if (!esp) {
             rep.problems.push_back("UEFI: no EFI System Partition"
@@ -278,11 +283,7 @@ Report auditTarget(const std::string& path)
                                 + ", FAT32 expected starting at LBA "
                                 + std::to_string(esp->first));
             /* ESP position: the FIRST partition is where some OEM
-             * firmwares only look for the default boot path.  USB drives
-             * installed with the old layout (BIOS boot partition first,
-             * before 2026-10-18) carry their ESP as P2: technically
-             * bootable on conformant firmwares, but invisible on those
-             * OEM machines. */
+             * firmwares only look for the default boot path. */
             if (esp->number != 1)
                 rep.lines.push_back(
                     "note: the ESP is partition P"
@@ -290,20 +291,18 @@ Report auditTarget(const std::string& path)
                     + ", not P1 - some OEM firmwares only try the default"
                       " boot path (EFI/BOOT/BOOTX64.EFI) on the FIRST"
                       " partition of a removable medium; reinstall with"
-                      " the 2026-10-18 (night) version (ESP first) for"
-                      " maximum compatibility");
+                      " this installer (ESP first) for maximum"
+                      " compatibility");
             /* 'legacy BIOS bootable' attribute (bit 2): optional for
              * compliant firmwares, but some OEM BIOSes only list a GPT
-             * disk in the boot menu if it is set.  USB drives installed
-             * before 2026-10-18 (evening) do not have it. */
+             * disk in the boot menu if it is set. */
             rep.lines.push_back(
                 std::string("ESP: 'legacy BIOS bootable' attribute ")
                 + ((esp->attrs & 0x4)
                    ? "set (maximum visibility in boot menus)"
                    : "missing - optional, but some firmwares only "
                      "list the USB drive in the F12 menu if it is set;"
-                     " reinstall with the 2026-10-18 (evening) version"
-                     " to add it"));
+                     " reinstall with this installer to add it"));
             if (esp->first % 2048 != 0)
                 rep.lines.push_back("ESP: start not aligned to MiB (LBA "
                                     + std::to_string(esp->first)
@@ -361,6 +360,58 @@ Report auditTarget(const std::string& path)
                 rep.problems.push_back(std::string("BIOS: boot partition "
                                                    "unreadable: ")
                                        + ex.what());
+            }
+        }
+
+        /* ---- 6. ext4 root ---------------------------------------------- */
+        /* The loader reads its boot tree (kernel, Lua scripts,
+         * loader.conf) from the ext4 root: without a sane root and a
+         * kernel inside, both the BIOS and the UEFI chains end at the
+         * loader with nothing to boot. */
+        if (!root) {
+            rep.problems.push_back("ext4 root: no Linux filesystem"
+                                   " partition (type GUID 0FC63DAF-...) -"
+                                   " the loader finds its boot tree and"
+                                   " the kernel there");
+        } else {
+            uint8_t sb[1024];
+            bool readOk = false, magicOk = false;
+            try {
+                preadAll(fd, root->first * SECTOR + 1024, sb, sizeof(sb));
+                readOk = true;
+                magicOk = le16(sb + 0x38) == 0xEF53;
+            } catch (const std::exception& ex) {
+                rep.problems.push_back(std::string("ext4 root: P"
+                                       + std::to_string(root->number)
+                                       + " unreadable: ") + ex.what());
+            }
+            if (magicOk) {
+                char label[17] = {0};
+                std::memcpy(label, sb + 0x78, 16);
+                rep.lines.push_back("ext4 root: P" + std::to_string(root->number)
+                                    + ", superblock OK, label \"" + label
+                                    + "\"");
+
+                ext4::StatResult st = ext4::statFile(path, root->first * SECTOR,
+                                                     "/boot/kernel/kernel");
+                if (st.kind == ext4::StatKind::Ok)
+                    rep.lines.push_back("ext4 root: kernel present"
+                                        " (/boot/kernel/kernel, "
+                                        + humanSize(st.size) + ")");
+                else if (st.kind == ext4::StatKind::NotFound)
+                    rep.problems.push_back(
+                        "ext4 root: /boot/kernel/kernel is missing - the"
+                        " loader would have no kernel to boot; reinstall"
+                        " with this installer");
+                else
+                    rep.lines.push_back("ext4 root: content not verified ("
+                                        + st.detail + ")");
+            } else if (readOk) {
+                rep.problems.push_back("ext4 root: P"
+                                       + std::to_string(root->number)
+                                       + " has no ext4 superblock (magic"
+                                         " 0xEF53) - the loader cannot read"
+                                         " the boot tree");
             }
         }
     } catch (const std::exception& ex) {

@@ -690,4 +690,36 @@ std::vector<std::string> verifyGptBoot(int fd,
     return problems;
 }
 
+/* ---- ext4 root ---------------------------------------------------------- */
+
+std::vector<std::string> verifyExt4Root(int fd, uint64_t baseOffset,
+                                        const std::string& label)
+{
+    std::vector<std::string> problems;
+
+    /* The superblock always sits 1024 bytes into the partition. */
+    uint8_t sb[1024];
+    try {
+        preadAll(fd, baseOffset + 1024, sb, sizeof(sb));
+    } catch (const std::exception& ex) {
+        problems.push_back(std::string("ext4 root: superblock unreadable: ")
+                           + ex.what());
+        return problems;
+    }
+
+    if (le16(sb + 0x38) != 0xEF53) {
+        problems.push_back("ext4 root: wrong superblock magic (expected"
+                           " 0xEF53) - the loader would not find the boot"
+                           " tree");
+        return problems;
+    }
+
+    char got[17] = {0};
+    std::memcpy(got, sb + 0x78, 16);              /* s_volume_name */
+    if (std::string(got) != label)
+        problems.push_back("ext4 root: label \"" + std::string(got)
+                           + "\" (expected \"" + label + "\")");
+    return problems;
+}
+
 } // namespace prism::verify

@@ -139,15 +139,17 @@ std::vector<uint8_t> buildGptEntries(const PartitionPlan& plan)
              plan.espStart, plan.espStart + plan.espSectors - 1,
              plan.espGuid, 0x4);
 
-    /* Entry #1 = BIOS boot partition (P2), after the reserve: its LBA
-     * is patched into boot0 (MBR) and boot1 at install time. */
+    /* Entry #1 = BIOS boot partition (P2), right after the ESP: its
+     * LBA is patched into boot0 (MBR) and boot1 at install time. */
     setEntry(1, GUID_BIOS_BOOT, PART_NAME_BOOT,
              plan.bootStart, plan.bootStart + plan.bootSectors - 1,
              plan.bootGuid, 0);
 
-    setEntry(2, GUID_LINUX_FS, PART_NAME_DATA,
-             plan.ext4Start, plan.ext4Start + plan.ext4Sectors - 1,
-             plan.ext4Guid, 0);
+    /* Entry #2 = ext4 root (P3): the loader finds it by its Linux
+     * filesystem type GUID, the kernel mounts it on /. */
+    setEntry(2, GUID_LINUX_FS, PART_NAME_ROOT,
+             plan.rootStart, plan.rootStart + plan.rootSectors - 1,
+             plan.rootGuid, 0);
 
     return entries;
 }

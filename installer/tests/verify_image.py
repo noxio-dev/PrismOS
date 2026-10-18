@@ -6,12 +6,21 @@ INDEPENDENT verifier for the image installed by prism-installer.
 
 Shares no code with the C++ installer: it re-interprets everything
 from the raw disk (MBR, GPT, BIOS boot partition, the ESP's FAT32
-volume, ext4 superblock) and compares against the source artifacts
-and the manifest.
+volume, ext4 root) and compares against the source artifacts and the
+manifest.
+
+Expected layout (same as tools/mkimage.py):
+    P1 "PrismOS ESP"   FAT32, only EFI/BOOT/BOOTX64.EFI
+    P2 "PrismOS boot"  boot1 + loader
+    P3 "PrismOS root"  ext4 populated from SOURCE_DIR/root
 
 Usage:
-    verify_image.py IMAGE SOURCE_DIR [--esp-size MIB] [--reserve MIB]
-                    [--stub-log LOG] [--label-ext4 L]
+    verify_image.py IMAGE SOURCE_DIR [--esp-size MIB] [--stub-log LOG]
+                    [--label-root L] [--real-ext4]
+
+--real-ext4: the image was formatted by a REAL mke2fs (not the test
+stub): the ext4 content is then compared file by file against the
+source root tree (debugfs) and the filesystem is checked (e2fsck -fn).
 """
 
 import argparse
@@ -19,6 +28,7 @@ import binascii
 import json
 import os
 import struct
+import subprocess
 import sys
 import zlib
 
@@ -132,7 +142,7 @@ def check_mbr(img, source, boot_start):
     note("protective MBR: boot0 code identical, boot1 LBA patched, 0xEE")
 
 
-def check_gpt(img, esp_mib, reserve_mib):
+def check_gpt(img, esp_mib):
     total_sectors = img.size() // SECTOR
     hdr = img.read(SECTOR, 92)
     if hdr[:8] != b"EFI PART":
@@ -176,9 +186,8 @@ def check_gpt(img, esp_mib, reserve_mib):
 
     p1, p2, p3 = parts
     esp_sectors = esp_mib * MIB // SECTOR
-    reserve_sectors = reserve_mib * MIB // SECTOR
-    boot_start = ESP_START + esp_sectors + reserve_sectors
-    ext4_expected_start = boot_start + BOOT_PART_SECTORS
+    boot_start = ESP_START + esp_sectors
+    root_expected_start = boot_start + BOOT_PART_SECTORS
 
     # P1 = ESP, the FIRST partition: some OEM firmwares only try the
     # default boot path (EFI/BOOT/BOOTX64.EFI) on partition #1.
@@ -194,7 +203,7 @@ def check_gpt(img, esp_mib, reserve_mib):
                 "some OEM firmwares do not list the drive in the boot "
                 "menu without it")
 
-    # P2 = BIOS boot partition, after the unallocated reserve.
+    # P2 = BIOS boot partition, right after the ESP.
     if p2["type"] != GUID_BIOS_BOOT or p2["name"] != "PrismOS boot":
         problem(f"P2: incorrect type/name ({p2['type']}, \"{p2['name']}\")")
     if (p2["first"], p2["last"]) != (boot_start,
@@ -202,12 +211,12 @@ def check_gpt(img, esp_mib, reserve_mib):
         problem(f"P2: range {p2['first']}..{p2['last']}, "
                 f"expected {boot_start}..{boot_start + BOOT_PART_SECTORS - 1}")
 
-    # P3 = ext4 data.
-    if p3["type"] != GUID_LINUX_FS or p3["name"] != "PrismOS data":
+    # P3 = ext4 root, right after the boot partition (no reserve gap).
+    if p3["type"] != GUID_LINUX_FS or p3["name"] != "PrismOS root":
         problem(f"P3: incorrect type/name ({p3['type']}, \"{p3['name']}\")")
-    if p3["first"] != ext4_expected_start:
-        problem(f"P3: start {p3['first']}, expected {ext4_expected_start} "
-                f"(ESP {esp_mib} MiB + reserve {reserve_mib} MiB + boot)")
+    if p3["first"] != root_expected_start:
+        problem(f"P3: start {p3['first']}, expected {root_expected_start} "
+                f"(ESP {esp_mib} MiB + boot, no reserve)")
     if p3["last"] != total_sectors - 34:
         problem(f"P3: end {p3['last']}, expected {total_sectors - 34}")
 
@@ -227,16 +236,10 @@ def check_gpt(img, esp_mib, reserve_mib):
     if crc32(bytes(bk_tmp)) != bk_crc:
         problem("GPT: backup header CRC incorrect")
 
-    # The reserve must not contain any partition
-    if reserve_sectors:
-        gap = img.read((ESP_START + esp_sectors) * SECTOR, 4096)
-        if any(gap):
-            problem("reserve: non-zero bytes detected at the head of the area")
-
     note(f"GPT: 3 correct partitions - ESP first "
-         f"(ESP@{p1['first']} ({esp_mib} MiB), reserve {reserve_mib} MiB, "
+         f"(ESP@{p1['first']} ({esp_mib} MiB), "
          f"boot@{p2['first']}, "
-         f"ext4@{p3['first']} ({(p3['last']-p3['first']+1)*SECTOR/MIB:.2f} MiB), "
+         f"root@{p3['first']} ({(p3['last']-p3['first']+1)*SECTOR/MIB:.2f} MiB), "
          f"backup intact)")
     return parts
 
@@ -524,9 +527,17 @@ def check_esp(img, source, manifest):
             rel2 = rel[4:]
             if rel2 not in on_disk:
                 problem(f"ESP: missing file {rel2}")
-    if len(on_disk) != len(manifest) - 3:   # - boot0/boot1/loader.bin
+    expected_esp = [r for r in manifest if r.startswith("esp/")]
+    if len(on_disk) != len(expected_esp):
         problem(f"ESP: {len(on_disk)} files on the ESP, "
-                f"{len(manifest) - 3} expected")
+                f"{len(expected_esp)} expected")
+    # The ESP is MINIMAL: nothing but the UEFI stub (the kernel, the Lua
+    # scripts and loader.conf live in the ext4 root).
+    stray = sorted(f for f in on_disk
+                   if f.lower() != "efi/boot/bootx64.efi")
+    if stray:
+        problem("ESP: files other than EFI/BOOT/BOOTX64.EFI: "
+                + ", ".join(stray))
 
     # UEFI boot: EFI/BOOT/BOOTX64.EFI must exist and be an x86-64 EFI
     # application (PE32+, subsystem 10) - Python mirror of the C++
@@ -549,7 +560,12 @@ def check_esp(img, source, manifest):
                      f"({size} bytes)")
 
 
-def check_ext4(img, parts, label, stub_log):
+def debugfs_spec(image_path, offset):
+    return f"{image_path}?offset={offset}"
+
+
+def check_ext4(img, image_path, source, manifest, parts, label, stub_log,
+               real_ext4):
     if not parts or len(parts) < 3:
         return
     p3 = parts[2]
@@ -560,43 +576,89 @@ def check_ext4(img, parts, label, stub_log):
         problem(f"ext4: magic 0x{magic:04X} (expected 0xEF53)")
     else:
         vol = sb[0x78:0x88].decode("ascii", "replace").rstrip("\x00")
-        state = struct.unpack_from("<H", sb, 0x38 - 0x20)[0] \
-            if False else struct.unpack_from("<I", sb, 0x18)[0]
+        state = struct.unpack_from("<I", sb, 0x18)[0]
         note(f"ext4: magic OK, state {state}, label \"{vol}\"")
         if vol != label:
             problem(f"ext4: label \"{vol}\" != \"{label}\"")
 
+    # The ext4 root must be populated from SOURCE/root (mke2fs -d).
+    expected_seed = os.path.abspath(os.path.join(source, "root"))
     if stub_log and os.path.exists(stub_log):
         with open(stub_log) as f:
-            for line in f:
-                call = json.loads(line)
-                parsed = call["parsed"]
-                if parsed.get("offset") != p3["first"] * SECTOR:
-                    problem(f"mke2fs: offset {parsed.get('offset')} != "
-                            f"{p3['first'] * SECTOR}")
-                expected_blocks = ((p3["last"] - p3["first"] + 1) * SECTOR
-                                   - 33 * SECTOR + 33 * SECTOR) // 4096
-                # exact partition size in 4096-byte blocks
-                expected_blocks = (p3["last"] - p3["first"] + 1) * SECTOR // 4096
-                if parsed.get("size_blocks") != expected_blocks:
-                    problem(f"mke2fs: {parsed.get('size_blocks')} blocks, "
-                            f"expected {expected_blocks}")
-                if parsed.get("label") != label:
-                    problem("mke2fs: incorrect label")
-                if "-t" in call["argv"]:
-                    t = call["argv"][call["argv"].index("-t") + 1]
-                    if t != "ext4":
-                        problem(f"mke2fs: type {t}")
+            calls = [json.loads(line) for line in f]
+        if not calls:
+            problem("mke2fs: not invoked")
+        for call in calls:
+            parsed = call["parsed"]
+            if parsed.get("offset") != p3["first"] * SECTOR:
+                problem(f"mke2fs: offset {parsed.get('offset')} != "
+                        f"{p3['first'] * SECTOR}")
+            # exact partition size in 4096-byte blocks
+            expected_blocks = (p3["last"] - p3["first"] + 1) * SECTOR // 4096
+            if parsed.get("size_blocks") != expected_blocks:
+                problem(f"mke2fs: {parsed.get('size_blocks')} blocks, "
+                        f"expected {expected_blocks}")
+            if parsed.get("label") != label:
+                problem("mke2fs: incorrect label")
+            if "-t" in call["argv"]:
+                t = call["argv"][call["argv"].index("-t") + 1]
+                if t != "ext4":
+                    problem(f"mke2fs: type {t}")
+            seed = parsed.get("seed")
+            if not seed or os.path.abspath(seed) != expected_seed:
+                problem(f"mke2fs: -d {seed}, expected {expected_seed} "
+                        "(the root tree must be seeded into the ext4)")
+
+    if not real_ext4:
+        return
+
+    # ---- REAL ext4: compare the content with the source root tree ------
+    spec = debugfs_spec(image_path, p3["first"] * SECTOR)
+    root_files = {r[5:]: v for r, v in manifest.items()
+                  if r.startswith("root/")}
+    if not root_files:
+        problem("manifest: no root/ file (generator out of date?)")
+    checked = 0
+    for rel, info in sorted(root_files.items()):
+        r = subprocess.run(["debugfs", "-R", "cat /" + rel, spec],
+                           capture_output=True)
+        data = r.stdout
+        if len(data) != info["size"]:
+            problem(f"ext4: /{rel} is {len(data)} bytes, "
+                    f"expected {info['size']}")
+        elif crc32(data) != info["crc32"]:
+            problem(f"ext4: CRC of /{rel} incorrect")
+        else:
+            checked += 1
+    note(f"ext4: {checked}/{len(root_files)} files of the root tree "
+         "re-read through debugfs, identical to the source")
+
+    # Directories of the standard tree (empty ones included).
+    for d in ("bin", "etc", "usr", "boot", "boot/kernel", "boot/lua"):
+        r = subprocess.run(["debugfs", "-R", "stat /" + d, spec],
+                           capture_output=True, text=True)
+        if "Type: directory" not in r.stdout:
+            problem(f"ext4: /{d} is not a directory of the ext4 root")
+
+    # Filesystem consistency (read-only).
+    r = subprocess.run(["e2fsck", "-fn", spec], capture_output=True,
+                       text=True)
+    if r.returncode != 0:
+        problem("ext4: e2fsck -fn failed (code %d): %s"
+                % (r.returncode, (r.stdout + r.stderr).strip()[-300:]))
+    else:
+        note("ext4: e2fsck -fn clean")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("image")
     ap.add_argument("source")
-    ap.add_argument("--esp-size", type=int, default=64)
-    ap.add_argument("--reserve", type=int, default=128)
+    ap.add_argument("--esp-size", type=int, default=36)
     ap.add_argument("--stub-log", default=None)
-    ap.add_argument("--label-ext4", default="PRISMDATA")
+    ap.add_argument("--label-root", default="PRISMROOT")
+    ap.add_argument("--real-ext4", action="store_true",
+                    help="image formatted by a real mke2fs: check content")
     args = ap.parse_args()
 
     img = Image(args.image)
@@ -612,16 +674,16 @@ def main():
     print(f"source: {args.source}")
     print()
 
-    # Expected BIOS boot partition start: after the ESP and the reserve.
+    # Expected BIOS boot partition start: right after the ESP.
     esp_sectors = args.esp_size * MIB // SECTOR
-    reserve_sectors = args.reserve * MIB // SECTOR
-    boot_start = ESP_START + esp_sectors + reserve_sectors
+    boot_start = ESP_START + esp_sectors
 
     check_mbr(img, args.source, boot_start)
-    parts = check_gpt(img, args.esp_size, args.reserve)
+    parts = check_gpt(img, args.esp_size)
     check_boot_partition(img, args.source, boot_start)
     check_esp(img, args.source, manifest)
-    check_ext4(img, parts, args.label_ext4, args.stub_log)
+    check_ext4(img, args.image, args.source, manifest, parts,
+               args.label_root, args.stub_log, args.real_ext4)
 
     for n in notes:
         print(f"  [note] {n}")

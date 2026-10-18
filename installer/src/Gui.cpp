@@ -54,9 +54,7 @@ using prism::MIB;
 using prism::SECTOR;
 using prism::ESP_MIN_MIB;
 using prism::ESP_MAX_MIB;
-using prism::RESERVE_MIN_MIB;
-using prism::RESERVE_MAX_MIB;
-using prism::EXT4_MAX_MIB;
+using prism::ROOT_MAX_MIB;
 
 /* ================================================================== */
 /* Installation worker (separate thread).                              */
@@ -450,14 +448,13 @@ private:
             body->setSpacing(14);
             auto* intro = new QLabel(QString::fromUtf8(
                 "This wizard installs PrismOS onto a disk or an image:\n\n"
-                "  •  the ESP (FAT32) as the FIRST partition - EFI/BOOT/"
-                "BOOTX64.EFI for UEFI (some firmwares only boot from the "
-                "first partition), plus the kernel and the Lua scripts;\n"
+                "  •  a minimal ESP (FAT32) as the FIRST partition - only "
+                "EFI/BOOT/BOOTX64.EFI for UEFI (some firmwares only boot "
+                "from the first partition);\n"
                 "  •  the bootloader (boot0/boot1 + BIOS loader in "
                 "raw sectors);\n"
-                "  •  an unallocated reserved gap right after the ESP, so "
-                "the ESP can be enlarged if a future kernel grows larger;\n"
-                "  •  an ext4 partition for data.\n\n"
+                "  •  an ext4 root partition holding the kernel, the Lua "
+                "scripts, loader.conf and the root filesystem.\n\n"
                 "The target disk will be entirely erased."));
             intro->setWordWrap(true);
             body->addWidget(intro);
@@ -516,8 +513,9 @@ private:
             stack_->addWidget(titledPage(QString::fromUtf8("Artifacts"),
                                          QString::fromUtf8(
                                              "boot0.bin, boot1.bin, "
-                                             "loader.bin and the esp/ "
-                                             "tree - including boot/kernel/kernel"),
+                                             "loader.bin, the esp/ tree "
+                                             "and the root/ tree - "
+                                             "including boot/kernel/kernel"),
                                          body));
         }
 
@@ -651,35 +649,24 @@ private:
 
             auto* col2 = new QVBoxLayout();
             col2->addWidget(new QLabel(QString::fromUtf8(
-                "Reserve (future kernel):")));
-            reserveSpin_ = new QSpinBox();
-            reserveSpin_->setRange(int(RESERVE_MIN_MIB), int(RESERVE_MAX_MIB));
-            reserveSpin_->setValue(int(opts_.reserveMiB));
-            reserveSpin_->setSuffix(QString::fromUtf8(" MiB"));
-            col2->addWidget(reserveSpin_);
+                "ext4 root (0 = rest of disk):")));
+            rootSpin_ = new QSpinBox();
+            rootSpin_->setRange(0, int(ROOT_MAX_MIB));
+            rootSpin_->setValue(int(opts_.rootMiB));
+            rootSpin_->setSuffix(QString::fromUtf8(" MiB"));
+            col2->addWidget(rootSpin_);
             grid->addLayout(col2);
-
-            auto* col3 = new QVBoxLayout();
-            col3->addWidget(new QLabel(QString::fromUtf8(
-                "ext4 (0 = rest of disk):")));
-            ext4Spin_ = new QSpinBox();
-            ext4Spin_->setRange(0, int(EXT4_MAX_MIB));
-            ext4Spin_->setValue(int(opts_.ext4MiB));
-            ext4Spin_->setSuffix(QString::fromUtf8(" MiB"));
-            col3->addWidget(ext4Spin_);
-            grid->addLayout(col3);
 
             grid->addStretch(1);
             body->addLayout(grid);
 
             auto* expl = new QLabel(QString::fromUtf8(
-                "The ESP contains the EFI, loader scripts and the kernel; "
+                "The ESP only contains the UEFI stub (EFI/BOOT/BOOTX64.EFI); "
                 "it is the FIRST partition of the disk because some "
                 "firmwares only try the default boot path there. "
-                "The reserve is unallocated space inserted right after "
-                "the ESP: when a kernel update outgrows the current ESP, "
-                "the ESP can be enlarged into this margin without "
-                "moving the other partitions."));
+                "The kernel, the Lua scripts and loader.conf live in the "
+                "ext4 root partition, which the bootloader reads and the "
+                "kernel mounts on /."));
             expl->setWordWrap(true);
             expl->setObjectName("pageHint");
             body->addWidget(expl);
@@ -691,15 +678,15 @@ private:
             body->addWidget(layoutErr_);
             body->addStretch(1);
 
-            for (auto* sb : { espSpin_, reserveSpin_, ext4Spin_ }) {
+            for (auto* sb : { espSpin_, rootSpin_ }) {
                 connect(sb, &QSpinBox::valueChanged, this,
                         [this] { applyNavState(validateLayout()); });
             }
 
             stack_->addWidget(titledPage(QString::fromUtf8("Partitioning"),
                                          QString::fromUtf8(
-                                             "Partition sizes and "
-                                             "the growth reserve"),
+                                             "ESP and ext4 root "
+                                             "partition sizes"),
                                          body));
         }
 
@@ -797,8 +784,7 @@ private:
     void collectOptions()
     {
         opts_.espMiB = uint64_t(espSpin_->value());
-        opts_.reserveMiB = uint64_t(reserveSpin_->value());
-        opts_.ext4MiB = uint64_t(ext4Spin_->value());
+        opts_.rootMiB = uint64_t(rootSpin_->value());
     }
 
     bool validateSource()
@@ -816,11 +802,14 @@ private:
         try {
             src_ = inst.loadSource();
             sourceOk_->setText(QString::fromUtf8(
-                "✓ loader %1 · kernel %2 · %3 ESP files (%4)")
+                "✓ loader %1 · kernel %2 · %3 ESP files (%4) · "
+                "%5 root files (%6)")
                 .arg(QString::fromStdString(humanSize(src_.loader.size())))
                 .arg(QString::fromStdString(humanSize(src_.kernelBytes)))
                 .arg(src_.espFiles)
-                .arg(QString::fromStdString(humanSize(src_.espTreeBytes))));
+                .arg(QString::fromStdString(humanSize(src_.espTreeBytes)))
+                .arg(src_.rootFiles)
+                .arg(QString::fromStdString(humanSize(src_.rootTreeBytes))));
             return true;
         } catch (const std::exception& ex) {
             sourceErr_->setText(QString::fromStdString(ex.what()));
@@ -879,7 +868,7 @@ private:
     {
         layoutErr_->setText("");
         collectOptions();
-        if (opts_.target.empty() || !src_.espFiles) {
+        if (opts_.target.empty() || !src_.espFiles || !src_.rootFiles) {
             layoutBar_->setRegions({});
             return false;
         }
@@ -906,17 +895,14 @@ private:
         add("GPT", 34 * 512, QColor("#6B7280"),
             QString::fromUtf8("Partition table (start of disk)"));
         add("ESP", plan_.espBytes(), QColor("#4653D8"),
-            QString::fromUtf8("FAT32 (FIRST partition): EFI/BOOT/BOOTX64.EFI, "
-                              "Lua scripts, config and kernel"));
-        if (plan_.reserveSectors)
-            add(QString::fromUtf8("reserve").toUtf8(), plan_.reserveBytes(),
-                QColor("#E7B93C"),
-                QString::fromUtf8("Unallocated space: margin to absorb "
-                                  "a larger future kernel"));
+            QString::fromUtf8("FAT32 (FIRST partition): "
+                              "EFI/BOOT/BOOTX64.EFI"));
         add("boot", plan_.bootSectors * SECTOR, QColor("#3B4252"),
             QString::fromUtf8("boot1 + BIOS loader (raw sectors)"));
-        add("ext4", plan_.ext4Bytes(), QColor("#1FA48E"),
-            QString::fromUtf8("PrismOS data (mounted on / by the kernel)"));
+        add("root", plan_.rootBytes(), QColor("#1FA48E"),
+            QString::fromUtf8("PrismOS root: ext4 with the kernel, Lua "
+                              "scripts and loader.conf (mounted on / by "
+                              "the kernel)"));
         layoutBar_->setRegions(regions);
 
         /* Text summary. */
@@ -927,22 +913,20 @@ private:
         s += QString::fromUtf8("Loader       : boot0 (MBR) + boot1 + BIOS "
                                "loader %1\n")
                 .arg(QString::fromStdString(humanSize(src_.loader.size())));
-        s += QString::fromUtf8("Kernel       : %1 → ESP /boot/kernel/kernel\n")
+        s += QString::fromUtf8("Kernel       : %1 → ext4 /boot/kernel/kernel\n")
                 .arg(QString::fromStdString(humanSize(src_.kernelBytes)));
         s += QString::fromUtf8("P1 ESP FAT32 : %1 @ LBA %2 (label %3) - first\n")
                 .arg(QString::fromStdString(humanSize(plan_.espBytes())))
                 .arg(plan_.espStart)
                 .arg(QString::fromStdString(plan_.espLabel));
-        s += QString::fromUtf8("Reserve      : %1 unallocated (future kernel)\n")
-                .arg(QString::fromStdString(humanSize(plan_.reserveBytes())));
         s += QString::fromUtf8("P2 boot      : %1 @ LBA %2\n")
                 .arg(QString::fromStdString(
                     humanSize(plan_.bootSectors * SECTOR)))
                 .arg(plan_.bootStart);
-        s += QString::fromUtf8("P3 ext4      : %1 @ LBA %2 (label %3)\n")
-                .arg(QString::fromStdString(humanSize(plan_.ext4Bytes())))
-                .arg(plan_.ext4Start)
-                .arg(QString::fromStdString(plan_.ext4Label));
+        s += QString::fromUtf8("P3 ext4 root : %1 @ LBA %2 (label %3)\n")
+                .arg(QString::fromStdString(humanSize(plan_.rootBytes())))
+                .arg(plan_.rootStart)
+                .arg(QString::fromStdString(plan_.rootLabel));
         s += QString::fromUtf8("GPT          : 3 partitions + backup at "
                                "the end of the disk");
         summaryText_->setText(s);
@@ -1040,11 +1024,11 @@ private:
             "PrismOS is installed on %1.\n\n"
             "  • BIOS: boot0 → boot1 → loader → kernel\n"
             "  • UEFI: EFI/BOOT/BOOTX64.EFI → kernel\n"
-            "  • ext4 \"%2\": %3\n\n"
+            "  • ext4 root \"%2\": %3 (kernel, Lua scripts, loader.conf)\n\n"
             "The disk can be plugged in and booted directly.")
             .arg(QString::fromStdString(target_.path))
-            .arg(QString::fromStdString(plan_.ext4Label))
-            .arg(QString::fromStdString(humanSize(plan_.ext4Bytes())));
+            .arg(QString::fromStdString(plan_.rootLabel))
+            .arg(QString::fromStdString(humanSize(plan_.rootBytes())));
 
         auto* thread = new QThread(this);
         auto* worker = new InstallWorker(opts_);
@@ -1121,7 +1105,7 @@ public:
 
         /* 3. Sizes. */
         espSpin_->setValue(int(opts.espMiB));
-        reserveSpin_->setValue(int(opts.reserveMiB));
+        rootSpin_->setValue(int(opts.rootMiB));
         if (!validateLayout()) { qApp->exit(2); return; }
         if (!btnNext_->isEnabled()) { qApp->exit(5); return; }
         stack_->setCurrentIndex(4);
@@ -1160,8 +1144,7 @@ private:
     QLabel* diskOk_ = nullptr;
 
     QSpinBox* espSpin_ = nullptr;
-    QSpinBox* reserveSpin_ = nullptr;
-    QSpinBox* ext4Spin_ = nullptr;
+    QSpinBox* rootSpin_ = nullptr;
     LayoutBar* layoutBar_ = nullptr;
     QLabel* layoutErr_ = nullptr;
 

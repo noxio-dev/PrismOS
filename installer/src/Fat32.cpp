@@ -33,7 +33,7 @@ constexpr uint16_t FSINFO_SECTOR     = 1;
 constexpr uint16_t BACKUP_BOOT_SECTOR = 6;
 
 constexpr uint32_t MIN_CLUSTERS = 65525;        /* FAT32 floor (spec)    */
-constexpr uint32_t FAT_EOC      = 0x0FFFFFF8;
+constexpr uint32_t FAT_EOC      = 0x0FFFFFFF;
 
 void put16(uint8_t* p, uint16_t v)
 {
@@ -271,9 +271,9 @@ private:
         put16(b.data() + 0x28, 0);                          /* ExtFlags   */
         put16(b.data() + 0x2A, 0);                          /* FSVer      */
         put32(b.data() + 0x2C, ROOT_CLUSTER);
-        put16(b.data() + 0x30, FSINFO_SECTOR);
-        put16(b.data() + 0x34, BACKUP_BOOT_SECTOR);
-        /* 0x36..0x3F: reserved (zeros)                          */
+        put16(b.data() + 0x30, FSINFO_SECTOR);              /* BPB_FSInfo     */
+        put16(b.data() + 0x32, BACKUP_BOOT_SECTOR);         /* BPB_BkBootSec  */
+        /* 0x34..0x3F: BPB_Reserved (12 bytes) - must stay zero */
 
         b[0x40] = 0x80;                                     /* DrvNum     */
         b[0x41] = 0;
@@ -477,14 +477,25 @@ std::vector<std::vector<uint8_t>> makeDirEntries(
 }
 
 std::vector<uint8_t> dotEntry(const std::array<uint8_t, 11>& name,
-                              uint32_t firstCluster)
+                              uint32_t firstCluster, util::FatTime when)
 {
     std::vector<uint8_t> e(32, 0);
     std::memcpy(e.data(), name.data(), 11);
     e[0x0B] = 0x10;                                /* directory           */
-    e[0x14] = uint8_t(firstCluster >> 16);
+    e[0x0D] = when.tenth > 99 ? 99 : uint8_t(when.tenth);
+    e[0x0E] = uint8_t(when.time);                  /* creation time       */
+    e[0x0F] = uint8_t(when.time >> 8);
+    e[0x10] = uint8_t(when.date);                  /* creation date       */
+    e[0x11] = uint8_t(when.date >> 8);
+    e[0x12] = uint8_t(when.date);                  /* last access date    */
+    e[0x13] = uint8_t(when.date >> 8);
+    e[0x14] = uint8_t(firstCluster >> 16);         /* FstClusHI           */
     e[0x15] = uint8_t(firstCluster >> 24);
-    e[0x1A] = uint8_t(firstCluster);
+    e[0x16] = uint8_t(when.time);                  /* write time          */
+    e[0x17] = uint8_t(when.time >> 8);
+    e[0x18] = uint8_t(when.date);                  /* write date          */
+    e[0x19] = uint8_t(when.date >> 8);
+    e[0x1A] = uint8_t(firstCluster);               /* FstClusLO           */
     e[0x1B] = uint8_t(firstCluster >> 8);
     return e;
 }
@@ -598,7 +609,7 @@ struct Copier {
         return {first, uint32_t(size)};
     }
 
-    /* Copies a directory; returns the directory's first cluster. */
+        /* Copies a directory; returns the directory's first cluster. */
     uint32_t copyDir(const fs::path& src, uint32_t parentFirst,
                      const std::string& relPrefix,
                      const std::set<std::array<uint8_t, 11>>& taken)
@@ -620,6 +631,15 @@ struct Copier {
 
         uint32_t first = vol->allocCluster();
 
+        /* Timestamp of the directory itself (mtime): '.' and '..' must
+         * carry a VALID FAT date, like mtools writes them.  A zero date
+         * (month 0 / day 0) is invalid FAT and is flagged by some
+         * parsers and repair tools. */
+        struct ::stat dst{};
+        if (::stat(src.string().c_str(), &dst) != 0)
+            throw std::runtime_error("stat failed: " + src.string());
+        auto dirWhen = util::toFatTime(int64_t(dst.st_mtime));
+
         std::vector<std::vector<uint8_t>> entries;
         if (relPrefix.empty()) {
             /* Root: volume label entry first (padded with
@@ -634,8 +654,11 @@ struct Copier {
             lab[0x0B] = 0x08;                     /* ATTR_VOLUME_ID */
             entries.push_back(std::move(lab));
         } else {
-            entries.push_back(dotEntry(DOT1, first));
-            entries.push_back(dotEntry(DOT2, parentFirst));
+            uint32_t dotdotCluster =
+                (parentFirst == ROOT_CLUSTER) ? 0 : parentFirst;
+
+            entries.push_back(dotEntry(DOT1, first, dirWhen));
+            entries.push_back(dotEntry(DOT2, dotdotCluster, dirWhen));
             dirs += 1;
         }
 

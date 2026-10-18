@@ -1,0 +1,550 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 noxio-dev
+#
+# Test suite for prism-installer (CLI mode, on disk images).
+# Uses an mke2fs stub: no need for e2fsprogs, no root privileges,
+# no real data.
+#
+# Usage: tests/run_cli_tests.sh [binary]
+#
+# Exit codes: 0 if everything passes.
+
+set -u
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(dirname "$HERE")
+BIN=${1:-$ROOT/build/prism-installer-cli}
+
+# ABSOLUTE path required: when elevating, the binary relaunches itself
+# via /proc/self/exe (always absolute) and tests T12/T14 compare the
+# arguments received against the binary's path - both forms must
+# match, even if the caller passes a relative path.
+case $BIN in
+    /*) ;;
+    *) BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN") ;;
+esac
+PY=python3
+
+if [ ! -x "$BIN" ]; then
+    echo "binary not found: $BIN"
+    echo "build it with: g++ -std=c++20 -O2 -o build/prism-installer-cli \\"
+    echo "    tests/cli_main.cpp src/*.cpp (without Gui.cpp)"
+    exit 1
+fi
+
+TMP=$ROOT/build/testrun
+rm -rf "$TMP"
+mkdir -p "$TMP/bin"
+
+# Executable mke2fs stub: DIRECT copy of the Python script (its
+# "#!/usr/bin/env python3" shebang is preserved).  No path
+# interpolation inside an sh script: the stub stays valid even if the
+# project lives in a directory containing spaces, parentheses or
+# accented characters (e.g. ~/Downloads/PrismOS (5)).
+cat "$HERE/mke2fs_stub.py" > "$TMP/bin/mke2fs"
+chmod +x "$TMP/bin/mke2fs"
+
+PASS=0
+FAIL=0
+
+report() {
+    if [ "$1" -eq 0 ]; then
+        PASS=$((PASS + 1))
+        echo "  [PASS] $2"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  [FAIL] $3"
+    fi
+}
+
+echo "== preparing the artifacts =="
+$PY "$HERE/make_test_artifacts.py" -o "$TMP/src" --kernel-kib 3072 >/dev/null
+report $? "artifacts generated" "artifact generation"
+
+echo
+echo "== T1: complete installation (512 MiB, ESP 64, reserve 128) =="
+rm -f "$TMP/t1.img" "$TMP/stub.log"
+NO_COLOR=1 PRISM_STUB_LOG="$TMP/stub.log" \
+    "$BIN" --cli --yes --source "$TMP/src" --disk "$TMP/t1.img" \
+    --image-size 512M --esp-size 64 --root-size 128 \
+    --mke2fs "$TMP/bin/mke2fs" > "$TMP/t1.log" 2>&1
+rc=$?
+report $rc "installation completed (exit 0)" \
+    "installation failed - see $TMP/t1.log"
+[ $rc -eq 0 ] && $PY "$HERE/verify_image.py" "$TMP/t1.img" "$TMP/src" \
+    --esp-size 64 --root-size 128 --stub-log "$TMP/stub.log" \
+    > "$TMP/t1.verify" 2>&1
+report $? "independent verification compliant" \
+    "independent verification - see $TMP/t1.verify"
+
+echo
+echo "== T2: simulation (dry run): no writes =="
+rm -f "$TMP/t2.img"
+NO_COLOR=1 "$BIN" --cli --yes --dry-run --source "$TMP/src" \
+    --disk "$TMP/t2.img" --image-size 1G > "$TMP/t2.log" 2>&1
+rc=$?
+if [ $rc -eq 0 ] && [ ! -e "$TMP/t2.img" ]; then
+    report 0 "dry run without file creation" "dry run created/wrote something"
+else
+    report 1 "dry run without file creation" "dry run: exit=$rc or file created"
+fi
+
+echo
+echo "== T3: corrupted boot1 (magic) => rejected =="
+cp -r "$TMP/src" "$TMP/src_bad"
+printf 'XXXX' | dd of="$TMP/src_bad/boot1.bin" bs=1 seek=0 conv=notrunc \
+    status=none
+NO_COLOR=1 "$BIN" --cli --yes --source "$TMP/src_bad" --disk "$TMP/t3.img" \
+    --image-size 512M > "$TMP/t3.log" 2>&1
+[ $? -eq 2 ]
+report $? "invalid artifacts rejected (exit 2)" "corrupted boot1 magic accepted!"
+
+echo
+echo "== T4: ESP too small for the tree => rejected =="
+NO_COLOR=1 "$BIN" --cli --yes --source "$TMP/src" --disk "$TMP/t4.img" \
+    --image-size 512M --esp-size 8 > "$TMP/t4.log" 2>&1
+[ $? -eq 2 ]
+report $? "ESP too small rejected (exit 2)" "8 MiB ESP accepted!"
+
+echo
+echo "== T5: disk too small => rejected =="
+NO_COLOR=1 "$BIN" --cli --yes --source "$TMP/src" --disk "$TMP/t5.img" \
+    --image-size 64M > "$TMP/t5.log" 2>&1
+[ $? -eq 2 ]
+report $? "disk too small rejected (exit 2)" "64 MiB disk accepted!"
+
+echo
+echo "== T6: nonexistent source => rejected =="
+NO_COLOR=1 "$BIN" --cli --yes --source "$TMP/nonexistent" \
+    --disk "$TMP/t6.img" --image-size 512M > "$TMP/t6.log" 2>&1
+[ $? -eq 2 ]
+report $? "nonexistent source rejected (exit 2)" "nonexistent source accepted!"
+
+echo
+echo "== T7: reinstallation on an existing image (idempotence) =="
+NO_COLOR=1 PRISM_STUB_LOG="$TMP/stub7.log" \
+    "$BIN" --cli --yes --source "$TMP/src" --disk "$TMP/t1.img" \
+    --esp-size 64 --root-size 128 --mke2fs "$TMP/bin/mke2fs" \
+    > "$TMP/t7.log" 2>&1
+rc=$?
+report $rc "reinstallation succeeded" "reinstallation failed - $TMP/t7.log"
+if [ $rc -eq 0 ]; then
+    $PY "$HERE/verify_image.py" "$TMP/t1.img" "$TMP/src" \
+        --esp-size 64 --root-size 128 --stub-log "$TMP/stub7.log" \
+        > "$TMP/t7.verify" 2>&1
+    report $? "verification after reinstallation" \
+        "verification after reinstallation - $TMP/t7.verify"
+fi
+
+echo
+echo "== T8: other parameters (ESP 128 MiB, reserve 0) =="
+rm -f "$TMP/t8.img" "$TMP/stub8.log"
+NO_COLOR=1 PRISM_STUB_LOG="$TMP/stub8.log" \
+    "$BIN" --cli --yes --source "$TMP/src" --disk "$TMP/t8.img" \
+    --image-size 1G --esp-size 128 --root-size 0 \
+    --mke2fs "$TMP/bin/mke2fs" > "$TMP/t8.log" 2>&1
+rc=$?
+report $rc "installation with ESP 128 / reserve 0" "T8 installation - $TMP/t8.log"
+if [ $rc -eq 0 ]; then
+    $PY "$HERE/verify_image.py" "$TMP/t8.img" "$TMP/src" \
+        --esp-size 128 --root-size 0 --stub-log "$TMP/stub8.log" \
+        > "$TMP/t8.verify" 2>&1
+    report $? "T8 verification compliant" "T8 verification - $TMP/t8.verify"
+fi
+
+echo
+echo "== T9: custom labels =="
+rm -f "$TMP/t9.img" "$TMP/stub9.log"
+NO_COLOR=1 PRISM_STUB_LOG="$TMP/stub9.log" \
+    "$BIN" --cli --yes --source "$TMP/src" --disk "$TMP/t9.img" \
+    --image-size 512M --esp-label TESTESP --ext4-label TESTDATA \
+    --mke2fs "$TMP/bin/mke2fs" > "$TMP/t9.log" 2>&1
+rc=$?
+if [ $rc -eq 0 ]; then
+    $PY "$HERE/verify_image.py" "$TMP/t9.img" "$TMP/src" \
+        --esp-size 64 --root-size 128 --stub-log "$TMP/stub9.log" \
+        --label-ext4 TESTDATA > "$TMP/t9.verify" 2>&1
+    # the FAT32 label TESTESP must appear in the boot sector
+    $PY - "$TMP/t9.img" <<'EOF'
+import sys
+img = open(sys.argv[1], "rb").read()
+esp = img[2048 * 512:2048 * 512 + 512]
+sys.exit(0 if esp[0x47:0x52] == b"TESTESP    " else 1)
+EOF
+    rc2=$?
+    [ $rc2 -eq 0 ]
+    report $? "custom labels applied" "incorrect FAT32 label"
+else
+    report 1 "custom labels applied" "T9 exit=$rc"
+fi
+
+echo
+echo "== T10: interactive prompts (Enter = default, redirected stdin) =="
+rm -f "$TMP/t10.img" "$TMP/stub10.log"
+# --source and --disk provided: only the size prompts and the
+# confirmation remain interactive.  Enter, Enter, Enter (= defaults
+# ESP 64 / reserve 128 / ext4 = remainder), then "t10.img" to confirm.
+# Regression: promptMiB compared bytes against MiB bounds and
+# rejected even a plain Enter keypress.
+printf '\n\n\nt10.img\n' | \
+    NO_COLOR=1 PRISM_STUB_LOG="$TMP/stub10.log" \
+    "$BIN" --cli --source "$TMP/src" --disk "$TMP/t10.img" \
+    --image-size 512M --mke2fs "$TMP/bin/mke2fs" > "$TMP/t10.log" 2>&1
+rc=$?
+if [ $rc -eq 0 ] && ! grep -q "out of range" "$TMP/t10.log" \
+    && grep -q "Installation complete" "$TMP/t10.log"; then
+    report 0 "Enter = default accepted, installation completed" \
+        "interactive prompts broken - $TMP/t10.log"
+    $PY "$HERE/verify_image.py" "$TMP/t10.img" "$TMP/src" \
+        --esp-size 64 --root-size 128 --stub-log "$TMP/stub10.log" \
+        > "$TMP/t10.verify" 2>&1
+    report $? "T10 verification compliant" \
+        "T10 verification - $TMP/t10.verify"
+else
+    report 1 "Enter = default accepted, installation completed" \
+        "T10 exit=$rc - $TMP/t10.log"
+fi
+
+echo
+echo "== T11: elevation impossible (no tool) => code 4 =="
+# An empty PATH: the binary (which knows how to elevate itself - both
+# the main.cpp and the cli_main.cpp layers) returns 4 with an explicit
+# message.  An old binary without that layer would fail validation (2):
+# T12-T15 would then be skipped rather than skewing the summary.
+rm -rf "$TMP/nobin"; mkdir -p "$TMP/nobin"
+NO_COLOR=1 PATH="$TMP/nobin" \
+    "$BIN" --cli --yes --source "$TMP/src" --disk /dev/prism-fakeusb \
+    > "$TMP/t11.log" 2>&1
+ELEV=$?
+if [ "$ELEV" -eq 4 ] && grep -q "sudo not found" "$TMP/t11.log"; then
+    HAS_ELEV=1
+    report 0 "missing sudo detected cleanly (exit 4)" \
+        "unexpected code $ELEV - $TMP/t11.log"
+elif [ "$ELEV" -eq 2 ]; then
+    HAS_ELEV=0
+    echo "  [note] binary without the elevation layer: T12-T15 skipped"
+else
+    HAS_ELEV=0
+    report 1 "missing sudo detected cleanly (exit 4)" \
+        "T11 exit=$ELEV - $TMP/t11.log"
+fi
+
+if [ "$HAS_ELEV" -eq 1 ]; then
+
+echo
+echo "== T12: /dev target => relaunch via sudo, argv intact =="
+# sudo stub: logs its arguments then exits 7.  The binary REPLACES
+# itself with sudo (execv): the stub's exit code becomes its own, and
+# the original command line must come back unchanged.
+cat > "$TMP/bin/sudo" <<'STUB'
+#!/bin/sh
+{ printf 'arg:%s\n' "$@"; } > "${PRISM_ELEVATE_LOG:?}"
+exit 7
+STUB
+chmod +x "$TMP/bin/sudo"
+rm -f "$TMP/t12.log" "$TMP/stub12.log"
+NO_COLOR=1 PRISM_ELEVATE_LOG="$TMP/stub12.log" \
+    PATH="$TMP/bin:/usr/bin:/bin" \
+    "$BIN" --cli --yes --source "$TMP/src" --disk /dev/prism-fakeusb \
+    > "$TMP/t12.log" 2>&1
+rc=$?
+if [ "$rc" -eq 7 ] && grep -Fxq "arg:--" "$TMP/stub12.log" \
+    && grep -Fxq "arg:$BIN" "$TMP/stub12.log" \
+    && grep -Fxq "arg:--cli" "$TMP/stub12.log" \
+    && grep -Fxq "arg:--yes" "$TMP/stub12.log" \
+    && grep -Fxq "arg:/dev/prism-fakeusb" "$TMP/stub12.log" \
+    && grep -q "via sudo" "$TMP/t12.log"; then
+    report 0 "sudo invoked with the command line intact" \
+        "T12 exit=$rc - $TMP/t12.log / $TMP/stub12.log"
+else
+    report 1 "sudo invoked with the command line intact" \
+        "T12 exit=$rc - $TMP/t12.log / $TMP/stub12.log"
+fi
+
+echo
+echo "== T13: image target => NO elevation (sudo present but unused) =="
+# Dedicated elevation log (PRISM_ELEVATE_LOG): the mke2fs stub log
+# (PRISM_STUB_LOG) proves that the installation did happen, while the
+# absence of a sudo log proves that no elevation was attempted.
+rm -f "$TMP/t13.img" "$TMP/t13.log" "$TMP/stub13.log" "$TMP/mke13.log"
+NO_COLOR=1 PRISM_ELEVATE_LOG="$TMP/stub13.log" \
+    PRISM_STUB_LOG="$TMP/mke13.log" \
+    PATH="$TMP/bin:/usr/bin:/bin" \
+    "$BIN" --cli --yes --source "$TMP/src" --disk "$TMP/t13.img" \
+    --image-size 512M --mke2fs "$TMP/bin/mke2fs" > "$TMP/t13.log" 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] && [ ! -e "$TMP/stub13.log" ] \
+    && [ -e "$TMP/mke13.log" ]; then
+    report 0 "image installation done without calling sudo" \
+        "T13: sudo wrongly called, or exit=$rc - $TMP/t13.log"
+else
+    report 1 "image installation done without calling sudo" \
+        "T13 exit=$rc - $TMP/t13.log"
+fi
+
+echo
+echo "== T14: graphical mode => pkexec + display variables =="
+# DISPLAY set (fake): the binary must relaunch itself via pkexec,
+# passing env, DISPLAY and the binary's absolute path.  Elevation
+# precedes the creation of QApplication: no real X server is needed,
+# the stub gets executed and returns 7.
+cat > "$TMP/bin/pkexec" <<'STUB'
+#!/bin/sh
+{ printf 'arg:%s\n' "$@"; } > "${PRISM_ELEVATE_LOG:?}"
+exit 7
+STUB
+chmod +x "$TMP/bin/pkexec"
+rm -f "$TMP/t14.log" "$TMP/stub14.log"
+DISPLAY=:42 NO_COLOR=1 PRISM_ELEVATE_LOG="$TMP/stub14.log" \
+    PATH="$TMP/bin:/usr/bin:/bin" \
+    "$BIN" --source "$TMP/src" > "$TMP/t14.log" 2>&1
+rc=$?
+if [ "$rc" -eq 7 ] && grep -q "arg:.*/env$" "$TMP/stub14.log" \
+    && grep -Fxq "arg:DISPLAY=:42" "$TMP/stub14.log" \
+    && grep -Fxq "arg:$BIN" "$TMP/stub14.log" \
+    && grep -Fxq "arg:--source" "$TMP/stub14.log" \
+    && grep -Fxq "arg:$TMP/src" "$TMP/stub14.log"; then
+    report 0 "pkexec called with env, DISPLAY and argv intact" \
+        "T14 exit=$rc - $TMP/t14.log / $TMP/stub14.log"
+else
+    report 1 "pkexec called with env, DISPLAY and argv intact" \
+        "T14 exit=$rc - $TMP/t14.log / $TMP/stub14.log"
+fi
+rm -f "$TMP/bin/pkexec"
+
+echo
+echo "== T15: PRISM_INSTALLER_NO_ELEVATE=1 => no elevation =="
+rm -f "$TMP/t15.log" "$TMP/stub15.log"
+PRISM_INSTALLER_NO_ELEVATE=1 NO_COLOR=1 PRISM_ELEVATE_LOG="$TMP/stub15.log" \
+    PATH="$TMP/bin:/usr/bin:/bin" \
+    "$BIN" --cli --yes --source "$TMP/src" --disk /dev/prism-fakeusb \
+    > "$TMP/t15.log" 2>&1
+rc=$?
+if [ "$rc" -eq 2 ] && [ ! -e "$TMP/stub15.log" ]; then
+    report 0 "bypass honored: no sudo, validation refused" \
+        "T15 exit=$rc - $TMP/t15.log"
+else
+    report 1 "bypass honored: no sudo, validation refused" \
+        "T15 exit=$rc - $TMP/t15.log"
+fi
+rm -f "$TMP/bin/sudo"
+
+fi   # HAS_ELEV
+
+echo
+echo "== T16: dirty media (non-zero residue): the ESP must stay readable =="
+# Real-world regression (an already-used USB drive): writeDirData()
+# only wrote the directory ENTRIES - the tail of the last cluster then
+# kept the media's previous content.  Since a fresh image is implicitly
+# zeroed, the test suite saw nothing; on a genuinely reused drive,
+# verification ended in "ESP unreadable: unexpected non-ASCII LFN"
+# (an 0x0F attribute byte landing by chance in old machine-code
+# leftovers, hex dump C8 F2 0F 5E...).
+# Here the WHOLE image is pre-filled with a pattern whose every
+# 32-byte slot mimics a non-ASCII LFN entry: the slightest residual
+# byte exposed after a directory entry must make the install fail.
+rm -f "$TMP/t16.img" "$TMP/stub16.log"
+$PY - "$TMP/t16.img" <<'EOF'
+import sys
+path = sys.argv[1]
+size = 512 * 1024 * 1024
+# 32 bytes: invalid LFN sequence number (0xC8), LFN attribute (0x0F)
+# at byte 11, non-ASCII UTF-16 characters (0xF2) everywhere else.
+pattern = bytes([0xC8] + [0xF2] * 10 + [0x0F] + [0xF2] * 20)
+chunk = pattern * (8 * 1024 * 1024 // len(pattern))
+with open(path, "wb") as f:
+    for _ in range(size // len(chunk)):
+        f.write(chunk)
+    f.write(chunk[: size % len(chunk)])
+EOF
+NO_COLOR=1 PRISM_STUB_LOG="$TMP/stub16.log" \
+    "$BIN" --cli --yes --source "$TMP/src" --disk "$TMP/t16.img" \
+    --esp-size 64 --root-size 128 \
+    --mke2fs "$TMP/bin/mke2fs" > "$TMP/t16.log" 2>&1
+rc=$?
+report $rc "installation on dirty media (fake LFN residue)" \
+    "installation on dirty media - $TMP/t16.log"
+if [ $rc -eq 0 ]; then
+    $PY "$HERE/verify_image.py" "$TMP/t16.img" "$TMP/src" \
+        --esp-size 64 --root-size 128 --stub-log "$TMP/stub16.log" \
+        > "$TMP/t16.verify" 2>&1
+    report $? "independent verification on dirty media" \
+        "dirty media verification - $TMP/t16.verify"
+fi
+
+echo
+echo "== T17: ESP without EFI/BOOT/BOOTX64.EFI => rejected BEFORE writing =="
+# Without a UEFI bootloader the disk would boot in BIOS but NOT in
+# UEFI: the installer must refuse (exit 2) rather than install a
+# non-bootable drive.  Real-world regression ("the install works but
+# it's not bootable, I'm on UEFI").
+rm -rf "$TMP/src_noefi"
+cp -r "$TMP/src" "$TMP/src_noefi"
+rm -f "$TMP/src_noefi/esp/EFI/BOOT/BOOTX64.EFI"
+rm -f "$TMP/t17.img"
+NO_COLOR=1 "$BIN" --cli --yes --source "$TMP/src_noefi" --disk "$TMP/t17.img" \
+    --image-size 512M --mke2fs "$TMP/bin/mke2fs" > "$TMP/t17.log" 2>&1
+rc=$?
+if [ "$rc" -eq 2 ] && grep -q "BOOTX64" "$TMP/t17.log" \
+    && [ ! -e "$TMP/t17.img" ]; then
+    report 0 "ESP tree without UEFI bootloader rejected (exit 2, nothing written)" \
+        "T17 exit=$rc - $TMP/t17.log"
+else
+    report 1 "ESP tree without UEFI bootloader rejected (exit 2, nothing written)" \
+        "T17 exit=$rc - $TMP/t17.log"
+fi
+
+echo
+echo "== T18: invalid BOOTX64.EFI (not a PE) => rejected =="
+# A renamed .EFI file without a PE/COFF header would be silently
+# rejected by the firmware: the installer must detect it at the source.
+rm -rf "$TMP/src_badefi"
+cp -r "$TMP/src" "$TMP/src_badefi"
+printf 'this is not a PE executable\n' \
+    > "$TMP/src_badefi/esp/EFI/BOOT/BOOTX64.EFI"
+rm -f "$TMP/t18.img"
+NO_COLOR=1 "$BIN" --cli --yes --source "$TMP/src_badefi" --disk "$TMP/t18.img" \
+    --image-size 512M --mke2fs "$TMP/bin/mke2fs" > "$TMP/t18.log" 2>&1
+rc=$?
+if [ "$rc" -eq 2 ] && grep -q "UEFI application" "$TMP/t18.log" \
+    && [ ! -e "$TMP/t18.img" ]; then
+    report 0 "non-PE BOOTX64.EFI rejected with an explicit message" \
+        "T18 exit=$rc - $TMP/t18.log"
+else
+    report 1 "non-PE BOOTX64.EFI rejected with an explicit message" \
+        "T18 exit=$rc - $TMP/t18.log"
+fi
+
+echo
+echo "== T19: --check on a compliant image => exit 0, no elevation =="
+# Diagnostic tool: audits the image installed in T1 without touching it.
+# The sudo stub is present in the PATH: no call must be made (an image
+# requires no privileges).
+cat > "$TMP/bin/sudo" <<'STUB'
+#!/bin/sh
+{ printf 'arg:%s\n' "$@"; } > "${PRISM_ELEVATE_LOG:?}"
+exit 7
+STUB
+chmod +x "$TMP/bin/sudo"
+rm -f "$TMP/t19.log" "$TMP/stub19.log"
+NO_COLOR=1 PRISM_ELEVATE_LOG="$TMP/stub19.log" \
+    PATH="$TMP/bin:/usr/bin:/bin" \
+    "$BIN" --cli --check --disk "$TMP/t1.img" > "$TMP/t19.log" 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] && [ ! -e "$TMP/stub19.log" ] \
+    && grep -q "Bootable disk" "$TMP/t19.log" \
+    && grep -q "BOOTX64.EFI present" "$TMP/t19.log" \
+    && grep -q "valid x86-64 EFI application" "$TMP/t19.log"; then
+    report 0 "--check: compliant, UEFI boot validated, no sudo" \
+        "T19 exit=$rc - $TMP/t19.log"
+else
+    report 1 "--check: compliant, UEFI boot validated, no sudo" \
+        "T19 exit=$rc - $TMP/t19.log"
+fi
+rm -f "$TMP/bin/sudo"
+
+echo
+echo "== T20: --check after PE corruption => exit 3, diagnostic =="
+# The "M" of the MZ header of BOOTX64.EFI in the image is altered: the
+# firmware would silently reject the bootloader; --check must say so.
+cp "$TMP/t1.img" "$TMP/t20.img"
+$PY - "$TMP/t20.img" "$TMP/src/esp/EFI/BOOT/BOOTX64.EFI" <<'EOF'
+import sys
+img_path, pe_path = sys.argv[1], sys.argv[2]
+with open(pe_path, "rb") as f:
+    header = f.read(512)          # full PE header of the source file
+with open(img_path, "r+b") as f:
+    data = f.read()
+    # The ESP contains TWO copies of these bytes (EFI/BOOT/BOOTX64.EFI
+    # and boot/loader.efi): corrupt ALL occurrences to be sure to reach
+    # the one the firmware loads.
+    offs = []
+    pos = 2048 * 512
+    while True:
+        off = data.find(header, pos)
+        if off < 0:
+            break
+        offs.append(off)
+        pos = off + 1
+    if not offs:
+        sys.exit("PE header not found in the image")
+    for off in offs:
+        f.seek(off)
+        f.write(b"\x00")          # destroy the "M" of "MZ"
+    sys.stderr.write("corrupted occurrences: %s\n" % offs)
+EOF
+NO_COLOR=1 "$BIN" --cli --check --disk "$TMP/t20.img" > "$TMP/t20.log" 2>&1
+rc=$?
+if [ "$rc" -eq 3 ] && grep -q "MZ" "$TMP/t20.log" \
+    && grep -q "NOT bootable" "$TMP/t20.log"; then
+    report 0 "--check detects the corrupted UEFI bootloader (exit 3)" \
+        "T20 exit=$rc - $TMP/t20.log"
+else
+    report 1 "--check detects the corrupted UEFI bootloader (exit 3)" \
+        "T20 exit=$rc - $TMP/t20.log"
+fi
+
+echo
+echo "== T21: --efi-boot-entry (efibootmgr stub) => entry created =="
+# Some firmwares treat a USB drive as a fixed disk and do not try the
+# removable path by default: the option creates a "PrismOS" entry via
+# efibootmgr (a stub that logs its arguments).
+cat > "$TMP/bin/efibootmgr" <<'STUB'
+#!/bin/sh
+{ printf 'arg:%s\n' "$@"; } > "${PRISM_EFIBOOT_LOG:?}"
+exit 0
+STUB
+chmod +x "$TMP/bin/efibootmgr"
+rm -f "$TMP/t21.img" "$TMP/t21.log" "$TMP/t21.efiboot.log" "$TMP/stub21.log"
+NO_COLOR=1 PRISM_INSTALLER_FORCE_EFIBOOTMGR=1 \
+    PRISM_EFIBOOT_LOG="$TMP/t21.efiboot.log" \
+    PRISM_STUB_LOG="$TMP/stub21.log" \
+    "$BIN" --cli --yes --source "$TMP/src" --disk "$TMP/t21.img" \
+    --image-size 512M --efi-boot-entry --efibootmgr "$TMP/bin/efibootmgr" \
+    --mke2fs "$TMP/bin/mke2fs" > "$TMP/t21.log" 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] && grep -Fxq "arg:--create" "$TMP/t21.efiboot.log" \
+    && grep -Fxq "arg:--disk" "$TMP/t21.efiboot.log" \
+    && grep -Fxq "arg:$TMP/t21.img" "$TMP/t21.efiboot.log" \
+    && grep -Fxq "arg:--part" "$TMP/t21.efiboot.log" \
+    && grep -Fxq "arg:1" "$TMP/t21.efiboot.log" \
+    && grep -Fxq "arg:--label" "$TMP/t21.efiboot.log" \
+    && grep -Fxq "arg:PrismOS" "$TMP/t21.efiboot.log" \
+    && grep -Fxq "arg:--loader" "$TMP/t21.efiboot.log" \
+    && grep -Fq "arg:\\EFI\\BOOT\\BOOTX64.EFI" "$TMP/t21.efiboot.log" \
+    && grep -q "boot entry" "$TMP/t21.log"; then
+    report 0 "efibootmgr invoked: --create --disk ... --part 1 --loader" \
+        "T21 exit=$rc - $TMP/t21.log / $TMP/t21.efiboot.log"
+else
+    report 1 "efibootmgr invoked: --create --disk ... --part 1 --loader" \
+        "T21 exit=$rc - $TMP/t21.log / $TMP/t21.efiboot.log"
+fi
+rm -f "$TMP/bin/efibootmgr"
+
+echo
+echo "== T22: --check on a disk without GPT => exit 3, diagnostic =="
+# A 4 MiB file of zeros: no MBR signature and no GPT header - the audit
+# must say so instead of staying silent.
+rm -f "$TMP/t22.img"
+$PY - "$TMP/t22.img" <<'EOF'
+import sys
+with open(sys.argv[1], "wb") as f:
+    f.truncate(4 * 1024 * 1024)
+EOF
+NO_COLOR=1 "$BIN" --cli --check --disk "$TMP/t22.img" > "$TMP/t22.log" 2>&1
+rc=$?
+if [ "$rc" -eq 3 ] && grep -q "55AA" "$TMP/t22.log" \
+    && grep -q "EFI PART" "$TMP/t22.log"; then
+    report 0 "--check: blank disk diagnosed (exit 3)" \
+        "T22 exit=$rc - $TMP/t22.log"
+else
+    report 1 "--check: blank disk diagnosed (exit 3)" \
+        "T22 exit=$rc - $TMP/t22.log"
+fi
+
+echo
+echo "=========================================="
+echo "  $PASS passed, $FAIL failed"
+echo "=========================================="
+[ $FAIL -eq 0 ]

@@ -4,7 +4,9 @@
 """
 Generates VALID test artifacts for the PrismOS installer:
 boot0.bin (512 B), boot1.bin (8 KiB, magic "PRB1"), loader.bin,
-and a complete ESP tree (EFI, Lua scripts, kernel).
+a MINIMAL ESP tree (esp/: only EFI/BOOT/BOOTX64.EFI) and the ext4 root
+tree (root/: boot/kernel/kernel, boot/lua, boot/loader.conf, bin, etc,
+usr) - the same two trees "make esp" and "make root" produce.
 
 Everything is deterministic (seeded PRNG): the CRCs are stable from
 one run to the next.  A manifest.json allows after-the-fact
@@ -121,15 +123,16 @@ def main():
     write(f"{root}/boot1.bin", boot1)
     write(f"{root}/loader.bin", loader)
 
-    # ESP tree identical to the one produced by "make":
-    # EFI/BOOT/BOOTX64.EFI, boot/loader.efi, boot/lua/*.lua,
-    # boot/defaults/loader.conf, boot/loader.conf, boot/kernel/kernel
-    # (BOOTX64.EFI is a REAL x86-64 EFI application: the installer
+    # P1 tree identical to the one produced by "make esp": ONLY the UEFI
+    # stub (BOOTX64.EFI is a REAL x86-64 EFI application: the installer
     # must validate it - random bytes there would be rejected by the
-    # PE/COFF check.)
+    # PE/COFF check).
     write(f"{root}/esp/EFI/BOOT/BOOTX64.EFI", efi_app)
-    write(f"{root}/esp/boot/loader.efi", efi_app)
-    write(f"{root}/esp/boot/kernel/kernel", kernel)
+
+    # P3 tree identical to the one produced by "make root":
+    # boot/kernel/kernel, boot/lua/*.lua, boot/defaults/loader.conf,
+    # boot/loader.conf, plus the (empty) bin, etc and usr directories.
+    write(f"{root}/root/boot/kernel/kernel", kernel)
 
     r = rng(1005)
     lua_files = {
@@ -140,12 +143,14 @@ def main():
         "config.lua": b"-- config.lua (test)\n" + r.randbytes(512),
     }
     for name, content in lua_files.items():
-        write(f"{root}/esp/boot/lua/{name}", content)
+        write(f"{root}/root/boot/lua/{name}", content)
 
-    write(f"{root}/esp/boot/defaults/loader.conf",
+    write(f"{root}/root/boot/defaults/loader.conf",
           b'autoboot_delay="3"\nloader_menu_title="PrismOS (test)"\n')
-    write(f"{root}/esp/boot/loader.conf",
+    write(f"{root}/root/boot/loader.conf",
           b'kernel="/boot/kernel/kernel"\nkernel_options=""\n')
+    for d in ("bin", "etc", "usr"):
+        os.makedirs(f"{root}/root/{d}", exist_ok=True)
 
     # Manifest: CRC and size of each file.
     manifest = {}

@@ -191,7 +191,7 @@ SourceInfo Installer::loadSource() const
     if (opts_.sourceDir.empty())
         throw InstallError("source directory not set (PrismOS build"
                            " output, containing the expected build/...: "
-                           "boot0.bin, boot1.bin, loader.bin, esp/)");
+                           "boot0.bin, boot1.bin, loader.bin, esp/, root/)");
     if (!fs::exists(opts_.sourceDir) || !fs::is_directory(opts_.sourceDir))
         throw InstallError("source directory not found: "
                            + opts_.sourceDir);
@@ -201,6 +201,9 @@ SourceInfo Installer::loadSource() const
     src.espDir = opts_.espDir.empty()
                  ? (root / "esp").string()
                  : opts_.espDir;
+    src.rootDir = opts_.rootDir.empty()
+                  ? (root / "root").string()
+                  : opts_.rootDir;
 
     auto missing = [&](const fs::path& p, const char* what) {
         if (!fs::exists(p))
@@ -216,11 +219,16 @@ SourceInfo Installer::loadSource() const
     missing(boot1, "boot1.bin");
     missing(loader, "loader.bin");
     missing(fs::path(src.espDir), "the ESP tree (esp/)");
+    missing(fs::path(src.rootDir), "the ext4 root tree (root/)");
 
-    src.kernelPath = (fs::path(src.espDir) / "boot" / "kernel" / "kernel").string();
+    /* The kernel lives in the ext4 root (P3), not on the ESP: the
+     * loader reads /boot/kernel/kernel from there. */
+    src.kernelPath = (fs::path(src.rootDir) / "boot" / "kernel" / "kernel").string();
     if (!fs::exists(src.kernelPath))
-        throw InstallError("kernel missing from the ESP: " + src.kernelPath
-                           + " - the installer requires a kernel to install");
+        throw InstallError("kernel missing from the root tree: "
+                           + src.kernelPath
+                           + " - the installer requires a kernel to install"
+                           " (run \"make root\" at the PrismOS root)");
 
     /* UEFI boot: without EFI/BOOT/BOOTX64.EFI (a valid x86-64 EFI
      * application), the disk boots in BIOS but NOT in UEFI - better
@@ -265,7 +273,7 @@ SourceInfo Installer::loadSource() const
     if (!v.empty())
         throw InstallError("invalid boot artifacts: " + v);
 
-    /* Inventory of the ESP tree. */
+    /* Inventory of the ESP and root trees. */
     std::error_code ec;
     for (const auto& de : fs::recursive_directory_iterator(src.espDir, ec)) {
         if (ec) break;
@@ -277,6 +285,16 @@ SourceInfo Installer::loadSource() const
     if (src.espFiles == 0)
         throw InstallError("the ESP tree is empty: "
                            + src.espDir);
+    for (const auto& de : fs::recursive_directory_iterator(src.rootDir, ec)) {
+        if (ec) break;
+        if (de.is_regular_file(ec)) {
+            src.rootFiles += 1;
+            src.rootTreeBytes += uint64_t(de.file_size(ec));
+        }
+    }
+    if (src.rootFiles == 0)
+        throw InstallError("the root tree is empty: "
+                           + src.rootDir);
     src.kernelBytes = uint64_t(fs::file_size(src.kernelPath, ec));
 
     return src;
@@ -411,19 +429,16 @@ PartitionPlan Installer::computePlan(const TargetInfo& t,
                            + std::to_string(opts_.espMiB) + " MiB; "
                            "between " + std::to_string(ESP_MIN_MIB) + " and "
                            + std::to_string(ESP_MAX_MIB) + ")");
-    if (opts_.reserveMiB > RESERVE_MAX_MIB)
-        throw InstallError("reserve too large (max "
-                           + std::to_string(RESERVE_MAX_MIB) + " MiB)");
-    if (opts_.ext4MiB != 0 && opts_.ext4MiB < EXT4_MIN_MIB)
-        throw InstallError("ext4 partition too small (min "
-                           + std::to_string(EXT4_MIN_MIB) + " MiB)");
+    if (opts_.rootMiB != 0 && opts_.rootMiB < ROOT_MIN_MIB)
+        throw InstallError("ext4 root partition too small (min "
+                           + std::to_string(ROOT_MIN_MIB) + " MiB)");
     if (opts_.espLabel.size() > 11)
         throw InstallError("the ESP label must be at most 11 characters");
-    if (opts_.ext4Label.size() > 16)
+    if (opts_.rootLabel.size() > 16)
         throw InstallError("the ext4 label must be at most 16 characters");
 
-    /* The ESP must hold the tree + FAT metadata (FAT + entries),
-     * with a comfortable margin. */
+    /* The ESP only holds the UEFI stub, but it must still hold the
+     * tree + FAT metadata (FAT + entries), with a comfortable margin. */
     uint64_t fatOverhead = src.espTreeBytes / 16;    /* ~FAT*2 at 512 B/cluster */
     uint64_t needed = src.espTreeBytes + fatOverhead + 2 * MIB;
     if (opts_.espMiB * MIB < needed)
@@ -432,58 +447,72 @@ PartitionPlan Installer::computePlan(const TargetInfo& t,
                            + ", allow at least "
                            + humanSize(needed + MIB) + " (--esp-size option)");
 
+    /* The ext4 root must hold the whole root tree: data + the metadata
+     * (inode tables, bitmaps, extent trees ~ 1/8) + the journal (up to
+     * 64 MiB on big volumes, 4 MiB on small ones) + margin.  mke2fs -d
+     * would otherwise fail halfway through the installation. */
+    uint64_t rootNeeded = src.rootTreeBytes + src.rootTreeBytes / 8 + 16 * MIB;
+    if (opts_.rootMiB != 0 && opts_.rootMiB * MIB < rootNeeded)
+        throw InstallError("ext4 root partition too small: the root tree is "
+                           + humanSize(src.rootTreeBytes)
+                           + ", allow at least " + humanSize(rootNeeded)
+                           + " (--root-size option)");
+
     PartitionPlan p;
     p.totalSectors = t.bytes / SECTOR;
-    if (p.totalSectors < 2048 + 4096 + 2048 + 33 + 2048)
+    if (p.totalSectors < ESP_START + BOOT_PART_SECTORS
+                         + mibToSectors(ROOT_MIN_MIB) + 33 + 1)
         throw InstallError("disk too small (" + humanSize(t.bytes) + ")");
 
     p.lastLba     = p.totalSectors - 1;
     p.firstUsable = 34;
     p.lastUsable  = p.lastLba - 33;
 
-    /* Layout: the ESP is the FIRST partition (P1, LBA 2048) because
-     * some OEM firmwares only try the default boot path
-     * (EFI/BOOT/BOOTX64.EFI) on the first partition of a removable
-     * medium - with the BIOS boot partition first, the USB drive
-     * could be installed perfectly and still never boot on such
-     * machines.  Then: unallocated reserve (growth margin for the
-     * ESP), BIOS boot partition (P2, LBA patched into boot0/boot1 at
-     * install time), ext4 (P3). */
+    /* Layout (identical to tools/mkimage.py): the ESP is the FIRST
+     * partition (P1, LBA 2048) because some OEM firmwares only try the
+     * default boot path (EFI/BOOT/BOOTX64.EFI) on the first partition
+     * of a removable medium.  Then the BIOS boot partition (P2, LBA
+     * patched into boot0/boot1 at install time), then the ext4 root
+     * (P3), back to back. */
     p.espStart    = ESP_START;
     p.espSectors  = mibToSectors(opts_.espMiB);
-    p.reserveSectors = mibToSectors(opts_.reserveMiB);
-    p.bootStart   = p.espStart + p.espSectors + p.reserveSectors;
+    p.bootStart   = p.espStart + p.espSectors;
     p.bootSectors = BOOT_PART_SECTORS;
-    p.ext4Start   = p.bootStart + p.bootSectors;
+    p.rootStart   = p.bootStart + p.bootSectors;
 
-    if (p.ext4Start > p.lastUsable)
+    if (p.rootStart > p.lastUsable)
         throw InstallError("disk too small (" + humanSize(t.bytes)
                            + "): after the ESP of "
-                           + std::to_string(opts_.espMiB) + " MiB, the "
-                           "reserve of " + std::to_string(opts_.reserveMiB)
-                           + " MiB and the boot partition, no space"
-                           " remains for the ext4 partition");
+                           + std::to_string(opts_.espMiB) + " MiB and the "
+                           "boot partition, no space remains for the ext4"
+                           " root partition");
 
-    uint64_t ext4Avail = p.lastUsable - p.ext4Start + 1;
-    uint64_t ext4Sectors = opts_.ext4MiB ? mibToSectors(opts_.ext4MiB)
-                                         : ext4Avail;
-    if (ext4Sectors > ext4Avail)
+    uint64_t rootAvail = p.lastUsable - p.rootStart + 1;
+    uint64_t rootSectors = opts_.rootMiB ? mibToSectors(opts_.rootMiB)
+                                         : rootAvail;
+    if (rootSectors > rootAvail)
         throw InstallError("disk too small: "
-                           + humanSize((ext4Sectors - ext4Avail) * SECTOR)
-                           + " would be missing for the requested ext4 partition");
-    if (ext4Sectors < mibToSectors(EXT4_MIN_MIB))
-        throw InstallError("insufficient space for the ext4 partition ("
-                           + humanSize(ext4Avail * SECTOR) + " remaining, min "
-                           + std::to_string(EXT4_MIN_MIB) + " MiB)");
-    p.ext4Sectors = ext4Sectors;
+                           + humanSize((rootSectors - rootAvail) * SECTOR)
+                           + " would be missing for the requested ext4 root partition");
+    if (rootSectors < mibToSectors(ROOT_MIN_MIB))
+        throw InstallError("insufficient space for the ext4 root partition ("
+                           + humanSize(rootAvail * SECTOR) + " remaining, min "
+                           + std::to_string(ROOT_MIN_MIB) + " MiB)");
+    if (rootSectors * SECTOR < rootNeeded)
+        throw InstallError("insufficient space for the ext4 root partition: "
+                           "the root tree is " + humanSize(src.rootTreeBytes)
+                           + ", allow at least " + humanSize(rootNeeded)
+                           + " (" + humanSize(rootSectors * SECTOR)
+                           + " available)");
+    p.rootSectors = rootSectors;
 
     p.diskGuid = util::Uuid::randomV4();
     p.bootGuid = util::Uuid::randomV4();
     p.espGuid  = util::Uuid::randomV4();
-    p.ext4Guid = util::Uuid::randomV4();
+    p.rootGuid = util::Uuid::randomV4();
 
     p.espLabel  = opts_.espLabel;
-    p.ext4Label = opts_.ext4Label;
+    p.rootLabel = opts_.rootLabel;
     return p;
 }
 
@@ -518,6 +547,8 @@ InstallSummary Installer::run(const ProgressHooks& hooks) const
          + ", kernel " + humanSize(src.kernelBytes));
     info("ESP tree: " + std::to_string(src.espFiles) + " files, "
          + humanSize(src.espTreeBytes));
+    info("Root tree: " + std::to_string(src.rootFiles) + " files, "
+         + humanSize(src.rootTreeBytes));
 
     prog(2, "Validating the target");
     TargetInfo target = probeTarget();
@@ -537,22 +568,22 @@ InstallSummary Installer::run(const ProgressHooks& hooks) const
     info("  Protective MBR + GPT headers (33 sectors at the end of the disk)");
     info("  P1 \"" + std::string(PART_NAME_ESP) + "\"  LBA "
          + std::to_string(plan.espStart) + " ("
-         + humanSize(plan.espBytes()) + ") - FAT32, EFI + scripts + kernel"
-         " - FIRST partition (required by some firmwares)");
-    info("  - unallocated reserved space: "
-         + humanSize(plan.reserveBytes())
-         + " (margin for kernel growth; the ESP can be expanded there)");
+         + humanSize(plan.espBytes()) + ") - FAT32, UEFI stub"
+         " (EFI/BOOT/BOOTX64.EFI) - FIRST partition (required by some"
+         " firmwares)");
     info("  P2 \"" + std::string(PART_NAME_BOOT) + "\"  LBA "
          + std::to_string(plan.bootStart) + " ("
          + humanSize(plan.bootSectors * SECTOR) + ") - boot1 + BIOS loader");
-    info("  P3 \"" + std::string(PART_NAME_DATA) + "\"  LBA "
-         + std::to_string(plan.ext4Start) + " ("
-         + humanSize(plan.ext4Bytes()) + ") - ext4 \""
-         + plan.ext4Label + "\"");
+    info("  P3 \"" + std::string(PART_NAME_ROOT) + "\"  LBA "
+         + std::to_string(plan.rootStart) + " ("
+         + humanSize(plan.rootBytes()) + ") - ext4 \""
+         + plan.rootLabel + "\": kernel, Lua scripts, loader.conf, root"
+         " filesystem");
 
     InstallSummary summary;
     summary.plan = plan;
     summary.kernelBytes = src.kernelBytes;
+    summary.rootFiles = src.rootFiles;
 
     if (opts_.dryRun) {
         info("[SIMULATION] no writes performed.");
@@ -573,9 +604,6 @@ InstallSummary Installer::run(const ProgressHooks& hooks) const
         prog(6, "Cleanup");
         info("Erasing existing signatures...");
         writeZeros(fd, 0, MIB);                              /* MBR + GPT */
-        if (plan.reserveSectors)
-            writeZeros(fd, plan.espStart * SECTOR + plan.espBytes(),
-                       plan.reserveBytes());                 /* reserve    */
         writeZeros(fd, (plan.lastUsable + 1) * SECTOR,
                    uint64_t(plan.totalSectors - plan.lastUsable - 1) * SECTOR);
 
@@ -598,8 +626,12 @@ InstallSummary Installer::run(const ProgressHooks& hooks) const
         pwriteAll(fd, plan.lastLba * SECTOR, backup.data(), backup.size());
         detail("GPT written (primary + backup, 3 partitions)");
 
-        /* 5. Partition ext4 ------------------------------------------- */
-        /* Deliberately BEFORE writing the boot code and the ESP:
+        /* 5. ext4 root (P3) ------------------------------------------- */
+        /* Formatted AND populated from the root tree (mke2fs -d): the
+         * kernel, the Lua scripts and loader.conf read by the loader,
+         * plus /bin, /etc, /usr.
+         *
+         * Deliberately BEFORE writing the boot code and the ESP:
          * formatting (mke2fs - including discard/UNMAP) and, on a real
          * disk, the kernel's re-read of the partition table
          * (BLKRRPART, which invalidates the disk's page cache) are
@@ -608,16 +640,17 @@ InstallSummary Installer::run(const ProgressHooks& hooks) const
          * re-read: some USB media lose sectors written shortly before
          * an UNMAP, and the previous order (ESP then mke2fs) made
          * verification random. */
-        prog(12, "Formatting the ext4 partition");
+        prog(12, "Formatting and populating the ext4 root");
         if (target.isImage) {
             ext4::FormatRequest req;
             req.target = target.path;
-            req.offsetBytes = plan.ext4Start * SECTOR;
-            req.sizeBytes = plan.ext4Bytes();
-            req.label = plan.ext4Label;
+            req.offsetBytes = plan.rootStart * SECTOR;
+            req.sizeBytes = plan.rootBytes();
+            req.label = plan.rootLabel;
+            req.seedDir = src.rootDir;
             req.mke2fsPath = opts_.mke2fsPath;
             detail("mke2fs -E offset=" + std::to_string(req.offsetBytes)
-                   + " (image file)");
+                   + " -d " + src.rootDir + " (image file)");
             ext4::format(req);
         } else {
             if (ioctl(fd, BLKRRPART) != 0) {
@@ -637,13 +670,17 @@ InstallSummary Installer::run(const ProgressHooks& hooks) const
                                    "reconnect the disk");
             ext4::FormatRequest req;
             req.target = node;
-            req.label = plan.ext4Label;
+            req.label = plan.rootLabel;
+            req.seedDir = src.rootDir;
             req.mke2fsPath = opts_.mke2fsPath;
-            detail("mke2fs " + node);
+            detail("mke2fs -d " + src.rootDir + " " + node);
             ext4::format(req);
         }
-        info("ext4 partition \"" + plan.ext4Label + "\" formatted ("
-             + humanSize(plan.ext4Bytes()) + ")");
+        info("ext4 root \"" + plan.rootLabel + "\" formatted ("
+             + humanSize(plan.rootBytes()) + ") and populated: "
+             + std::to_string(src.rootFiles) + " files ("
+             + humanSize(src.rootTreeBytes) + "), kernel "
+             + humanSize(src.kernelBytes));
 
         /* 6. BIOS boot partition -------------------------------------- */
         prog(15, "Installing the bootloader");
@@ -700,6 +737,43 @@ InstallSummary Installer::run(const ProgressHooks& hooks) const
         for (const auto& p : uefiProblems)
             problems.push_back(p);
 
+        /* ext4 root: the loader reads its boot tree from here, so the
+         * superblock must be sane AND the kernel must really be inside.
+         * The content check goes through debugfs (e2fsprogs, installed
+         * with mke2fs); when it cannot tell (debugfs missing, or an
+         * mke2fs stub in the tests), it is reported, not failed. */
+        auto rootProblems = verify::verifyExt4Root(fd, plan.rootStart * SECTOR,
+                                                   plan.rootLabel);
+        for (const auto& p : rootProblems)
+            problems.push_back(p);
+
+        std::string kernelNote;
+        if (rootProblems.empty()) {
+            std::string spec = target.isImage
+                               ? target.path
+                               : partitionNodeName(target.path, 3);
+            uint64_t off = target.isImage ? plan.rootStart * SECTOR : 0;
+            ext4::StatResult st = ext4::statFile(spec, off,
+                                                 "/boot/kernel/kernel");
+            if (st.kind == ext4::StatKind::Ok) {
+                if (st.size != src.kernelBytes)
+                    problems.push_back(
+                        "ext4 root: /boot/kernel/kernel is "
+                        + std::to_string(st.size) + " bytes, expected "
+                        + std::to_string(src.kernelBytes));
+                else
+                    kernelNote = "kernel " + humanSize(st.size)
+                                 + " found in the ext4 root"
+                                   " (/boot/kernel/kernel)";
+            } else if (st.kind == ext4::StatKind::NotFound) {
+                problems.push_back("ext4 root: /boot/kernel/kernel is"
+                                   " missing - the loader would have no"
+                                   " kernel to boot");
+            } else {
+                kernelNote = "ext4 content not verified: " + st.detail;
+            }
+        }
+
         if (!problems.empty()) {
             std::string msg = "verification failed:";
             for (const auto& p : problems) msg += "\n  - " + p;
@@ -714,6 +788,8 @@ InstallSummary Installer::run(const ProgressHooks& hooks) const
              + std::to_string(src.espFiles) + " files checked by CRC)");
         info("UEFI boot: EFI/BOOT/BOOTX64.EFI re-read from the media -"
              " valid x86-64 EFI application");
+        info("ext4 root: superblock and label correct"
+             + (kernelNote.empty() ? std::string() : "; " + kernelNote));
 
         ::fsync(fd);
         prog(100, "Done");
@@ -733,8 +809,8 @@ InstallSummary Installer::run(const ProgressHooks& hooks) const
     info("");
     info("Installation complete on " + target.path + ".");
     if (!target.isImage)
-        info("The disk boots in BIOS and UEFI; the ext4 partition will "
-             "be mounted on / by the PrismOS kernel.");
+        info("The disk boots in BIOS and UEFI; the ext4 root partition"
+             " holds the kernel and is mounted on / by the PrismOS kernel.");
 
     /* Secure Boot: the PrismOS boot code is not signed.  Verified on
      * a real EDK2 firmware (OVMF): an otherwise PERFECTLY bootable
@@ -763,7 +839,7 @@ InstallSummary Installer::run(const ProgressHooks& hooks) const
         info("");
         info("At reboot: boot menu (often F12) → choose the UEFI entry"
              " for the USB drive (\"UEFI: ...\", often named after the"
-             " volume: \"UEFI: PRISMOS\"), not \"USB HDD: ...\".");
+             " volume: \"UEFI: PRISMESP\"), not \"USB HDD: ...\".");
         info("If only a \"USB HDD\" entry appears, switch the setup Boot"
              " Mode to UEFI (and disable CSM/Launch CSM).");
 

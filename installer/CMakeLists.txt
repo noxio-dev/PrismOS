@@ -16,7 +16,7 @@ cmake_minimum_required(VERSION 3.16)
 
 project(prism-installer
     VERSION 1.0.0
-    DESCRIPTION "PrismOS installer (BIOS + UEFI, kernel on ESP, ext4)"
+    DESCRIPTION "PrismOS installer (BIOS + UEFI, minimal ESP, kernel on the ext4 root)"
     LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
