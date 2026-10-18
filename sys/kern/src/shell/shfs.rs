@@ -67,8 +67,8 @@ pub fn cmd_mount(args: &mut Args) {
         }
         for f in all {
             match f.part {
-                None => crate::kprintln!("{}        whole disk, {}", f.disk, Size(f.sectors * 512)),
-                Some(p) => crate::kprintln!("{}:{}      partition, {}", f.disk, p, Size(f.sectors * 512)),
+                None => crate::kprintln!("disk{}        whole disk, {}", f.disk, Size(f.sectors * 512)),
+                Some(p) => crate::kprintln!("disk{}:{}      partition, {}", f.disk, p, Size(f.sectors * 512)),
             }
         }
         return;
@@ -666,4 +666,40 @@ pub fn cmd_chmod(args: &mut Args) {
     if let Err(e) = vfs().chmod(&abs(p), mode) {
         fail("chmod", p, e);
     }
+}
+
+/// `fallocate [-k] <path> <off> <len>`: preallocate blocks as unwritten
+/// extents (phase 1.5); reads of the range return zeros until written.
+pub fn cmd_fallocate(args: &mut Args) {
+    if !need_root("fallocate") {
+        return;
+    }
+    let mut keep = false;
+    let mut path = args.next();
+    if path == Some("-k") {
+        keep = true;
+        path = args.next();
+    }
+    let (Some(p), Some(off), Some(len)) = (path, args.next(), args.next()) else {
+        return usage("fallocate");
+    };
+    let (Some(off), Some(len)) = (parse_u64(off), parse_u64(len)) else {
+        return crate::kprintln!("fallocate: bad number");
+    };
+    match vfs().stat(&abs(p)) {
+        Ok(_) => {}
+        Err(e) => return fail("fallocate", p, e),
+    }
+    if let Err(e) = vfs().fallocate(&abs(p), off, len, keep) {
+        return fail("fallocate", p, e);
+    }
+    let st = vfs().stat(&abs(p)).ok();
+    crate::kprintln!(
+        "fallocate: {} +{} = {} bytes, size {} ({} blocks on disk)",
+        off,
+        len,
+        off + len,
+        st.as_ref().map_or(0, |s| s.size),
+        st.as_ref().map_or(0, |s| s.blocks)
+    );
 }

@@ -191,6 +191,12 @@ pub trait FileSystem {
     fn chmod(&mut self, _ino: u64, _mode: u16) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
+    /// fallocate-style preallocation: allocate unwritten blocks for
+    /// [start, start+len) without writing data; the file size grows past
+    /// EOF unless `keep_size` (phase 1.5).
+    fn fallocate(&mut self, _ino: u64, _start: u64, _len: u64, _keep_size: bool) -> FsResult<()> {
+        Err(FsError::ReadOnly)
+    }
     /// Push every pending change to the device.
     fn sync(&mut self) -> FsResult<()> {
         Ok(())
@@ -663,6 +669,13 @@ impl Vfs {
         let p = normalize("/", path);
         let (mi, ino) = self.walk(&p, true)?;
         self.mounts[mi].fs.chmod(ino, mode)
+    }
+
+    /// Preallocate blocks for [start, start + len) of `path`.
+    pub fn fallocate(&mut self, path: &str, start: u64, len: u64, keep_size: bool) -> FsResult<()> {
+        let p = normalize("/", path);
+        let (mi, ino) = self.walk(&p, true)?;
+        self.mounts[mi].fs.fallocate(ino, start, len, keep_size)
     }
 
     // ------------------------------------------------------ descriptor API

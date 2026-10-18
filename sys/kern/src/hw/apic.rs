@@ -42,6 +42,8 @@ const REG_LVT_ERROR: u32 = 0x370;
 const REG_TIMER_INIT: u32 = 0x380;
 const REG_TIMER_CUR: u32 = 0x390;
 const REG_TIMER_DIV: u32 = 0x3E0;
+const REG_ICR_LO: u32 = 0x300;
+const REG_ICR_HI: u32 = 0x310;
 
 const LVT_MASKED: u32 = 1 << 16;
 const LVT_PERIODIC: u32 = 1 << 17;
@@ -113,11 +115,64 @@ pub fn lapic_id() -> u32 {
 }
 
 pub fn lapic_version() -> u32 {
-    if enabled() { lread(REG_VERSION) & 0xFF } else { 0 }
+    if enabled() {
+        lread(REG_VERSION) & 0xFF
+    } else {
+        0
+    }
 }
 
 pub fn lapic_eoi() {
     lwrite(REG_EOI, 0);
+}
+
+/// Bring up the LAPIC of an application processor: spurious vector, error
+/// LVT, and a periodic timer on `vector` running at the BSP's calibrated
+/// rate (every core's LAPIC ticks at the same frequency in QEMU and on
+/// any modern x86 with invariant TSC / per-core crystal).
+///
+/// SAFETY: must run on the AP itself, before its interrupts go on.
+pub unsafe fn init_lapic_secondary(timer_vector: u8) {
+    let x2 = is_x2apic();
+    // IA32_APIC_BASE is per-CPU: make sure this core's APIC is enabled
+    // (and in x2APIC mode if that is what the system uses).
+    // SAFETY: MSR access on this CPU.
+    unsafe {
+        let base = rdmsr(MSR_APIC_BASE);
+        let phys = if base & 0xFFFF_F000 != 0 { base } else { LAPIC_PHYS.load(Ordering::Relaxed) };
+        wrmsr(MSR_APIC_BASE, phys | BASE_ENABLE | if x2 { BASE_X2APIC } else { 0 });
+    }
+    lwrite(REG_TPR, 0);
+    lwrite(REG_SVR, 0x100 | SPURIOUS_VECTOR as u32);
+    lwrite(REG_LVT_ERROR, 0xFE);
+    if !x2 {
+        lwrite(REG_ESR, 0);
+        lwrite(REG_ESR, 0);
+    }
+    let initial = TIMER_INITIAL.load(Ordering::Relaxed);
+    if initial > 0 {
+        lwrite(REG_TIMER_DIV, 0x3);
+        lwrite(REG_LVT_TIMER, LVT_PERIODIC | timer_vector as u32);
+        lwrite(REG_TIMER_INIT, initial);
+    }
+}
+
+/// Send an interrupt to `dest` (LAPIC id).  `icr` is the low ICR dword:
+/// vector for a fixed IPI, 0x500 for INIT, 0x600|vector for a SIPI,
+/// bit 14 (0x4000) for a broadcast-to-all-but-self shorthand (dest then
+/// ignored).  Physical destination, edge, assert.
+///
+/// SAFETY: privileged LAPIC access; safe from any CPU.
+pub unsafe fn send_ipi(dest: u32, icr: u64) {
+    if is_x2apic() {
+        // SAFETY: x2APIC ICR is MSR 0x830, destination in bits 63:32.
+        unsafe { wrmsr(0x830, ((dest as u64) << 32) | (icr & 0xFFFF_FFFF)) };
+    } else {
+        // xAPIC: wait for Delivery Status idle, then destination, then command.
+        while lread(REG_ICR_LO) & (1 << 12) != 0 {}
+        lwrite(REG_ICR_HI, (dest & 0xFF) << 24);
+        lwrite(REG_ICR_LO, icr as u32);
+    }
 }
 
 /// End of interrupt for ISA line `irq`: LAPIC when the APIC is in charge,

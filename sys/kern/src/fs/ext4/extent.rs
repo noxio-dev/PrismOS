@@ -128,12 +128,14 @@ fn in_ranges(r: &[(u32, u32)], l: u32) -> bool {
 impl Ext4 {
     // ------------------------------------------------------------ loading
 
-    /// Read the mapping of `inode` (extent tree or block map).
+    /// Read the mapping of `inode` (extent tree or block map), verifying
+    /// the checksums of the index blocks on the way (phase 1.5).
     pub(super) fn load_tree(&mut self, inode: &Inode) -> FsResult<ExtTree> {
         if inode.uses_extents() {
             let mut t = ExtTree::default();
             let area = inode.block_area().to_vec();
-            self.walk_node(&area, &mut t, 5)?;
+            let ctx = (inode.ino, inode.generation());
+            self.walk_node(&area, &mut t, 5, ctx)?;
             Ok(t)
         } else {
             self.load_blockmap(inode)
@@ -152,7 +154,28 @@ impl Ext4 {
         Ok(t)
     }
 
-    fn walk_node(&mut self, node: &[u8], t: &mut ExtTree, depth_left: u32) -> FsResult<()> {
+    /// Verify the checksum of one on-disk extent/index block (the tail
+    /// sits right after the entry area at 12 + 12*eh_max).
+    fn verify_extent_csum(&self, ctx: (u32, u32), blk: &[u8]) -> FsResult<()> {
+        if !self.g.metadata_csum || blk.len() < 24 || le16(blk, 0) != EXT_MAGIC {
+            return Ok(());
+        }
+        let max = le16(blk, 4) as usize;
+        let tail = 12 + 12 * max;
+        if tail + 4 > blk.len() {
+            return Ok(());
+        }
+        let want = le32(blk, tail);
+        let seed = self.inode_seed(ctx.0, ctx.1);
+        let got = crc32c(seed, &blk[..tail]);
+        self.note_csum(want == got);
+        if want != got {
+            return Err(FsError::Corrupt);
+        }
+        Ok(())
+    }
+
+    fn walk_node(&mut self, node: &[u8], t: &mut ExtTree, depth_left: u32, ctx: (u32, u32)) -> FsResult<()> {
         if node.len() < 12 || le16(node, 0) != EXT_MAGIC {
             return Err(FsError::Corrupt);
         }
@@ -185,7 +208,8 @@ impl Ext4 {
                 }
                 t.nodes.push(child);
                 let buf = self.bread(child)?;
-                self.walk_node(&buf, t, depth - 1)?;
+                self.verify_extent_csum(ctx, &buf)?;
+                self.walk_node(&buf, t, depth - 1, ctx)?;
                 if t.nodes.len() > self.g.blocks as usize {
                     return Err(FsError::Corrupt);
                 }
@@ -270,20 +294,26 @@ impl Ext4 {
     // ------------------------------------------------------------- reading
 
     /// Read `out.len()` bytes starting at byte `in_blk` of block `pblk`
-    /// (running over the following contiguous blocks).
+    /// (running over the following contiguous blocks).  Block-aligned
+    /// ranges that are entirely uncached take one raw device read; the
+    /// rest goes through the cache (phase 1.5: file data is cached).
     fn read_run(&mut self, pblk: u64, in_blk: usize, out: &mut [u8]) -> FsResult<()> {
         let bs = self.bs;
-        let total = (in_blk + out.len() + bs - 1) / bs;
-        let mut tmp = vec![0u8; core::cmp::min(total, 128) * bs];
-        let (mut blk_done, mut out_done, mut skip) = (0usize, 0usize, in_blk);
-        while blk_done < total {
-            let nb = core::cmp::min(total - blk_done, 128);
-            self.read_raw(pblk + blk_done as u64, &mut tmp[..nb * bs])?;
-            let take = core::cmp::min(nb * bs - skip, out.len() - out_done);
-            out[out_done..out_done + take].copy_from_slice(&tmp[skip..skip + take]);
-            out_done += take;
-            blk_done += nb;
+        if in_blk == 0 && out.len() >= bs && out.len() % bs == 0 {
+            let n = (out.len() / bs) as u64;
+            let any_cached = (0..n).any(|k| self.cache.map.contains_key(&(pblk + k)));
+            if !any_cached {
+                return self.read_raw(pblk, out);
+            }
+        }
+        let (mut src, mut skip, mut done) = (pblk, in_blk, 0usize);
+        while done < out.len() {
+            let b = self.bread(src)?;
+            let take = core::cmp::min(bs - skip, out.len() - done);
+            out[done..done + take].copy_from_slice(&b[skip..skip + take]);
+            done += take;
             skip = 0;
+            src += 1;
         }
         Ok(())
     }
@@ -571,13 +601,12 @@ impl Ext4 {
         let added: u64 = allocated.iter().map(|a| a.1 as u64).sum();
         inode.set_blocks512(inode.blocks512() + added * (bs / 512));
 
-        // 3. Write the data, batching physically contiguous blocks.
+        // 3. Write the data through the block cache (write-back: it
+        //    reaches the device at the commit, batched into runs).
         let eff_end = core::cmp::min(end, stop * bs);
         let bsz = self.bs;
         let mut pos = off;
         let mut src = 0usize;
-        let mut run_p = 0u64;
-        let mut run: Vec<u8> = Vec::new();
         while pos < eff_end {
             let lblk = (pos / bs) as u32;
             let in_blk = (pos % bs) as usize;
@@ -585,28 +614,19 @@ impl Ext4 {
             let i = find(&tree.exts, lblk).ok_or(FsError::Corrupt)?;
             let e = tree.exts[i];
             let p = e.pblk + (lblk - e.lblk) as u64;
-            if !run.is_empty() && (p != run_p + (run.len() / bsz) as u64 || run.len() >= 128 * bsz) {
-                self.write_raw(run_p, &run)?;
-                run.clear();
-            }
-            if run.is_empty() {
-                run_p = p;
-            }
             if take == bsz {
-                run.extend_from_slice(&data[src..src + bsz]);
+                self.bwrite_data(p, data[src..src + bsz].to_vec())?;
             } else {
-                let mut blk = vec![0u8; bsz];
-                if !in_ranges(&fresh, lblk) {
-                    self.read_raw(p, &mut blk)?;
-                }
+                let mut blk = if in_ranges(&fresh, lblk) {
+                    vec![0u8; bsz]
+                } else {
+                    self.bread(p)?
+                };
                 blk[in_blk..in_blk + take].copy_from_slice(&data[src..src + take]);
-                run.extend_from_slice(&blk);
+                self.bwrite_data(p, blk)?;
             }
             src += take;
             pos += take as u64;
-        }
-        if !run.is_empty() {
-            self.write_raw(run_p, &run)?;
         }
 
         if eff_end > inode.size() {
@@ -617,6 +637,85 @@ impl Ext4 {
         inode.set_ctime(t);
         self.write_inode(&mut inode)?;
         Ok((eff_end - off) as usize)
+    }
+
+    /// fallocate-style preallocation (phase 1.5): every hole in
+    /// [start, start+len) becomes an *unwritten* extent -- the blocks are
+    /// allocated and will read as zeros, but no data is written.  The
+    /// size grows past EOF unless `keep_size`.
+    pub(super) fn file_fallocate(&mut self, ino: u32, start: u64, len: u64, keep_size: bool) -> FsResult<()> {
+        if self.ro {
+            return Err(FsError::ReadOnly);
+        }
+        let mut inode = self.read_inode(ino)?;
+        if !inode.is_reg() {
+            return Err(if inode.is_dir() { FsError::IsDir } else { FsError::Invalid });
+        }
+        if !inode.uses_extents() || inode.flags() & (EXT4_HUGE_FILE_FL | EXT4_ENCRYPT_FL | EXT4_INLINE_DATA_FL) != 0 {
+            return Err(FsError::Unsupported);
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let bs = self.bs as u64;
+        let end = start.checked_add(len).ok_or(FsError::TooBig)?;
+        if end > (u32::MAX as u64) * bs {
+            return Err(FsError::TooBig);
+        }
+        let first = (start / bs) as u32;
+        let last = ((end - 1) / bs) as u32;
+        let mut tree = self.tree_for(&inode)?;
+        let mut exts = tree.exts.clone();
+        let mut allocated: Vec<(u64, u32)> = Vec::new();
+        let mut lb = first as u64;
+        while lb <= last as u64 {
+            if let Some(i) = find(&exts, lb as u32) {
+                // Already mapped (written or unwritten): nothing to do.
+                lb = exts[i].end();
+                continue;
+            }
+            let nx = exts.partition_point(|e| e.lblk <= lb as u32);
+            let next_start = if nx < exts.len() { exts[nx].lblk as u64 } else { u64::MAX };
+            let hole_end = core::cmp::min(next_start, last as u64 + 1);
+            let mut cur = lb;
+            while cur < hole_end {
+                let want = core::cmp::min(hole_end - cur, UNINIT_MAX as u64) as u32;
+                let goal = self.write_goal(&exts, cur as u32, &inode);
+                match self.alloc_blocks(goal, want) {
+                    Ok((p, n)) => {
+                        let pos = exts.partition_point(|x| x.lblk < cur as u32);
+                        exts.insert(pos, Ext { lblk: cur as u32, len: n, pblk: p, uninit: true });
+                        allocated.push((p, n));
+                        cur += n as u64;
+                    }
+                    Err(e) => {
+                        for (p, n) in allocated {
+                            let _ = self.free_blocks(p, n as u64);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            lb = hole_end;
+        }
+        merge_adjacent(&mut exts);
+        if exts != tree.exts {
+            if let Err(e) = self.rebuild_tree(&mut inode, &mut tree, exts) {
+                for (p, n) in allocated {
+                    let _ = self.free_blocks(p, n as u64);
+                }
+                return Err(e);
+            }
+        }
+        let added: u64 = allocated.iter().map(|a| a.1 as u64).sum();
+        inode.set_blocks512(inode.blocks512() + added * (bs / 512));
+        if !keep_size && end > inode.size() {
+            inode.set_size(end);
+        }
+        let t = now();
+        inode.set_mtime(t);
+        inode.set_ctime(t);
+        self.write_inode(&mut inode)
     }
 
     pub(super) fn file_truncate(&mut self, ino: u32, size: u64) -> FsResult<()> {
@@ -659,17 +758,16 @@ impl Ext4 {
         let b = inode.blocks512().saturating_sub(nfreed * (bs / 512));
         inode.set_blocks512(b);
         // Zero the tail of the last kept block so a later extension reads
-        // zeros there.
+        // zeros there (through the cache).
         if size % bs != 0 {
             let lblk = (size / bs) as u32;
             if let Some(i) = find(&tree.exts, lblk) {
                 let e = tree.exts[i];
                 if !e.uninit {
                     let p = e.pblk + (lblk - e.lblk) as u64;
-                    let mut blk = vec![0u8; self.bs];
-                    self.read_raw(p, &mut blk)?;
+                    let mut blk = self.bread(p)?;
                     blk[(size % bs) as usize..].fill(0);
-                    self.write_raw(p, &blk)?;
+                    self.bwrite_data(p, blk)?;
                 }
             }
         }

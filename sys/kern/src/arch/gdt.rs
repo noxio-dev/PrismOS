@@ -96,3 +96,10 @@ pub fn init() {
         asm!("ltr ax", in("ax") TSS_SEL, options(preserves_flags));
     }
 }
+
+/// Address of the LGDT pseudo-descriptor, as a plain value: an application
+/// processor reloads the kernel GDT with `lgdt [reg]` (see hw/smp.rs).
+pub fn gdtr_va() -> u64 {
+    // SAFETY: pointer to a static set up by init() before any AP starts.
+    unsafe { core::ptr::addr_of!((*addr_of_mut!(GDT)).gdtr) as u64 }
+}

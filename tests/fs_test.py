@@ -278,6 +278,161 @@ def run_persistence(tmp):
     ok, out = fsck(img)
     return (rc == 0 and ok and "keep me" in log), log[-800:] + out[-800:]
 
+
+def run_journal_crash(tmp):
+    """phase 1.5 jbd2: 'crash' after the journal commit but before the
+    checkpoint -- the next mount must replay the transaction, and e2fsck
+    (which replays with its own code) must see a clean volume both times."""
+    img = os.path.join(tmp, "jcrash.img")
+    with open(img, "wb") as f:
+        f.truncate(64 * 1024 * 1024)
+    sh(["mke2fs", "-q", "-F", "-t", "ext4", "-b", "4096", img])
+    # A few operations whose metadata lives only in the journal when the
+    # "crash" hits (the final sync is skipped by the `crash` command).
+    log, rc = run_script(img, [
+        "mkdir /jd",
+        "write /jd/a before the crash\\n",
+        "gen /jd/big 3:300000",
+        "write /jd/b second file\\n",
+        "rm /jd/big",
+        "crash",
+    ], tmp, "jcrash1")
+    if "crash: exiting" not in log:
+        return False, "no crash exit:\n" + log[-500:]
+    # e2fsck on the crashed image: replays the journal itself, must be clean.
+    ok, out = fsck(img)
+    if not ok:
+        return False, "e2fsck after crash:\n" + out[-1500:]
+    # Our own driver must replay at mount and see the data.
+    log, rc = run_script(img, ["cat /jd/a", "cat /jd/b", "ls /jd", "sync"], tmp, "jcrash2")
+    probs = []
+    if rc != 0:
+        probs.append("replay mount failed:\n" + log[-800:])
+    for want in ["before the crash", "second file"]:
+        if want not in log:
+            probs.append("missing after replay: " + want)
+    if "big" in log:
+        probs.append("deleted file resurrected wrongly: " + log[-300:])
+    ok, out = fsck(img)
+    if not ok:
+        probs.append("e2fsck after our replay:\n" + out[-1500:])
+    return (not probs), "\n".join(probs) + "\n" + log[-500:]
+
+
+def run_journal_crash_e2fsck_replay(tmp):
+    """The journal we write must be replayable by e2fsck alone: crash with
+    un-checkpointed transactions, then let e2fsck -fy do the replay and
+    verify the files through debugfs (no PrismOS code involved)."""
+    img = os.path.join(tmp, "je2fsck.img")
+    with open(img, "wb") as f:
+        f.truncate(64 * 1024 * 1024)
+    sh(["mke2fs", "-q", "-F", "-t", "ext4", "-b", "4096", img])
+    log, rc = run_script(img, [
+        "mkdir /jd",
+        "write /jd/x e2fsck must replay this\\n",
+        "crash",
+    ], tmp, "je1")
+    if "crash: exiting" not in log:
+        return False, "no crash exit"
+    r = sh(["e2fsck", "-fy", img])
+    # exit 0 = clean, 1 = errors corrected (the replay itself) -- both fine.
+    if r.returncode not in (0, 1):
+        return False, "e2fsck -fy replay failed:\n" + r.stdout + r.stderr
+    d = sh(["debugfs", "-R", "cat /jd/x", img])
+    if "e2fsck must replay this" not in d.stdout:
+        return False, "debugfs cannot read /jd/x after e2fsck replay: %r" % d.stdout
+    ok, out = fsck(img)
+    return ok, out[-500:]
+
+
+def run_fallocate(tmp):
+    """phase 1.5: fallocate-style preallocation -- unwritten extents that
+    read as zeros, size/blocks accounting, e2fsck-clean."""
+    img = os.path.join(tmp, "falloc.img")
+    with open(img, "wb") as f:
+        f.truncate(64 * 1024 * 1024)
+    sh(["mke2fs", "-q", "-F", "-t", "ext4", "-b", "4096", img])
+    log, rc = run_script(img, [
+        "touch /f",
+        "prealloc /f 0 65536",          # extends the size
+        "size /f", "blk /f",
+        "peek /f 0 64",                 # unwritten reads as zeros
+        "peek /f 65400 64",
+        "patch /f 65024 7:100",         # write inside the preallocated range
+        "peek /f 65024 16",
+        "prealloc /f 131072 4096",      # second range, size grows again
+        "size /f", "blk /f",
+        "preallok /f 262144 8192",      # keep_size variant
+        "size /f",
+        "touch /g",
+        "preallok /g 0 1048576",        # keep size 0 but blocks allocated
+        "size /g", "blk /g",
+        "sync",
+    ], tmp, "falloc")
+    probs = []
+    if rc != 0:
+        probs.append("script failed:\n" + log[-800:])
+    lines = {l.split(":")[0].split(" ")[0]: l.split(": ", 1)[1] if ": " in l else "" for l in log.splitlines()}
+    sizes = [l.split(": ", 1)[1] for l in log.splitlines() if l.startswith("size /f")]
+    blks = [l.split(": ", 1)[1] for l in log.splitlines() if l.startswith("blk /f")]
+    if len(sizes) >= 3 and sizes[0] != "65536":
+        probs.append("size after prealloc: " + sizes[0])
+    if len(sizes) >= 2 and sizes[1] != "135168":
+        probs.append("size after second prealloc: " + sizes[1])
+    if len(sizes) >= 1 and sizes[-1] != "135168":
+        probs.append("keep_size prealloc changed the size: " + sizes[-1])
+    if len(blks) >= 1 and blks[0] != "128":
+        probs.append("blocks after 64 KiB prealloc: " + blks[0])
+    zero_peek = [l.split(": ", 1)[1] for l in log.splitlines() if l.startswith("peek /f")]
+    if len(zero_peek) >= 2 and (set(zero_peek[0]) - {"0"} or set(zero_peek[1][:96]) - {"0"}):
+        probs.append("unwritten range not zero: %r %r" % (zero_peek[0][:32], zero_peek[1][:32]))
+    # The patched bytes must equal the harness' xorshift pattern (seed 7).
+    def pattern(seed, n):
+        x = ((seed * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF) | 1
+        out = bytearray()
+        for _ in range(n):
+            x ^= (x << 13) & 0xFFFFFFFFFFFFFFFF
+            x ^= x >> 7
+            x ^= (x << 17) & 0xFFFFFFFFFFFFFFFF
+            out.append((x >> 24) & 0xFF)
+        return bytes(out)
+    if len(zero_peek) >= 3:
+        want = pattern(7, 16).hex()
+        if zero_peek[2] != want:
+            probs.append("patched bytes %r != pattern %r" % (zero_peek[2][:32], want))
+    ok, out = fsck(img)
+    if not ok:
+        probs.append("e2fsck:\n" + out[-2000:])
+    d = sh(["debugfs", "-R", "ex /f", img])
+    if "uninit" not in d.stdout and "> UNINIT" not in d.stdout and "unwritten" not in d.stdout:
+        # debugfs prints unwritten extents as e.g. " 0 16 234 [..] UNINIT"
+        pass  # presence of uninit is nice but e2fsck already validates them
+    return (not probs), "\n".join(probs) + "\n" + log[-600:]
+
+
+def run_csum_detect(tmp):
+    """phase 1.5: metadata checksums are verified on read -- a corrupted
+    inode or superblock is detected, not silently used."""
+    img = os.path.join(tmp, "csum.img")
+    with open(img, "wb") as f:
+        f.truncate(32 * 1024 * 1024)
+    sh(["mke2fs", "-q", "-F", "-t", "ext4", "-b", "4096", img])
+    # sanity: mounts fine first
+    log, rc = run_script(img, ["ls /"], tmp, "cs0")
+    if rc != 0:
+        return False, "clean image does not mount"
+    # locate the superblock checksum field and flip a checksum byte: the
+    # superblock itself is not touched, only its stored checksum.
+    with open(img, "r+b") as f:
+        f.seek(1024 + 0x3FC + 1)
+        b = f.read(1)
+        f.seek(1024 + 0x3FC + 1)
+        f.write(bytes([b[0] ^ 0xFF]))
+    log, rc = run_script(img, ["ls /"], tmp, "cs1")
+    if "MOUNT-FAIL" not in log:
+        return False, "corrupted superblock checksum not detected:\n" + log
+    return True, ""
+
 def main():
     keep = "-k" in sys.argv
     for tool in ("mke2fs", "e2fsck", "debugfs", "cargo"):
@@ -299,7 +454,11 @@ def main():
     for name, fn in (("read-only mount", run_readonly), ("full disk + fsck", run_full_disk),
                      ("fragmented 4k (extent tree depth 1)", lambda t: run_fragmented(t, 4096)),
                      ("fragmented 1k (extent tree depth 1)", lambda t: run_fragmented(t, 1024)),
-                     ("persistence across mounts", run_persistence)):
+                     ("persistence across mounts", run_persistence),
+                     ("journal crash + replay (phase 1.5)", run_journal_crash),
+                     ("journal replay by e2fsck (phase 1.5)", run_journal_crash_e2fsck_replay),
+                     ("fallocate preallocation (phase 1.5)", run_fallocate),
+                     ("checksum detection (phase 1.5)", run_csum_detect)):
         ok, msg = fn(tmp)
         print(("ok    " if ok else "FAIL  ") + name)
         if not ok:

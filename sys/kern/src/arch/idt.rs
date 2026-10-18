@@ -82,6 +82,9 @@ pub fn init() {
     set_gate(0x2F, isr::stub_irq15, 0);
 
     set_gate(0x30, isr::stub_apic_timer, 0);
+    set_gate(0x31, isr::stub_ahci, 0);
+    set_gate(0x32, isr::stub_ap_timer, 0);
+    set_gate(0x33, isr::stub_ap_ipi, 0);
     set_gate(0xFF, isr::stub_spurious, 0);
 
     // SAFETY: building and loading our own table with interrupts disabled.
@@ -97,4 +100,11 @@ pub fn init() {
 #[allow(dead_code)]
 pub fn idt_ready() -> bool {
     IDT_READY.load(Ordering::Acquire)
+}
+
+/// Address of the LIDT pseudo-descriptor, as a plain value: an application
+/// processor reloads the kernel IDT with `lidt [reg]` (see hw/smp.rs).
+pub fn idtr_va() -> u64 {
+    // SAFETY: pointer to a static set up by init() before any AP starts.
+    unsafe { core::ptr::addr_of!((*addr_of_mut!(IDT)).idtr) as u64 }
 }

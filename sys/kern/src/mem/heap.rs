@@ -929,3 +929,10 @@ fn alloc_layout(l: Layout, flags: u32) -> *mut u8 {
 
 #[global_allocator]
 static ALLOCATOR: KernelAlloc = KernelAlloc;
+
+/// Heap activity counters, for `meminfo` and the in-kernel tests.
+pub fn activity() -> (u64, u64, u64, u64) {
+    // SAFETY: read-only access to plain counters.
+    let c = unsafe { &*core::ptr::addr_of!(CNT) };
+    (c.allocs, c.frees, c.failed, c.bad_frees)
+}

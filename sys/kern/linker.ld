@@ -32,7 +32,21 @@ SECTIONS
     .rodata : ALIGN(4K) {
         __rodata_start = .;
         *(.rodata .rodata.*)
+        /* SMP real-mode trampoline template (hw/smp.rs): copied to
+           physical 0xA000 at boot, never executed in place.  Kept INSIDE
+           the rodata range so the kernel's own page tables map it. */
+        KEEP(*(.trampoline))
         __rodata_end = .;
+    } :rodata
+
+    /* Kernel symbol table (kallsyms): FIXED 128 KiB so that filling it in a
+       second build pass never moves any other symbol (see tools/mksyms.py
+       and the `kernel` rule in the Makefile). */
+    .kallsyms : ALIGN(4K) {
+        __kallsyms_start = .;
+        KEEP(*(.kallsyms))
+        . = __kallsyms_start + 0x20000;
+        __kallsyms_end = .;
     } :rodata
 
     .data : ALIGN(4K) {

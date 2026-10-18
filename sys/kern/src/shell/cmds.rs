@@ -76,6 +76,11 @@ const COMMANDS: &[Cmd] = &[
     Cmd { name: "usertest", usage: "", desc: "run every ring 3 test and check the outcomes", run: shuser::cmd_usertest },
     Cmd { name: "ps", usage: "", desc: "list the process table", run: shuser::cmd_ps },
     Cmd { name: "kill", usage: "<pid>", desc: "terminate a process", run: shuser::cmd_kill },
+    Cmd { name: "dmesg", usage: "[-l level]", desc: "kernel log ring (debug/info/warn/error)", run: cmd_dmesg },
+    Cmd { name: "ktest", usage: "", desc: "run the in-kernel unit tests (phase 1.5)", run: cmd_ktest },
+    Cmd { name: "sym", usage: "<addr>", desc: "resolve a kernel address through kallsyms", run: cmd_sym },
+    Cmd { name: "fallocate", usage: "[-k] <path> <off> <len>", desc: "preallocate blocks (unwritten extents); -k keeps the size", run: shfs::cmd_fallocate },
+    Cmd { name: "smp", usage: "", desc: "per-CPU state: online, LAPIC timer ticks, IPI round-trip (phase 1.5)", run: cmd_smp },
 ];
 
 pub(super) fn dispatch(name: &str, args: &mut Args) {
@@ -378,12 +383,13 @@ fn cmd_ahci(args: &mut Args) {
                 crate::kprintln!("ahci     : no controller");
                 return;
             };
-            crate::kprintln!("ahci     : {:02x}:{:02x}.{}, AHCI {}.{}, {} port(s), {} slot(s), 64-bit DMA {}",
-                c.pci.0, c.pci.1, c.pci.2, c.version >> 16, (c.version >> 8) & 0xFF, c.ports, c.slots, yn(c.s64a));
+            crate::kprintln!("ahci     : {:02x}:{:02x}.{}, AHCI {}.{}, {} port(s), {} slot(s), 64-bit DMA {}, msi {}, {} completion irq(s)",
+                c.pci.0, c.pci.1, c.pci.2, c.version >> 16, (c.version >> 8) & 0xFF, c.ports, c.slots,
+                yn(c.s64a), yn(c.msi), c.irqs);
             for i in 0..crate::hw::ahci::MAX_DISKS {
                 if let Some(d) = crate::hw::ahci::disk(i) {
-                    crate::kprintln!("disk {}   : port {}, {} sectors ({}), \"{}\" serial {}",
-                        i, d.port(), d.sectors(), Size(d.sectors() * 512), d.model(), d.serial());
+                    crate::kprintln!("disk {}   : port {}, {} sectors ({}), \"{}\" serial {}, ncq {}",
+                        i, d.port(), d.sectors(), Size(d.sectors() * 512), d.model(), d.serial(), yn(d.ncq()));
                 }
             }
         }
@@ -512,4 +518,94 @@ fn edit_distance(a: &str, b: &str) -> usize {
         core::mem::swap(&mut prev, &mut cur);
     }
     prev[b.len()]
+}
+
+// ----------------------------------------------------- phase 1.5 commands
+
+/// `dmesg [-l level]`: dump the kernel log ring.
+fn cmd_dmesg(args: &mut Args) {
+    use crate::lib::klog::{self, Level};
+    let mut level = Level::Debug;
+    while let Some(tok) = args.next() {
+        if tok == "-l" {
+            match args.next().and_then(|l| Level::parse(l)) {
+                Some(l) => level = l,
+                None => return usage("dmesg"),
+            }
+        } else {
+            return usage("dmesg");
+        }
+    }
+    let (used, retired) = klog::usage();
+    let recs = klog::read(level);
+    for r in &recs {
+        let whole = r.ts_ms / 1000;
+        let tenth = (r.ts_ms % 1000) / 100;
+        crate::kprintln!("[{:>5}.{}] {:<5} {}", whole, tenth, r.level.as_str(), r.text);
+    }
+    crate::kprintln!("-- {} record(s), {} bytes live, {} retired by wrapping --",
+        recs.len(), used, retired);
+}
+
+/// `ktest`: run the in-kernel unit test table.
+fn cmd_ktest(_args: &mut Args) {
+    crate::kprintln!("running {} in-kernel tests", crate::lib::ktest::TESTS.len());
+    let (pass, fail) = crate::lib::ktest::run_all();
+    if fail == 0 {
+        crate::kprintln!("ktest: all {} passed", pass);
+    } else {
+        crate::kprintln!("ktest: {} passed, {} FAILED", pass, fail);
+    }
+}
+
+/// `sym <addr>`: resolve a kernel address.
+fn cmd_sym(args: &mut Args) {
+    let Some(tok) = args.next() else { return usage("sym") };
+    let Some(addr) = super::parse_u64(tok) else { return bad_number("sym", tok) };
+    match crate::lib::kallsyms::lookup(addr) {
+        Some((name, 0)) => crate::kprintln!("{:#018x} {}", addr, name),
+        Some((name, off)) => crate::kprintln!("{:#018x} {}+{:#x}", addr, name, off),
+        None => crate::kprintln!("{:#018x} ? (no symbol covers this address)", addr),
+    }
+}
+
+/// `smp`: per-CPU snapshot, then an IPI round-trip to prove the APs are
+/// alive and taking interrupts (phase 1.5).
+fn cmd_smp(_args: &mut Args) {
+    use crate::hw::smp;
+    const ZERO: smp::CpuInfo = smp::CpuInfo {
+        index: 0,
+        lapic: 0,
+        online: false,
+        ticks: 0,
+        ipis: 0,
+        idles: 0,
+    };
+    let mut info = [ZERO; crate::hw::acpi::MAX_CPUS];
+    let n = smp::snapshot(&mut info);
+    if n == 0 {
+        crate::kprintln!("smp      : not initialized");
+        return;
+    }
+    crate::kprintln!("cpu  lapic  state   ticks      ipis   idle-halts");
+    for c in &info[..n] {
+        crate::kprintln!(
+            "{:>3}  {:>5}  {:<6}  {:>9}  {:>6}  {:>10}",
+            c.index,
+            c.lapic,
+            if c.online { "online" } else { "down" },
+            c.ticks,
+            c.ipis,
+            c.idles
+        );
+    }
+    let (answered, aps) = smp::ipi_ping_all();
+    if aps == 0 {
+        crate::kprintln!("ipi      : no AP to ping (single cpu system)");
+    } else {
+        crate::kprintln!("ipi      : {}/{} AP(s) answered the round-trip", answered, aps);
+        if answered == aps {
+            crate::kprintln!("ipi      : ok");
+        }
+    }
 }

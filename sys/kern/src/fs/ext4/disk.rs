@@ -147,6 +147,12 @@ pub struct Geo {
     pub metadata_csum: bool,
     pub gdt_csum: bool,
     pub filetype: bool,
+    /// s_hash_seed: htree name-hash seed words (little endian).
+    pub hash_seed: [u32; 4],
+    /// s_def_hash_version (0 legacy .. 2 tea, 3..5 unsigned).
+    pub hash_version: u8,
+    /// COMPAT_DIR_INDEX: htree indexing allowed on this volume.
+    pub dir_index: bool,
 }
 
 /// An inode as read from disk.  The raw bytes are kept so that fields this

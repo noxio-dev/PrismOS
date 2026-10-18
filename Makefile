@@ -121,7 +121,7 @@ $B/loader.bin: $(BIOS_OBJS) boot/bios/loader.ld
 
 $B/loader.efi: $(EFI_OBJS)
 	$(LLD_LINK) /subsystem:efi_application /entry:efi_main /nodefaultlib /machine:x64 \
-		/base:0x400000 /dynamicbase /opt:ref /out:$@ $(EFI_OBJS)
+                /base:0x400000 /dynamicbase /opt:ref /out:$@ $(EFI_OBJS)
 
 # ---- kernel ------------------------------------------------------------------
 
@@ -130,6 +130,8 @@ KERNEL_ELF := sys/kern/target/x86_64-unknown-none/release/kernel
 kernel: $B/kernel
 $B/kernel: FORCE
 	@mkdir -p $(@D)
+	cd sys/kern && MAKEFLAGS= $(CARGO) build --release $(CARGOFLAGS)
+	-$(PYTHON) tools/mksyms.py $(KERNEL_ELF) sys/kern/src/lib/kallsyms_data.rs
 	cd sys/kern && MAKEFLAGS= $(CARGO) build --release $(CARGOFLAGS)
 	@cmp -s $(KERNEL_ELF) $@ || cp -f $(KERNEL_ELF) $@
 FORCE:
@@ -149,7 +151,7 @@ root: $B/root.stamp
 $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*)
 	rm -rf $B/root
 	mkdir -p $B/root/boot/lua $B/root/boot/defaults $B/root/boot/kernel \
-		 $B/root/bin $B/root/etc $B/root/usr
+                 $B/root/bin $B/root/etc $B/root/usr
 	cp boot/lua/*.lua $B/root/boot/lua/
 	cp boot/conf/defaults-loader.conf $B/root/boot/defaults/loader.conf
 	cp boot/conf/loader.conf $B/root/boot/loader.conf
@@ -158,7 +160,7 @@ $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*)
 
 $B/$(NAME).img: $B/boot0.bin $B/boot1.bin $B/loader.bin $B/esp.stamp $B/root.stamp tools/mkimage.py include/prism.inc
 	$(PYTHON) tools/mkimage.py --boot0 $B/boot0.bin --boot1 $B/boot1.bin \
-		--loader $B/loader.bin --esp-dir $B/esp --root-dir $B/root -o $@
+                --loader $B/loader.bin --esp-dir $B/esp --root-dir $B/root -o $@
 
 # ---- ext4 data disk (AHCI port 1) -----------------------------------------------
 # Created once and kept between runs (so what you write in the shell survives);
@@ -181,15 +183,15 @@ run-uefi: $B/$(NAME).img $(DATA_IMG)
 	@test -n "$(OVMF_CODE)" || { echo "OVMF not found: set OVMF_CODE and OVMF_VARS"; exit 1; }
 	cp -f $(OVMF_VARS) $B/OVMF_VARS.fd
 	$(QEMU) $(QEMUFLAGS) -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
-		-drive if=pflash,format=raw,file=$B/OVMF_VARS.fd \
-		$(call qemu_boot_drive,$<) -serial stdio
+                -drive if=pflash,format=raw,file=$B/OVMF_VARS.fd \
+                $(call qemu_boot_drive,$<) -serial stdio
 
 # KVM : BIOS
 run-kvm: $B/$(NAME).img $(DATA_IMG)
 	@test -e /dev/kvm || { echo "KVM unavailable: /dev/kvm not found"; exit 1; }
 	$(QEMU) -enable-kvm $(QEMUFLAGS) \
-		$(call qemu_boot_drive,$<) \
-		-serial stdio
+                $(call qemu_boot_drive,$<) \
+                -serial stdio
 
 # KVM : UEFI
 run-uefi-kvm: $B/$(NAME).img $(DATA_IMG)
@@ -199,10 +201,10 @@ run-uefi-kvm: $B/$(NAME).img $(DATA_IMG)
 	@test -f "$(OVMF_VARS)" || { echo "OVMF_VARS file not found: $(OVMF_VARS)"; exit 1; }
 	cp -f $(OVMF_VARS) $B/OVMF_VARS_KVM.fd
 	$(QEMU) -enable-kvm $(QEMUFLAGS) \
-		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
-		-drive if=pflash,format=raw,file=$B/OVMF_VARS_KVM.fd \
-		$(call qemu_boot_drive,$<) \
-		-serial stdio
+                -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+                -drive if=pflash,format=raw,file=$B/OVMF_VARS_KVM.fd \
+                $(call qemu_boot_drive,$<) \
+                -serial stdio
 
 # ---- ISO --------------------------------------------------------------------
 
@@ -231,15 +233,15 @@ $B/$(NAME).iso: $B/esp.img
 	mkdir -p $B/iso
 	cp $B/esp.img $B/iso/esp.img
 	$(XORRISO) -as mkisofs -quiet -V $(NAME) -J -joliet-long -rational-rock \
-		-e esp.img -no-emul-boot -isohybrid-gpt-basdat \
-		-o $@ $B/iso
+                -e esp.img -no-emul-boot -isohybrid-gpt-basdat \
+                -o $@ $B/iso
 
 run-iso: $B/$(NAME).iso $(DATA_IMG)
 	@test -n "$(OVMF_CODE)" || { echo "OVMF not found: set OVMF_CODE and OVMF_VARS"; exit 1; }
 	cp -f $(OVMF_VARS) $B/OVMF_VARS.fd
 	$(QEMU) $(QEMUFLAGS) -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
-		-drive if=pflash,format=raw,file=$B/OVMF_VARS.fd \
-		-cdrom $< -serial stdio
+                -drive if=pflash,format=raw,file=$B/OVMF_VARS.fd \
+                -cdrom $< -serial stdio
 
 test: $B/$(NAME).img
 	$(PYTHON) tests/boot_test.py $< "$(QEMU)" "$(OVMF_CODE)" "$(OVMF_VARS)"

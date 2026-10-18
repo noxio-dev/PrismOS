@@ -50,16 +50,16 @@ Phase 1 — kernel foundations
 - [x] Phase 1.2 — ACPI/APIC (LAPIC + IOAPIC + 8259 masked)
 - [x] Phase 1.3 — PCI/AHCI
 - [x] Phase 1.4 — VFS + ext4 R/W
-- [ ] Phase 1.5 — hardening before userspace
-  - [ ] run `make test` on BIOS + UEFI with the ext4 data disk, fix what it finds
-  - [ ] ext4: replay a dirty journal at mount, then a minimal jbd2 writer
-  - [ ] ext4: verify metadata checksums on read, htree insert, `fallocate`-style preallocation
-  - [ ] block cache for file data (write-back, `sync` / periodic flush)
-  - [ ] AHCI: interrupt-driven completion and NCQ instead of polling
+- [x] Phase 1.5 — hardening before userspace
+  - [x] run `make test` on BIOS + UEFI with the ext4 data disk, fix what it finds
+  - [x] ext4: replay a dirty journal at mount, then a minimal jbd2 writer
+  - [x] ext4: verify metadata checksums on read, htree insert, `fallocate`-style preallocation
+  - [x] block cache for file data (write-back, `sync` / periodic flush)
+  - [x] AHCI: interrupt-driven completion and NCQ instead of polling (MSI, FPDMA reads, per-slot bounce buffers)
   - [x] boot from the ext4 volume (loader ext4 driver) instead of the FAT32 ESP only (BIOS loader; UEFI still needs a FAT32 ESP)
   - [x] three-partition layout: minimal ESP (UEFI stub only), BIOS boot partition, ext4 root read by both the loader and the kernel
-  - [ ] kernel logging (`dmesg` ring buffer), proper `panic` backtrace, unit tests in-kernel
-  - [ ] SMP bring-up (AP startup via the LAPIC), per-CPU data, spinlocks
+  - [x] kernel logging (`dmesg` ring buffer), proper `panic` backtrace, unit tests in-kernel
+  - [x] SMP bring-up (AP startup via the LAPIC), per-CPU data, spinlocks (APs idle on their own LAPIC timer and answer IPIs; the scheduler stays on the BSP until phase 2)
 
 Phase 2 — ring 3 and processes
 - [x] Phase 2.1 — ring 3: user page tables per process, `syscall`/`sysret`, TSS stacks

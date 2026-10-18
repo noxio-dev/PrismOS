@@ -44,6 +44,9 @@ pub fn run() -> ! {
         "PrismOS {} kernel console -- type 'help' for commands.",
         env!("CARGO_PKG_VERSION")
     );
+    // The shell takes over: from here on the log ring only keeps explicit
+    // kernel records (klog!), not the shell echo.
+    crate::lib::klog::end_boot_capture();
     loop {
         crate::kprint!("prism# ");
         let mut line = [0u8; 256];

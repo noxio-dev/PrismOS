@@ -163,6 +163,65 @@ def main():
           "PrismOS loader configuration",
           "persisted by PrismOS", "t.txt", "mounted on", "synced"], 90))
 
+    # The extra bare ext4 disk on AHCI port 1 (phase 1.5: make test with the
+    # ext4 data disk): the kernel still boots from disk 0's P3, and the shell
+    # mounts the second disk read-write, writes to it, and unmounts cleanly.
+    if have_fs:
+        def data_cmd():
+            shutil.copyfile(image, work)
+            return base + ahci_boot(work) + data_drive()
+
+        scenarios.append(
+            ("BIOS shell: ext4 data disk (AHCI port 1, read-write)", data_cmd,
+             [("prism# ", "mount -l\r"),
+              ("prism# ", "mkdir /mnt\r"),
+              ("prism# ", "mount disk1 /mnt\r"),
+              ("prism# ", "cat /mnt/hello.txt\r"),
+              ("prism# ", "write /mnt/from-guest.txt persisted on the data disk\r"),
+              ("prism# ", "cat /mnt/from-guest.txt\r"),
+              ("prism# ", "df\r"),
+              ("prism# ", "umount /mnt\r")],
+             ["disk1        whole disk",
+              "mounted disk1 on /mnt",
+              "Hello from the PrismOS ext4 data disk.",
+              "persisted on the data disk",
+              "unmounted /mnt"], 90))
+
+    # The boot tree with INDEXED directories: after a kernel dx_convert or an
+    # e2fsck -D pass (or years of package updates) /boot/lua and /boot/kernel
+    # are htree-indexed -- both the loader (linear scan through the dx
+    # blocks) and the kernel (dx_probe lookup) must still find their files.
+    idximg = None
+    if have_fs and shutil.which("debugfs"):
+        idximg = index_boot_tree(image, os.path.join(tmp, "idx.img"))
+    if idximg:
+        def idx_cmd():
+            return base + ahci_boot(idximg)
+
+        scenarios.append(
+            ("BIOS: boot tree with indexed (htree) directories", idx_cmd,
+             [("prism# ", "cat /boot/loader.conf\r"),
+              ("prism# ", "ls /boot/lua\r"),
+              ("prism# ", "cat /boot/lua/loader.lua\r")],
+             ["Hello, world!",
+              "PrismOS loader configuration",
+              "loader.lua"], 90))
+
+    # SMP (phase 1.5): three cpus, the APs come up through INIT-SIPI-SIPI,
+    # run their own LAPIC timer and answer IPIs (the scheduler stays on the
+    # BSP until phase 2 grows per-CPU scheduling).
+    def smp_cmd():
+        shutil.copyfile(image, work)
+        return base + ["-smp", "3"] + ahci_boot(work)
+
+    scenarios.append(
+        ("BIOS SMP: 3 cpus, AP bring-up + IPI round-trip", smp_cmd,
+         [("prism# ", "smp\r"),
+          ("prism# ", "uptime\r")],
+         ["smp      : 3 cpu(s) online (2 AP up, IPI round-trip 2/2)",
+          "cpu  lapic  state   ticks      ipis   idle-halts",
+          "online", "ipi      : ok", "uptime   :", "ticks at 100 Hz"], 120))
+
     failed = 0
     for name, cmd, steps, expect, timeout in scenarios:
         start = time.time()
@@ -196,11 +255,72 @@ def main():
             print("FAIL  ext4 root after the guest ran\n" + r.stdout + d.stdout)
         else:
             print("ok    ext4 root clean and /d/t.txt readable on the host")
+
+    # Same for the data disk (whole-disk ext4, no partitions to extract).
+    if have_fs and os.path.exists(data) and shutil.which("e2fsck"):
+        r = subprocess.run(["e2fsck", "-fn", data], capture_output=True, text=True)
+        d = subprocess.run(["debugfs", "-R", "cat /from-guest.txt", data], capture_output=True, text=True)
+        if r.returncode != 0 or "persisted on the data disk" not in d.stdout:
+            failed += 1
+            print("FAIL  ext4 data disk after the guest ran\n" + r.stdout + d.stdout)
+        else:
+            print("ok    ext4 data disk clean and /from-guest.txt readable on the host")
     shutil.rmtree(tmp, ignore_errors=True)
     sys.exit(1 if failed else 0)
 
 
 # ---------------------------------------------------------------- helpers
+
+def index_boot_tree(image, out_path):
+    """Copy `image` and htree-index the boot directories of its P3 (fill the
+    dirs past one block, then e2fsck -D).  Returns the new image path, or
+    None when the tree could not be prepared."""
+    try:
+        shutil.copyfile(image, out_path)
+        rootimg = out_path + ".p3"
+        ents = gpt_entries(out_path)
+        first, last = ents[2][1]
+        with open(out_path, "rb") as f, open(rootimg, "wb") as o:
+            f.seek(first * 512)
+            o.write(f.read((last - first + 1) * 512))
+        # Fillers: ~48-byte entries, ~80 per directory is past one 4 KiB block.
+        filler = out_path + ".filler"
+        with open(filler, "wb") as f:
+            f.write(b"x" * 512)
+        cmds = out_path + ".cmds"
+        with open(cmds, "w") as f:
+            for d in ("/boot/lua", "/boot/kernel"):
+                f.write("cd %s\n" % d)
+                for i in range(96):
+                    f.write("write %s dx%s%03d\n" % (filler, "z" * 32, i))
+        subprocess.run(["debugfs", "-w", "-f", cmds, rootimg],
+                       capture_output=True, text=True, check=True)
+        r = subprocess.run(["e2fsck", "-fyD", rootimg], capture_output=True, text=True)
+        if r.returncode != 0:
+            return None
+        # Both directories must now carry INDEX_FL (bit 12 of the flags).
+        def is_indexed(d):
+            s = subprocess.run(["debugfs", "-R", "stat %s" % d, rootimg],
+                               capture_output=True, text=True).stdout
+            for l in s.splitlines():
+                if "Flags:" in l:
+                    try:
+                        return int(l.split("Flags:")[1].split()[0], 16) & 0x1000 != 0
+                    except (ValueError, IndexError):
+                        return False
+            return False
+        if not is_indexed("/boot/lua") or not is_indexed("/boot/kernel"):
+            return None
+        with open(rootimg, "rb") as f, open(out_path, "r+b") as o:
+            o.seek(first * 512)
+            o.write(f.read())
+        os.unlink(rootimg)
+        os.unlink(filler)
+        os.unlink(cmds)
+        return out_path
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
 
 TYPE_ESP = bytes.fromhex("28732ac11ff8d211ba4b00a0c93ec93b")        # C12A7328-...
 TYPE_BIOS_BOOT = bytes.fromhex("4861682149646f6e744e656564454649")  # 21686148-...

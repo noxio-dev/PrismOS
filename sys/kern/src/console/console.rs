@@ -62,16 +62,60 @@ pub fn init(bi: Option<&BootInfo>) {
     }
 }
 
+/// Serializes _print across CPUs (phase 1.5 SMP): the IrqGuard only stops
+/// re-entrancy on the LOCAL cpu; another cpu printing concurrently would
+/// interleave on the serial line and the framebuffer.
+static PRINT_LOCK: crate::lib::spin::SpinLock<()> = crate::lib::spin::SpinLock::new(());
+
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
-    // Keep IRQ-context prints from interleaving with task-context ones.
+    // Keep IRQ-context prints from interleaving with task-context ones, on
+    // this cpu (IrqGuard) and across cpus (the spin lock).  No deadlock is
+    // possible: nothing takes PRINT_LOCK twice on the same cpu, and no
+    // interrupt handler prints while the holder is in IRQ context.
     let _guard = crate::arch::io::IrqGuard::new();
+    let _cross = PRINT_LOCK.lock();
+    // Format once into a stack buffer so the kernel log ring (dmesg) can
+    // record the exact same text; no allocation, safe before heap init.
+    let mut buf = LogBuf::default();
+    let _ = buf.write_fmt(args);
     // SAFETY: single CPU; the guard serializes output paths.
     let c = unsafe { &mut *addr_of_mut!(CONSOLE) };
-    let _ = c.write_fmt(args);
+    let _ = c.write_str(buf.as_str());
     // One copy to the screen per print call, not one per character.
     if let Some(f) = c.fb.as_mut() {
         f.flush();
+    }
+    // Tee into the ring while the boot log plays (before the shell starts).
+    if crate::lib::klog::boot_capturing() {
+        crate::lib::klog::record(crate::lib::klog::Level::Info, buf.as_str());
+    }
+}
+
+/// Fixed-capacity formatting target for the console tee (1 KiB, no alloc).
+struct LogBuf {
+    buf: [u8; 1024],
+    len: usize,
+}
+
+impl Default for LogBuf {
+    fn default() -> Self {
+        LogBuf { buf: [0; 1024], len: 0 }
+    }
+}
+
+impl LogBuf {
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl fmt::Write for LogBuf {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let take = s.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
+        self.len += take;
+        Ok(())
     }
 }
 

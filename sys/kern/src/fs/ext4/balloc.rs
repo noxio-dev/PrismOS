@@ -29,7 +29,7 @@ impl Ext4 {
     fn gd_off(&self, g: u32) -> usize {
         g as usize * self.g.desc_size
     }
-    fn gd16(&self, g: u32, o: usize) -> u16 {
+    pub(super) fn gd16(&self, g: u32, o: usize) -> u16 {
         le16(&self.gdt, self.gd_off(g) + o)
     }
     fn gd32(&self, g: u32, o: usize) -> u32 {
@@ -96,7 +96,7 @@ impl Ext4 {
         }
     }
 
-    fn gd_csum(&self, g: u32) -> u16 {
+    pub(super) fn gd_csum(&self, g: u32) -> u16 {
         let ds = self.g.desc_size;
         let off = self.gd_off(g);
         let d = &self.gdt[off..off + ds];
@@ -179,13 +179,24 @@ impl Ext4 {
     // -------------------------------------------------------------- bitmaps
 
     /// Block bitmap of group `g`; for a BLOCK_UNINIT group it is rebuilt from
-    /// the group layout (the on-disk block holds garbage).
+    /// the group layout (the on-disk block holds garbage).  The checksum
+    /// (low 16 bits in the group descriptor) is verified on read.
     fn load_bbitmap(&mut self, g: u32) -> FsResult<Vec<u8>> {
         let uninit_ok = self.g.metadata_csum || self.g.gdt_csum;
         if uninit_ok && self.gd_flags(g) & BG_BLOCK_UNINIT != 0 {
             return Ok(self.uninit_bbitmap(g));
         }
-        self.bread(self.gd_block_bitmap(g))
+        let bm = self.bread(self.gd_block_bitmap(g))?;
+        if self.g.metadata_csum {
+            let bytes = (self.g.bpg as usize / 8).min(self.bs);
+            let want = self.gd16(g, 0x18) as u32 | if self.wide() { (self.gd16(g, 0x38) as u32) << 16 } else { 0 };
+            let got = crc32c(self.g.csum_seed, &bm[..bytes]);
+            self.note_csum(want as u32 == got);
+            if want as u32 != got {
+                return Err(FsError::Corrupt);
+            }
+        }
+        Ok(bm)
     }
 
     fn uninit_bbitmap(&self, g: u32) -> Vec<u8> {
@@ -223,7 +234,17 @@ impl Ext4 {
         if uninit_ok && self.gd_flags(g) & BG_INODE_UNINIT != 0 {
             return Ok(vec![0u8; self.bs]);
         }
-        self.bread(self.gd_inode_bitmap(g))
+        let bm = self.bread(self.gd_inode_bitmap(g))?;
+        if self.g.metadata_csum {
+            let bytes = (self.g.ipg as usize / 8).min(self.bs);
+            let want = self.gd16(g, 0x1A) as u32 | if self.wide() { (self.gd16(g, 0x3A) as u32) << 16 } else { 0 };
+            let got = crc32c(self.g.csum_seed, &bm[..bytes]);
+            self.note_csum(want as u32 == got);
+            if want as u32 != got {
+                return Err(FsError::Corrupt);
+            }
+        }
+        Ok(bm)
     }
 
     fn store_bbitmap(&mut self, g: u32, bm: Vec<u8>) -> FsResult<()> {

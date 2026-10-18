@@ -52,7 +52,7 @@ pub fn abs(path: &str) -> String {
 // ------------------------------------------------------------------- clock
 
 /// Days since 1970-01-01 of a proleptic Gregorian date.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
@@ -62,7 +62,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 /// Inverse of `days_from_civil`.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = z - era * 146097;
@@ -147,8 +147,12 @@ fn open_dev(f: &Found) -> Option<Box<dyn BlockDev>> {
     })
 }
 
-/// Find a volume by "disk" or "disk:part" (partition numbers start at 1).
+/// Find a volume by "disk", "diskN", "disk:part" or "diskN:part"
+/// (partition numbers start at 1).
 pub fn find(spec: &str) -> Option<Found> {
+    // The optional "disk" prefix matches the names shown by `mount -l` and
+    // the boot log ("disk 0 partition 3").
+    let spec = spec.strip_prefix("disk").unwrap_or(spec);
     let (d, p) = match spec.split_once(':') {
         Some((d, p)) => (d.parse::<usize>().ok()?, Some(p.parse::<usize>().ok()?)),
         None => (spec.parse::<usize>().ok()?, None),

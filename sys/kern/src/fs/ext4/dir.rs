@@ -26,7 +26,7 @@ pub(super) struct RawEnt {
     pub ftype: u8,
 }
 
-fn align4(n: usize) -> usize {
+pub(super) fn align4(n: usize) -> usize {
     (n + 3) & !3
 }
 
@@ -37,7 +37,7 @@ fn is_tail(blk: &[u8]) -> bool {
 
 impl Ext4 {
     /// End of the entry area of a directory block (before the checksum tail).
-    fn dir_block_end(&self, blk: &[u8]) -> FsResult<usize> {
+    pub(super) fn dir_block_end(&self, blk: &[u8]) -> FsResult<usize> {
         let tail = is_tail(blk);
         if self.g.metadata_csum && !tail {
             return Err(FsError::Unsupported);
@@ -67,7 +67,7 @@ impl Ext4 {
         Ok(v)
     }
 
-    fn set_dir_csum(&self, dir: &Inode, blk: &mut [u8]) {
+    pub(super) fn set_dir_csum(&self, dir: &Inode, blk: &mut [u8]) {
         if self.g.metadata_csum && is_tail(blk) {
             let n = blk.len();
             let c = crc32c(self.inode_seed(dir.ino, dir.generation()), &blk[..n - 12]);
@@ -75,7 +75,7 @@ impl Ext4 {
         }
     }
 
-    fn write_dirent(blk: &mut [u8], off: usize, ino: u32, rec_len: usize, name: &[u8], ft: u8) {
+    pub(super) fn write_dirent(blk: &mut [u8], off: usize, ino: u32, rec_len: usize, name: &[u8], ft: u8) {
         put32(blk, off, ino);
         put16(blk, off + 4, rec_len as u16);
         blk[off + 6] = name.len() as u8;
@@ -116,7 +116,7 @@ impl Ext4 {
         let nb = name.as_bytes();
         for lb in 0..nblocks {
             let Some(p) = map_block(&tree.exts, lb) else { continue };
-            let b = self.bread(p)?;
+            let b = self.bread_dir(&d, p)?;
             for e in self.parse_dir_block(&b)? {
                 if e.ino != 0 && e.name_len == nb.len() && &b[e.off + 8..e.off + 8 + e.name_len] == nb {
                     return Ok(e.ino);
@@ -132,7 +132,7 @@ impl Ext4 {
         let mut out = Vec::new();
         for lb in 0..nblocks {
             let Some(p) = map_block(&tree.exts, lb) else { continue };
-            let b = self.bread(p)?;
+            let b = self.bread_dir(&d, p)?;
             for e in self.parse_dir_block(&b)? {
                 if e.ino == 0 {
                     continue;
@@ -157,7 +157,7 @@ impl Ext4 {
         let (tree, nblocks) = self.dir_tree(dir)?;
         for lb in 0..nblocks {
             let Some(p) = map_block(&tree.exts, lb) else { continue };
-            let b = self.bread(p)?;
+            let b = self.bread_dir(dir, p)?;
             for e in self.parse_dir_block(&b)? {
                 if e.ino == 0 {
                     continue;
@@ -174,7 +174,7 @@ impl Ext4 {
     // ------------------------------------------------------------ mutation
 
     /// Try to place an entry in `b`.  Returns whether it fit.
-    fn try_insert(&self, b: &mut [u8], name: &[u8], ino: u32, ft: u8) -> FsResult<bool> {
+    pub(super) fn try_insert(&self, b: &mut [u8], name: &[u8], ino: u32, ft: u8) -> FsResult<bool> {
         let need = 8 + align4(name.len());
         self.dir_block_end(b)?;
         for e in self.parse_dir_block(b)? {
@@ -196,22 +196,31 @@ impl Ext4 {
     }
 
     /// Add `name -> ino` to `dir`.  The caller writes `dir` afterwards (its
-    /// size, block count or flags may change).
+    /// size, block count or flags may change).  Indexed directories keep
+    /// their index: multi-block linear directories are converted first,
+    /// exactly when the Linux driver starts indexing.
     pub(super) fn dir_add(&mut self, dir: &mut Inode, name: &[u8], ino: u32, mode: u16) -> FsResult<()> {
         if !dir.uses_extents() {
             return Err(FsError::Unsupported);
         }
         if dir.flags() & EXT4_INDEX_FL != 0 {
-            if self.g.metadata_csum {
-                return Err(FsError::Unsupported);
+            return self.dx_add(dir, name, ino, mode);
+        }
+        // A linear directory that has outgrown one block gets indexed
+        // (e2fsck -D style) when the volume allows it.
+        let nblocks = (dir.size() + self.bs as u64 - 1) / self.bs as u64;
+        if nblocks >= 2 && self.g.dir_index && self.g.hash_version < 6 {
+            match self.dx_convert(dir) {
+                Ok(()) => return self.dx_add(dir, name, ino, mode),
+                Err(FsError::Unsupported) => { /* stay linear */ }
+                Err(e) => return Err(e),
             }
-            dir.set_flags(dir.flags() & !EXT4_INDEX_FL);
         }
         let ft = if self.g.filetype { dirent_type(mode) } else { 0 };
         let (tree, nblocks) = self.dir_tree(dir)?;
         for lb in 0..nblocks {
             let Some(p) = map_block(&tree.exts, lb) else { continue };
-            let mut b = self.bread(p)?;
+            let mut b = self.bread_dir(dir, p)?;
             if self.try_insert(&mut b, name, ino, ft)? {
                 self.set_dir_csum(dir, &mut b);
                 return self.bwrite(p, b);
@@ -220,22 +229,18 @@ impl Ext4 {
         // No room: grow the directory by one block.
         let p = self.dir_append_block(dir)?;
         let bs = self.bs;
-        let usable = if self.g.metadata_csum { bs - 12 } else { bs };
-        let mut b = vec![0u8; bs];
-        put16(&mut b, 4, usable as u16);
-        if self.g.metadata_csum {
-            put16(&mut b, bs - 12 + 4, 12);
-            b[bs - 12 + 7] = FT_TAIL;
-        }
+        let usable = self.usable_dirent_bytes();
+        let mut b = self.empty_leaf_block();
         if !self.try_insert(&mut b, name, ino, ft)? {
             return Err(FsError::NameTooLong);
         }
+        let _ = (bs, usable);
         self.set_dir_csum(dir, &mut b);
         self.bwrite(p, b)
     }
 
     /// Append one (empty, unmapped-content) block to a directory's mapping.
-    fn dir_append_block(&mut self, dir: &mut Inode) -> FsResult<u64> {
+    pub(super) fn dir_append_block(&mut self, dir: &mut Inode) -> FsResult<u64> {
         let bs = self.bs as u64;
         let mut tree = self.tree_for(dir)?;
         let lblk = ((dir.size() + bs - 1) / bs) as u32;
@@ -264,19 +269,30 @@ impl Ext4 {
         F: FnMut(&mut [u8], RawEnt, Option<RawEnt>),
     {
         let (tree, nblocks) = self.dir_tree(dir)?;
+        let indexed = dir.flags() & EXT4_INDEX_FL != 0;
+        let root_p = if indexed { map_block(&tree.exts, 0) } else { None };
         for lb in 0..nblocks {
             let Some(p) = map_block(&tree.exts, lb) else { continue };
-            let mut b = self.bread(p)?;
+            let mut b = self.bread_dir(dir, p)?;
             let ents = self.parse_dir_block(&b)?;
             let mut prev: Option<RawEnt> = None;
             for e in ents {
                 if e.ino != 0 && e.name_len == name.len() && &b[e.off + 8..e.off + 8 + e.name_len] == name {
                     let (ino, ft) = (e.ino, e.ftype);
-                    self.dir_block_end(&b)?;
+                    if !indexed || Some(p) != root_p {
+                        // Leaf block: plain dirent semantics.
+                        self.dir_block_end(&b)?;
+                        f(&mut b, e, prev);
+                        self.set_dir_csum(dir, &mut b);
+                        return self.bwrite(p, b).map(|_| (ino, ft));
+                    }
+                    // The dx root: "." / ".." live in the fake dirents; the
+                    // rest of the block is the index, so the checksum is the
+                    // dx one and nothing may move.
                     f(&mut b, e, prev);
-                    self.set_dir_csum(dir, &mut b);
-                    self.bwrite(p, b)?;
-                    return Ok((ino, ft));
+                    let hdr = self.dx_parse_root(&b)?;
+                    self.dx_set_csum(dir, &mut b, &hdr);
+                    return self.bwrite(p, b).map(|_| (ino, ft));
                 }
                 prev = Some(e);
             }

@@ -136,6 +136,13 @@ stub!(stub_ve, 20);
 stub!(stub_apic_timer, 0x30);
 stub!(stub_spurious, 0xFF);
 
+// AHCI disk completion (MSI, phase 1.5).
+stub!(stub_ahci, 0x31);
+
+// SMP (phase 1.5): per-AP LAPIC timer and inter-processor interrupts.
+stub!(stub_ap_timer, 0x32);
+stub!(stub_ap_ipi, 0x33);
+
 // IRQ lines 0..15 after the 8259 remap.
 stub!(stub_irq0, 0x20);
 stub!(stub_irq1, 0x21);
@@ -258,6 +265,18 @@ extern "C" fn isr_handler(frame: &mut IsrFrame) {
             }
         }
         0x30 => crate::hw::apic::on_timer(frame.cs & 3 == 3),
+        0x31 => {
+            crate::hw::ahci::on_irq();
+            crate::hw::apic::lapic_eoi();
+        }
+        0x32 => {
+            crate::hw::smp::on_ap_timer();
+            crate::hw::apic::lapic_eoi();
+        }
+        0x33 => {
+            crate::hw::smp::on_ipi();
+            crate::hw::apic::lapic_eoi();
+        }
         0xFF => {} // spurious: no EOI by definition
         _ => {
             crate::kprintln!("\nunexpected interrupt vector {}", v);

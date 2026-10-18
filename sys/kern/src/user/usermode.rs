@@ -58,24 +58,53 @@ pub const EINVAL: i64 = 22;
 // ------------------------------------------------------------ per-CPU block
 
 /// Reached through GS while in the kernel.  The `syscall` entry stub uses
-/// the two fixed offsets below.
+/// the two fixed offsets below.  One slot per CPU (phase 1.5 SMP): each
+/// CPU's GS base points at its own slot.
 #[repr(C)]
 struct PerCpu {
     kstack_top: u64, // gs:[0]  kernel stack for syscalls
     user_rsp: u64,   // gs:[8]  scratch: user RSP during the entry sequence
 }
 
-static mut PERCPU: PerCpu = PerCpu { kstack_top: 0, user_rsp: 0 };
+const PERCPU_ZERO: PerCpu = PerCpu { kstack_top: 0, user_rsp: 0 };
+
+static mut PERCPU: [PerCpu; crate::hw::acpi::MAX_CPUS] =
+    [PERCPU_ZERO; crate::hw::acpi::MAX_CPUS];
+
+/// The per-CPU block of the running CPU, through its GS base (each CPU's
+/// GS base was set to its own slot at boot / AP bring-up).
+fn current_percpu() -> &'static mut PerCpu {
+    // SAFETY: reading MSR_GS_BASE in kernel context yields our slot's
+    // address; the value is one of the PERCPU entries by construction.
+    unsafe {
+        let gs = crate::arch::io::rdmsr(MSR_GS_BASE) as usize;
+        let base = addr_of_mut!(PERCPU).cast::<PerCpu>() as usize;
+        let idx = (gs - base) / core::mem::size_of::<PerCpu>();
+        let idx = idx.min(crate::hw::acpi::MAX_CPUS - 1);
+        &mut *addr_of_mut!(PERCPU).cast::<PerCpu>().add(idx)
+    }
+}
+
+/// Point this CPU's GS base at its per-CPU slot (BSP: slot 0 in init();
+/// APs: their own slot from hw/smp.rs).
+///
+/// SAFETY: privileged MSR write; must run on the CPU it configures.
+pub unsafe fn set_gs_for_cpu(cpu: usize) {
+    let p = unsafe { addr_of_mut!(PERCPU).cast::<PerCpu>().add(cpu.min(crate::hw::acpi::MAX_CPUS - 1)) };
+    // SAFETY: as above.
+    unsafe {
+        crate::arch::io::wrmsr(MSR_GS_BASE, p as u64);
+        crate::arch::io::wrmsr(MSR_KERNEL_GS_BASE, 0);
+    }
+}
 
 /// Publish the kernel stack that traps coming from ring 3 must land on:
 /// TSS.RSP0 (interrupts / exceptions) and gs:[0] (`syscall`).  Called by the
 /// scheduler on every switch to a user process.
 pub fn set_kstack_top(top: u64) {
-    // SAFETY: scalar writes; called with interrupts masked.
-    unsafe {
-        (*addr_of_mut!(PERCPU)).kstack_top = top;
-        crate::arch::tss::set_rsp0(top);
-    }
+    // SAFETY: scalar write through GS; called with interrupts masked.
+    current_percpu().kstack_top = top;
+    crate::arch::tss::set_rsp0(top);
 }
 
 // -------------------------------------------------------------- entry stubs
@@ -237,8 +266,9 @@ pub fn init() -> InitInfo {
         crate::arch::io::wrmsr(MSR_STAR, (0x10u64 << 48) | ((KERNEL_CS as u64) << 32));
         crate::arch::io::wrmsr(MSR_LSTAR, syscall_entry as usize as u64);
         crate::arch::io::wrmsr(MSR_SFMASK, SFMASK);
-        crate::arch::io::wrmsr(MSR_GS_BASE, addr_of_mut!(PERCPU) as u64);
-        crate::arch::io::wrmsr(MSR_KERNEL_GS_BASE, 0);
+        // The BSP takes per-CPU slot 0; APs set their own in hw/smp.rs.
+        // SAFETY: we are the BSP, cpu 0.
+        unsafe { set_gs_for_cpu(0) };
 
         let mut cr4 = crate::arch::regs::read_cr4();
         if smep {

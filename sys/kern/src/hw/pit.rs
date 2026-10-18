@@ -103,3 +103,14 @@ pub fn sleep_ms(ms: u64) {
         crate::arch::io::hlt();
     }
 }
+
+/// Busy-wait until the uptime clock advanced by `ms` milliseconds, spinning
+/// instead of hlt-ing: used by the SMP bring-up (the INIT-SIPI-SIPI delays)
+/// where the caller must stay responsive, and usable with interrupts
+/// already enabled (the tick keeps running).
+pub fn spin_ms(ms: u64) {
+    let end = uptime_ms() + ms;
+    while uptime_ms() < end {
+        core::hint::spin_loop();
+    }
+}

@@ -202,6 +202,69 @@ pub fn alloc_page_low() -> Option<u64> {
     alloc_page_inner(true)
 }
 
+/// Take `n` contiguous free pages below 4 GiB, zeroed, or None.  For DMA
+/// structures that must sit in one physically contiguous run (AHCI command
+/// lists + tables, ...).  First-fit from the rotating hint, like the
+/// single-page path.
+pub fn alloc_pages_low_contig(n: usize) -> Option<u64> {
+    if n == 0 {
+        return Some(0); // degenerate: no allocation, no address
+    }
+    let words = BITMAP_WORDS.load(Ordering::Relaxed);
+    if words == 0 {
+        return None;
+    }
+    let _guard = IrqGuard::new();
+    let limit = words.min((FOUR_GIB / PAGE / 64) as usize);
+    let min_pfn = (LOW_RESERVED / PAGE) as usize; // never touch low BIOS junk
+    let start = HINT.load(Ordering::Relaxed).min(limit.saturating_sub(1));
+    for i in 0..limit {
+        let w0 = (start + i) % limit;
+        // Try to fit n bits starting at bit b of word w0.
+        for b in 0..64 {
+            let pfn0 = (w0 as u64 * 64 + b as u64) as usize;
+            if pfn0 < min_pfn {
+                continue;
+            }
+            // Run check without touching the bitmap: read the words needed.
+            let mut ok = true;
+            for k in 0..n {
+                let pfn = pfn0 + k;
+                let (w, bit) = (pfn >> 6, pfn & 63);
+                if w >= limit {
+                    ok = false;
+                    break;
+                }
+                if bm_read(w) & (1u64 << bit) != 0 {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            // Claim the run.
+            for k in 0..n {
+                let pfn = pfn0 + k;
+                let (w, bit) = (pfn >> 6, pfn & 63);
+                bm_write(w, bm_read(w) | (1u64 << bit));
+            }
+            HINT.store(w0, Ordering::Relaxed);
+            ALLOC_COUNT.fetch_add(n as u64, Ordering::Relaxed);
+            // SAFETY: atomic update on our own static.
+            unsafe {
+                (*core::ptr::addr_of_mut!(STATS)).free_pages.fetch_sub(n as u64, Ordering::Relaxed);
+            }
+            let base = pfn0 as u64 * PAGE;
+            for p in 0..n {
+                zero_page(base + p as u64 * PAGE);
+            }
+            return Some(base);
+        }
+    }
+    None
+}
+
 fn alloc_page_inner(force_low: bool) -> Option<u64> {
     let words = BITMAP_WORDS.load(Ordering::Relaxed);
     if words == 0 {

@@ -14,3 +14,4 @@ pub mod pic;
 pub mod pit;
 pub mod rtc;
 pub mod serial;
+pub mod smp;

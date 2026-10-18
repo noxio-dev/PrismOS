@@ -9,3 +9,6 @@ publish = false
 [[bin]]
 name = "fstest"
 path = "src/main.rs"
+
+[features]
+dbg = []

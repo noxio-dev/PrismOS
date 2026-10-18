@@ -182,6 +182,27 @@ fn main() {
                 "sync" => { vfs.sync_all()?; String::new() }
                 "df" => { let s = vfs.statfs("/")?; format!("{} {} {} {}", s.blocks, s.free_blocks, s.files, s.free_files) }
                 "umount" => { vfs.umount(a)?; String::new() }
+                // phase 1.5: preallocation (two flavours), block count,
+                // raw bytes, and the crash-right-after-journal-commit exit.
+                "prealloc" => { let (o, l) = rest.split_once(' ').unwrap(); vfs.fallocate(a, o.parse().unwrap(), l.parse().unwrap(), false)?; String::new() }
+                "preallok" => { let (o, l) = rest.split_once(' ').unwrap(); vfs.fallocate(a, o.parse().unwrap(), l.parse().unwrap(), true)?; String::new() }
+                "blk" => format!("{}", vfs.stat(a)?.blocks),
+                "peek" => {
+                    let (o, l) = rest.split_once(' ').unwrap();
+                    let (o, l): (u64, usize) = (o.parse().unwrap(), l.parse().unwrap());
+                    let mut b = vec![0u8; l];
+                    let fd = vfs.open(a, vfs::O_READ)?;
+                    vfs.seek(fd, vfs::Whence::Set(o))?;
+                    vfs.read(fd, &mut b)?;
+                    vfs.close(fd)?;
+                    b.iter().map(|x| format!("{:02x}", x)).collect::<Vec<_>>().join("")
+                }
+                "crash" => {
+                    // Simulate power loss after the last commit: the journal
+                    // holds un-checkpointed transactions, nothing is synced.
+                    println!("crash: exiting without sync");
+                    std::process::exit(0);
+                }
                 _ => panic!("line {}: unknown command {}", ln + 1, cmd),
             })
         })();

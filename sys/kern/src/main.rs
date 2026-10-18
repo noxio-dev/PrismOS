@@ -37,7 +37,7 @@ mod user;
 use arch::{cpu, gdt, idt, intr, vm};
 use boot::BootInfo;
 use fs::fsys;
-use hw::{acpi, ahci, apic, blk, kbd, pci, pic, pit, serial};
+use hw::{acpi, ahci, apic, blk, kbd, pci, pic, pit, serial, smp};
 use mem::{heap, pmm, vmm};
 use user::process;
 
@@ -53,6 +53,9 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // SAFETY: the pointer comes straight from the loader.
     let bi = unsafe { BootInfo::from_ptr(boot_info) };
     console::init(bi);
+    // Kernel log ring (dmesg): timestamps come from the tick once the PIT
+    // is up; before that they read as 0.
+    crate::lib::klog::init(pit::uptime_ms);
 
     kprintln!("Hello, world!");
     kprintln!();
@@ -244,6 +247,23 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     intr::sti();
     kprintln!("interrupts enabled");
 
+    // --- SMP (phase 1.5) --------------------------------------------------------
+    // Bring the application processors up through the LAPIC: they run their
+    // own timer, answer IPIs and idle; the scheduler stays on this CPU.
+    let ncpu = smp::init();
+    if ncpu > 1 {
+        let (answered, aps) = smp::ipi_ping_all();
+        kprintln!(
+            "smp      : {} cpu(s) online ({} AP up, IPI round-trip {}/{})",
+            ncpu,
+            ncpu - 1,
+            answered,
+            aps
+        );
+    } else {
+        kprintln!("smp      : single cpu (no AP in the MADT or APIC unavailable)");
+    }
+
     // --- PCI / storage (needs the system tick for command time-outs) ----------
     kprintln!("pci      : {} function(s) on the bus", pci::init());
     let ndisks = ahci::init();
@@ -280,6 +300,11 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     kprintln!("dropping to the shell");
     kprintln!();
 
+    // Defense in depth: the disk paths may only ever sleep with interrupts
+    // on, but a leaked IF=0 here would freeze the shell on its first idle
+    // hlt -- re-enable them unconditionally before handing over.
+    intr::sti();
+
     shell::set_boot_info(Some(bi));
     shell::run()
 }
@@ -309,6 +334,9 @@ fn yn(b: bool) -> &'static str {
 fn panic(info: &PanicInfo) -> ! {
     intr::cli();
     kprintln!("\nKERNEL PANIC: {}", info);
+    // A proper backtrace: the frame-pointer chain, symbolized through the
+    // build-time kallsyms table (phase 1.5).
+    crate::lib::kallsyms::backtrace();
     halt()
 }
 
