@@ -25,11 +25,12 @@ open file descriptions shared by `fork` and `dup`, pipes (bounded blocking,
 EOF / EPIPE), a `/dev` directory (devfs) with `console`, `null` and `zero`,
 and six new syscalls (`read`, `open`, `close`, `lseek`, `dup`, `pipe`; `write`
 now routes through the table).
-Phase 3.1 rounds out the POSIX surface a newlib port needs: seventeen new
+Phase 3.1 rounds out the POSIX surface a C library port needs: seventeen new
 syscalls (`stat`, `fstat`, `brk`, `mmap`, `munmap`, `chdir`, `getcwd`, `dup2`,
 `fcntl`, `getdents`, `ioctl`, `unlink`, `mkdir`, `rmdir`, `rename`, `link`,
 `uname`), `O_NONBLOCK` / `O_CLOEXEC`, a working directory *per process*, the
-POSIX SIGPIPE rule and the `isatty` ioctl pair -- the ABI a `x86_64-prismos`
+POSIX SIGPIPE rule and the `isatty` ioctl pair -- the ABI the
+[mlibc](https://github.com/managarm/mlibc) port and the `x86_64-prismos`
 toolchain (phase 3.2) will build against.
 
 | Area                     | State   | Notes                                                                 |
@@ -47,7 +48,7 @@ toolchain (phase 3.2) will build against.
 | ELF loader / `execve`    | done    | static ELF64 (`ET_EXEC` / static PIE with RELATIVE relocations), W^X segments, System V initial stack with argv / envp / auxv, `execve` syscall, `/bin/hello` demo built from `usr/` (2.4) |
 | fork / wait / signals     | done    | `fork` clones the address space copy-on-write (refcounted shared pages, fault-time copies), `wait` reaps zombies (blocking, WNOHANG, by pid, Linux status word), SIGKILL/SIGTERM/SIGINT/SIGCHLD/SIGUSR1 with per-process handlers delivered at the syscall boundary and restored register-for-register by a sigreturn trampoline (2.5) |
 | Descriptors / pipes / /dev | done   | a fd table per process (0/1/2 on the console), open file descriptions shared by fork / dup (shared offsets, POSIX), pipes with bounded blocking and EOF / EPIPE, devfs on /dev with `console` / `null` / `zero` served by the descriptor layer, syscalls read / open / close / lseek / dup / pipe (2.6) |
-| POSIX syscalls (newlib set) | done | 17 new syscalls (stat / fstat / brk / mmap / munmap / chdir / getcwd / dup2 / fcntl / getdents / ioctl / unlink / mkdir / rmdir / rename / link / uname), `O_NONBLOCK` / `O_CLOEXEC`, per-process cwd, the SIGPIPE rule, `uname` / the isatty ioctl pair; x86-64 Linux `struct stat` and `linux_dirent64` layouts (3.1) |
+| POSIX syscalls (libc set) | done | 17 new syscalls (stat / fstat / brk / mmap / munmap / chdir / getcwd / dup2 / fcntl / getdents / ioctl / unlink / mkdir / rmdir / rename / link / uname), `O_NONBLOCK` / `O_CLOEXEC`, per-process cwd, the SIGPIPE rule, `uname` / the isatty ioctl pair; x86-64 Linux `struct stat` and `linux_dirent64` layouts (3.1) |
 | Networking, USB, SMP     | todo    | not started                                                            |
 
 **Testing.** `make fstest` (11 scenarios against `mke2fs` images, each validated
@@ -114,11 +115,16 @@ Phase 2 — ring 3 and processes
 - [x] Phase 2.6 — file descriptors per process on top of the VFS, pipes, `/dev` (`console`, `null`, `zero`)
 
 Phase 3 — POSIX userspace
-- [x] Phase 3.1 — syscall set for newlib: `open/read/write/lseek/close/stat/dup/pipe/mmap/brk/getcwd/...`
-- [ ] Phase 3.2 — newlib port and a `x86_64-prismos` toolchain target
+- [x] Phase 3.1 — syscall set for a C library: `open/read/write/lseek/close/stat/dup/pipe/mmap/brk/getcwd/...`
+- [ ] Phase 3.2 — mlibc port and a `x86_64-prismos` toolchain target
+  - [ ] kernel prerequisites mlibc needs beyond 3.1: TLS (`FS` base through `arch_prctl`), `futex`, `sigprocmask` / `sigaction`, `mprotect`, `poll` / `select`, `clock_gettime` (pulled forward from 3.5)
+  - [ ] `sysdeps/prismos` in mlibc (`sys_open`, `sys_read`, `sys_vm_map`, `sys_fork`, `sys_execve`, `sys_waitpid`, ...); sysdeps the kernel lacks stay `ENOSYS`
+  - [ ] build mlibc with Meson against a cross C/C++ compiler (headers first, then the compiler, then the library), install it into a sysroot
+  - [ ] port `/bin/hello`, `/bin/fork`, `/bin/fd` and `/bin/posix` from the mini libc (`usr/lib`) to mlibc
+  - [ ] ELF loader: dynamic linking, a requirement and not an option. Honour `PT_INTERP` (load the interpreter, mlibc's `ld.so`, at its own base and start it with `AT_BASE` plus `AT_PHDR` / `AT_PHNUM` / `AT_ENTRY` describing the main program); `DT_NEEDED` resolution stays in userspace (`ld.so` finds libraries in `/lib` and `/usr/lib` and maps them with file `mmap`); add `mprotect` for RELRO and relocation fix-ups; shared libraries are `ET_DYN` with their own `PT_LOAD` / `PT_TLS` / `PT_GNU_RELRO` handling
 - [ ] Phase 3.3 — `init`, TTY layer with line discipline, `/proc` and `/tmp` (tmpfs)
 - [ ] Phase 3.4 — BusyBox and a userspace shell
-- [ ] Phase 3.5 — time (`clock_gettime`, HPET/TSC), `/dev/random`, users and permissions
+- [ ] Phase 3.5 — precise time (HPET/TSC behind the 3.2 `clock_gettime`), `/dev/random`, users and permissions
 
 Phase 4 — toolchain
 - [ ] Phase 4.1 — cross-binutils for `x86_64-prismos`
@@ -136,6 +142,7 @@ Beyond (nice to have)
 - [ ] USB (xHCI) keyboard and mass storage, NVMe
 - [ ] other file systems: FAT32 R/W in the kernel, tmpfs
 - [ ] graphics: framebuffer userspace API, a minimal window system
+- [ ] desktop (Xorg, then KDE): mlibc is the entry ticket, not the whole price -- also Unix domain sockets, `epoll`, shared memory (`MAP_SHARED` of files, `shm`), a display / input device interface (KMS-style), and a lot of the Linux surface (`/proc`, `/sys`, `udev`-like discovery)
 - [ ] AArch64 port of the kernel and loader
 
 *`One day, perhaps, PrismOS will be self-hosted lol`*
@@ -208,7 +215,7 @@ the `Opened::Dev` arm of `fs/vfs.rs`; the demo / test program is `/bin/fd`
   deliberate: the shell is blocked while its children run, so nothing may
   wait forever (the same rule `sleep` follows).
 
-Limits worth knowing, as phase 2.6 left them (the newlib set of phase 3.1
+Limits worth knowing, as phase 2.6 left them (the libc set of phase 3.1
 lifted most -- see below): no `O_NONBLOCK` / `O_CLOEXEC`, no `dup2` /
 `fcntl`, no per-process cwd (paths resolved against the shell's, like
 `execve`'s), no `getdents` (a directory fd opened but could not be read),
@@ -219,7 +226,7 @@ Shell: `ls /dev` and `mount` show the device directory (`c` type chars,
 devfs read-only); `exec fd` runs the ten phase 2.6 scenarios and prints
 `fd: all 10 passed` -- also part of `make test`.
 
-## The newlib syscall set (phase 3.1)
+## The libc syscall set (phase 3.1)
 
 `user/sysc.rs` (the memory / process half: `brk`, `mmap`, `munmap`,
 `chdir`, `getcwd`, `uname`) and the descriptor layer grown to POSIX size
@@ -229,7 +236,7 @@ devfs read-only); `exec fd` runs the ten phase 2.6 scenarios and prints
 arguments now -- `mmap` needs r10 / r8 / r9, the Linux order.
 
 - **stat / fstat** fill the x86-64 Linux `struct stat` layout (144 bytes)
-  exactly -- the ABI the future newlib port compiles against.  The file
+  exactly -- the ABI the future mlibc port compiles against.  The file
   type lives in the mode's `S_IFMT` bits (`S_IFREG` / `S_IFDIR` / `S_IFLNK`),
   a devfs node is `S_IFCHR` with `st_rdev` = `(1 << 8) | id` (Linux's mem
   major), a pipe end fstats as a fifo.  `st_dev` is 0 (no device numbering
@@ -296,7 +303,9 @@ build string / `x86_64` / `(none)`).
 
 Not here (yet): `select` / `poll`, `mprotect`, `MAP_SHARED` of a file,
 `PROT_NONE`, `fchmod` / `chmod` and anything permission-shaped (phase
-3.5), `clock_gettime` and friends (phase 3.5), `wait4`-style rusage, and
+3.5), `clock_gettime` and friends (needed by mlibc, so pulled forward into
+phase 3.2), TLS / `futex` / `sigprocmask` (phase 3.2, same reason),
+`wait4`-style rusage, and
 `getdents` `d_type` for file systems that do not know one (ext4 and devfs
 always do).
 
