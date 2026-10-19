@@ -8,7 +8,13 @@
 //  * `Vfs` owns the mount table and the open-file table, resolves paths
 //    (mount point crossing, symlinks, `.`/`..`) and exposes a path-based API
 //    plus a small descriptor API (open/read/write/seek/close) that the
-//    syscall layer of phase 2 can sit on.
+//    syscall layer sits on (phase 2.6: user/fd.rs puts the per-process
+//    descriptor tables in front of it).
+//
+//  * device nodes (phase 2.6): a `FileType::Dev(id)` entry is what devfs
+//    (fs/devfs.rs) answers `stat` with.  `open_desc` maps one to
+//    `Opened::Dev(id)` -- the caller (the descriptor layer) owns its I/O,
+//    the VFS never reads or writes a device.
 //
 // Like blk.rs this file has no dependency on the rest of the kernel (only on
 // `alloc` and `core`), so it is built and tested on the host as well.  The
@@ -109,6 +115,9 @@ pub enum FileType {
     Regular,
     Dir,
     Symlink,
+    /// A device node (phase 2.6): the number is the device id (1 = console,
+    /// 2 = null, 3 = zero, see fs/devfs.rs).  Only devfs produces these.
+    Dev(u32),
     Other,
 }
 
@@ -270,6 +279,15 @@ pub enum Whence {
     Set(u64),
     Cur(i64),
     End(i64),
+}
+
+/// What `open_desc` hands back (phase 2.6): a slot in the open-file table,
+/// or a device node the caller serves itself (its I/O never goes through
+/// this table -- see fs/devfs.rs and user/fd.rs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Opened {
+    File(usize),
+    Dev(u32),
 }
 
 struct OpenFile {
@@ -508,6 +526,8 @@ impl Vfs {
         match st.ftype {
             FileType::Dir => return Err(FsError::IsDir),
             FileType::Regular => {}
+            // A device node has no file data; whole-file helpers refuse it.
+            FileType::Dev(_) => return Err(FsError::Unsupported),
             _ => return Err(FsError::Invalid),
         }
         if st.size as usize > max {
@@ -689,6 +709,21 @@ impl Vfs {
     }
 
     pub fn open(&mut self, path: &str, flags: u32) -> FsResult<usize> {
+        match self.open_desc(path, flags)? {
+            // A regular file / directory: the table slot is the description.
+            Opened::File(fd) => Ok(fd),
+            // Devices go through the descriptor layer, never through the
+            // plain table API (nothing here could serve their I/O).
+            Opened::Dev(_) => Err(FsError::Unsupported),
+        }
+    }
+
+    /// `open`, telling devices apart (phase 2.6).  Same rules as `open` for
+    /// everything else (create on ENOENT, truncate, directory and read-only
+    /// checks); a `Dev(id)` node resolves to its device id instead of a table
+    /// slot.  `O_TRUNC` / `O_APPEND` on a device are ignored (a device has no
+    /// offset) and its permissions are whatever was asked for.
+    pub fn open_desc(&mut self, path: &str, flags: u32) -> FsResult<Opened> {
         Self::check_len(path)?;
         if flags & (O_READ | O_WRITE) == 0 {
             return Err(FsError::Invalid);
@@ -709,6 +744,11 @@ impl Vfs {
             Err(e) => return Err(e),
         };
         let st = self.mounts[mi].fs.stat(ino)?;
+        // A device node: no table slot, no I/O here -- the descriptor layer
+        // turns the id into the device it serves.
+        if let FileType::Dev(id) = st.ftype {
+            return Ok(Opened::Dev(id));
+        }
         let is_dir = st.ftype == FileType::Dir;
         if is_dir && flags & O_WRITE != 0 {
             return Err(FsError::IsDir);
@@ -725,10 +765,10 @@ impl Vfs {
         let of = OpenFile { mount: self.mounts[mi].id, ino, off: 0, flags, is_dir };
         if let Some(i) = self.files.iter().position(|f| f.is_none()) {
             self.files[i] = Some(of);
-            Ok(i)
+            Ok(Opened::File(i))
         } else {
             self.files.push(Some(of));
-            Ok(self.files.len() - 1)
+            Ok(Opened::File(self.files.len() - 1))
         }
     }
 

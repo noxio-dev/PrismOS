@@ -17,6 +17,9 @@
 //     8 fork()                9 wait(pid, status_ptr, flags)  (phase 2.5)
 //    10 kill(pid, sig)       11 signal(sig, handler)
 //    12 sigreturn()
+//    13 read(fd, buf, len)   14 open(path, flags)      15 close(fd)
+//    16 lseek(fd, off, whence)  17 dup(fd)            18 pipe(int *fds)
+//                                                          (phase 2.6)
 //
 // `exit` never returns to the caller.  `yield` and `sleep` switch to another
 // process and come back here only when the process is scheduled again (the
@@ -29,9 +32,10 @@
 //
 // `execve` replaces the calling process's image by an ELF executable of the
 // VFS (user/elf.rs): new address space, fresh System V stack (argc, argv,
-// envp, auxv), fresh FPU state and clean signal handlers; the pid, priority
-// and CPU budget stay.  It returns only on failure (-ENOENT, -ENOEXEC,
-// -EACCES, -E2BIG, -ENOMEM, -EFAULT ...) and then the caller is untouched.
+// envp, auxv), fresh FPU state and clean signal handlers; the pid, priority,
+// CPU budget and descriptor table stay (POSIX keeps the fds).  It returns
+// only on failure (-ENOENT, -ENOEXEC, -EACCES, -E2BIG, -ENOMEM, -EFAULT ...)
+// and then the caller is untouched.
 //
 // Phase 2.5: `fork` clones the caller copy-on-write and returns the child's
 // pid (the child resumes in ring 3 with rax = 0).  `wait` reaps a dead
@@ -43,15 +47,19 @@
 // syscall return value.  A pending signal is delivered between the return
 // value and `sysretq`.
 //
-// The descriptor API of fs/vfs.rs (open / read / write / seek / close) is
-// meant to sit behind this table later (phase 2.6).
+// Phase 2.6: the descriptor layer (user/fd.rs) sits in front of the VFS:
+// every process owns a fd table (0/1/2 on the console), `fork` shares the
+// open descriptions with the child, `write`/`read`/`open`/`close`/
+// `lseek`/`dup`/`pipe` are the six syscalls above, and the device nodes of
+// /dev (devfs) resolve through it.
 
 use crate::arch::intr::IsrFrame;
 use crate::mem::vmm::AddressSpace;
 use crate::user::elf;
+use crate::user::fd;
 use crate::user::process;
 use crate::user::signal;
-use crate::user::usermode::{EBADF, EFAULT, ENOSYS};
+use crate::user::usermode::{EFAULT, ENOSYS};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -59,61 +67,9 @@ const ENOENT: i64 = 2;
 const E2BIG: i64 = 7;
 const ENAMETOOLONG: i64 = 36;
 
-/// Copy `len` user bytes starting at `buf` to the console, in chunks.
-/// Returns the number of bytes written or -EFAULT when nothing was readable.
-fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
-    if fd != 1 && fd != 2 {
-        return -EBADF;
-    }
-    let len = len.min(4096) as usize;
-    let Some(cur) = process::current() else { return -EFAULT };
-    let Some(aspace) = cur.aspace.as_ref() else { return -EFAULT };
-    let mut chunk = [0u8; 256];
-    let mut done = 0usize;
-    while done < len {
-        let n = (len - done).min(chunk.len());
-        if !aspace.read(buf + done as u64, &mut chunk[..n]) {
-            break;
-        }
-        put_user_bytes(&chunk[..n]);
-        done += n;
-    }
-    if done == 0 && len > 0 {
-        -EFAULT
-    } else {
-        done as i64
-    }
-}
-
-/// Print user-supplied bytes: valid UTF-8 as is, control characters (other
-/// than newline / tab) and invalid sequences as '?', so a program cannot
-/// inject terminal escapes into the console.
-fn put_user_bytes(mut b: &[u8]) {
-    while !b.is_empty() {
-        let (valid, skip, bad) = match core::str::from_utf8(b) {
-            Ok(s) => (s, b.len(), false),
-            Err(e) => {
-                let v = e.valid_up_to();
-                // SAFETY: from_utf8 vouches for the prefix.
-                (unsafe { core::str::from_utf8_unchecked(&b[..v]) }, v + e.error_len().unwrap_or(b.len() - v), true)
-            }
-        };
-        for ch in valid.chars() {
-            if ch.is_control() && ch != '\n' && ch != '\t' {
-                crate::kprint!("?");
-            } else {
-                crate::kprint!("{}", ch);
-            }
-        }
-        if bad {
-            crate::kprint!("?");
-        }
-        b = &b[skip.min(b.len())..];
-    }
-}
-
 /// NUL-terminated string at the user address `ptr` (without the NUL).
-fn read_user_cstr(aspace: &AddressSpace, ptr: u64, max: usize) -> Result<Vec<u8>, i64> {
+/// Shared by execve and the descriptor layer's `open` (phase 2.6).
+pub(crate) fn read_user_cstr(aspace: &AddressSpace, ptr: u64, max: usize) -> Result<Vec<u8>, i64> {
     let mut out = Vec::new();
     let mut p = ptr;
     loop {
@@ -218,7 +174,6 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
     let (a0, a1, a2) = (frame.rdi, frame.rsi, frame.rdx);
     let ret: i64 = match frame.rax {
         0 => process::exit_current(process::Outcome::Exited(a0)),
-        1 => sys_write(a0, a1, a2),
         2 => process::getpid() as i64,
         3 => crate::hw::pit::uptime_ms() as i64,
         4 => {
@@ -243,6 +198,14 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
             signal::sys_sigreturn(frame);
             return;
         }
+        // ---- phase 2.6: the descriptor layer ----------------------------
+        1 => fd::sys_write(a0, a1, a2),
+        13 => fd::sys_read(a0, a1, a2),
+        14 => fd::sys_open(a0, a1),
+        15 => fd::sys_close(a0),
+        16 => fd::sys_lseek(a0, a1, a2),
+        17 => fd::sys_dup(a0),
+        18 => fd::sys_pipe(a0),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

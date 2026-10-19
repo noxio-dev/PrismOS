@@ -8,6 +8,7 @@
 
 use crate::hw::ahci;
 use crate::hw::blk::{read_gpt, BlockDev, GptEntry, Partition};
+use crate::fs::devfs::DevFs;
 use crate::fs::ext4::Ext4;
 use crate::fs::vfs::{self, FsError, Vfs};
 use alloc::boxed::Box;
@@ -169,7 +170,8 @@ pub fn mount(f: &Found, path: &str, read_only: bool) -> Result<(), FsError> {
     vfs().mount(path, Box::new(fs))
 }
 
-/// Boot-time setup: install the clock and mount the first ext volume on "/".
+/// Boot-time setup: install the clock, mount the first ext volume on "/"
+/// and the device directory on /dev (phase 2.6).
 pub fn init() {
     vfs::set_clock(unix_now);
     let found = scan();
@@ -197,6 +199,16 @@ pub fn init() {
             );
         }
         Err(e) => crate::kprintln!("vfs      : {} is not mountable: {}", name(f), e.as_str()),
+    }
+    // /dev holds the device nodes (console, null, zero) served by the
+    // descriptor layer (user/fd.rs).  It needs an existing /dev directory
+    // in the root file system (the build creates one); without a root
+    // mount there is nothing to hang it on either.
+    if vfs().is_mounted() {
+        match vfs().mount("/dev", Box::new(DevFs::new())) {
+            Ok(()) => crate::kprintln!("vfs      : devfs on /dev (console, null, zero)"),
+            Err(e) => crate::kprintln!("vfs      : cannot mount devfs on /dev: {}", e.as_str()),
+        }
     }
 }
 

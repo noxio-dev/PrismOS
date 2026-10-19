@@ -371,7 +371,7 @@ pub(super) fn cmd_usertest(_args: &mut Args) {
 }
 
 /// Default environment of programs started from the shell.
-const DEFAULT_ENV: [&str; 3] = ["PATH=/bin", "HOME=/", "PRISMOS=2.5"];
+const DEFAULT_ENV: [&str; 3] = ["PATH=/bin", "HOME=/", "PRISMOS=2.6"];
 
 pub(super) fn cmd_exec(args: &mut Args) {
     use crate::user::elf;

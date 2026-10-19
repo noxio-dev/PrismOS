@@ -16,28 +16,43 @@
 /* ---- system calls (kernel: sys/kern/src/user/syscall.rs) -------------- */
 
 enum {
-	SYS_EXIT = 0, SYS_WRITE = 1, SYS_GETPID = 2, SYS_UPTIME_MS = 3,
-	SYS_YIELD = 4, SYS_SLEEP = 5, SYS_SETPRIO = 6, SYS_EXECVE = 7,
-	SYS_FORK = 8, SYS_WAIT = 9, SYS_KILL = 10, SYS_SIGNAL = 11,
-	SYS_SIGRETURN = 12,
+        SYS_EXIT = 0, SYS_WRITE = 1, SYS_GETPID = 2, SYS_UPTIME_MS = 3,
+        SYS_YIELD = 4, SYS_SLEEP = 5, SYS_SETPRIO = 6, SYS_EXECVE = 7,
+        SYS_FORK = 8, SYS_WAIT = 9, SYS_KILL = 10, SYS_SIGNAL = 11,
+        SYS_SIGRETURN = 12,
+        SYS_READ = 13, SYS_OPEN = 14, SYS_CLOSE = 15, SYS_LSEEK = 16,
+        SYS_DUP = 17, SYS_PIPE = 18,
 };
 
 /* errno values returned (negated) by the kernel */
 enum {
-	PRISM_EPERM = 1, PRISM_ENOENT = 2, PRISM_ESRCH = 3, PRISM_E2BIG = 7,
-	PRISM_ENOEXEC = 8, PRISM_EBADF = 9, PRISM_ECHILD = 10,
-	PRISM_ENOMEM = 12, PRISM_EACCES = 13, PRISM_EFAULT = 14,
-	PRISM_EISDIR = 21, PRISM_EINVAL = 22, PRISM_ENAMETOOLONG = 36,
-	PRISM_ENOSYS = 38,
+        PRISM_EPERM = 1, PRISM_ENOENT = 2, PRISM_ESRCH = 3, PRISM_E2BIG = 7,
+        PRISM_ENOEXEC = 8, PRISM_EBADF = 9, PRISM_ECHILD = 10,
+        PRISM_EAGAIN = 11, PRISM_ENOMEM = 12, PRISM_EACCES = 13,
+        PRISM_EFAULT = 14, PRISM_EEXIST = 17, PRISM_ENODEV = 19,
+        PRISM_EISDIR = 21, PRISM_EINVAL = 22, PRISM_EMFILE = 24,
+        PRISM_EFBIG = 27, PRISM_ESPIPE = 29, PRISM_EPIPE = 32,
+        PRISM_ENAMETOOLONG = 36, PRISM_ENOSYS = 38,
 };
+
+/* open() flags: the kernel's own values (fs/vfs.rs), not Linux's O_* */
+enum {
+        PRISM_O_READ = 1, PRISM_O_WRITE = 2, PRISM_O_CREATE = 4,
+        PRISM_O_TRUNC = 8, PRISM_O_APPEND = 16, PRISM_O_EXCL = 32,
+};
+
+/* lseek() whence */
+#define PRISM_SEEK_SET 0
+#define PRISM_SEEK_CUR 1
+#define PRISM_SEEK_END 2
 
 /* signals (the basic set the kernel implements) */
 enum {
-	PRISM_SIGHUP = 1, PRISM_SIGINT = 2, PRISM_SIGQUIT = 3, PRISM_SIGILL = 4,
-	PRISM_SIGTRAP = 5, PRISM_SIGABRT = 6, PRISM_SIGBUS = 7, PRISM_SIGFPE = 8,
-	PRISM_SIGKILL = 9, PRISM_SIGUSR1 = 10, PRISM_SIGSEGV = 11,
-	PRISM_SIGUSR2 = 12, PRISM_SIGPIPE = 13, PRISM_SIGALRM = 14,
-	PRISM_SIGTERM = 15, PRISM_SIGCHLD = 17,
+        PRISM_SIGHUP = 1, PRISM_SIGINT = 2, PRISM_SIGQUIT = 3, PRISM_SIGILL = 4,
+        PRISM_SIGTRAP = 5, PRISM_SIGABRT = 6, PRISM_SIGBUS = 7, PRISM_SIGFPE = 8,
+        PRISM_SIGKILL = 9, PRISM_SIGUSR1 = 10, PRISM_SIGSEGV = 11,
+        PRISM_SIGUSR2 = 12, PRISM_SIGPIPE = 13, PRISM_SIGALRM = 14,
+        PRISM_SIGTERM = 15, PRISM_SIGCHLD = 17,
 };
 
 /* wait() flags and status decoding (Linux encoding) */
@@ -51,23 +66,23 @@ enum {
 
 static inline long syscall3(long n, long a, long b, long c)
 {
-	long r;
-	__asm__ volatile("syscall"
-	    : "=a"(r)
-	    : "a"(n), "D"(a), "S"(b), "d"(c)
-	    : "rcx", "r11", "memory");
-	return r;
+        long r;
+        __asm__ volatile("syscall"
+            : "=a"(r)
+            : "a"(n), "D"(a), "S"(b), "d"(c)
+            : "rcx", "r11", "memory");
+        return r;
 }
 
 __attribute__((noreturn)) static inline void sys_exit(long code)
 {
-	syscall3(SYS_EXIT, code, 0, 0);
-	for (;;)
-		;
+        syscall3(SYS_EXIT, code, 0, 0);
+        for (;;)
+                ;
 }
 static inline long sys_write(int fd, const void *buf, size_t len)
 {
-	return syscall3(SYS_WRITE, fd, (long)buf, (long)len);
+        return syscall3(SYS_WRITE, fd, (long)buf, (long)len);
 }
 static inline long sys_getpid(void) { return syscall3(SYS_GETPID, 0, 0, 0); }
 static inline long sys_uptime_ms(void) { return syscall3(SYS_UPTIME_MS, 0, 0, 0); }
@@ -76,27 +91,45 @@ static inline void sys_sleep(long ms) { syscall3(SYS_SLEEP, ms, 0, 0); }
 static inline long sys_setprio(long level) { return syscall3(SYS_SETPRIO, level, 0, 0); }
 static inline long sys_execve(const char *path, char *const argv[], char *const envp[])
 {
-	return syscall3(SYS_EXECVE, (long)path, (long)argv, (long)envp);
+        return syscall3(SYS_EXECVE, (long)path, (long)argv, (long)envp);
 }
 static inline long sys_fork(void) { return syscall3(SYS_FORK, 0, 0, 0); }
 static inline long sys_wait(long pid, int *status, long flags)
 {
-	return syscall3(SYS_WAIT, pid, (long)status, flags);
+        return syscall3(SYS_WAIT, pid, (long)status, flags);
 }
 static inline long sys_kill(long pid, long sig) { return syscall3(SYS_KILL, pid, sig, 0); }
 static inline long sys_signal(long sig, void (*handler)(int))
 {
-	return syscall3(SYS_SIGNAL, sig, (long)handler, 0);
+        return syscall3(SYS_SIGNAL, sig, (long)handler, 0);
 }
 /* The PRISM_W* macros above decode the int *status word filled by sys_wait. */
+
+/* ---- descriptors, pipes, /dev (phase 2.6) ----------------------------- */
+
+static inline long sys_read(int fd, void *buf, size_t len)
+{
+        return syscall3(SYS_READ, fd, (long)buf, (long)len);
+}
+static inline long sys_open(const char *path, unsigned long flags)
+{
+        return syscall3(SYS_OPEN, (long)path, flags, 0);
+}
+static inline long sys_close(int fd) { return syscall3(SYS_CLOSE, fd, 0, 0); }
+static inline long sys_lseek(int fd, long off, long whence)
+{
+        return syscall3(SYS_LSEEK, fd, off, whence);
+}
+static inline long sys_dup(int fd) { return syscall3(SYS_DUP, fd, 0, 0); }
+static inline long sys_pipe(int *fds) { return syscall3(SYS_PIPE, (long)fds, 0, 0); }
 
 /* ---- auxiliary vector ------------------------------------------------- */
 
 enum {
-	AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_PAGESZ = 6,
-	AT_BASE = 7, AT_FLAGS = 8, AT_ENTRY = 9, AT_UID = 11, AT_EUID = 12,
-	AT_GID = 13, AT_EGID = 14, AT_CLKTCK = 17, AT_SECURE = 23,
-	AT_RANDOM = 25, AT_EXECFN = 31,
+        AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_PAGESZ = 6,
+        AT_BASE = 7, AT_FLAGS = 8, AT_ENTRY = 9, AT_UID = 11, AT_EUID = 12,
+        AT_GID = 13, AT_EGID = 14, AT_CLKTCK = 17, AT_SECURE = 23,
+        AT_RANDOM = 25, AT_EXECFN = 31,
 };
 
 extern char **environ;

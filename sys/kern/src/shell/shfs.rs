@@ -31,6 +31,8 @@ fn type_char(t: FileType) -> char {
         FileType::Regular => '-',
         FileType::Dir => 'd',
         FileType::Symlink => 'l',
+        // A device node (phase 2.6): the console / null / zero of /dev.
+        FileType::Dev(_) => 'c',
         FileType::Other => '?',
     }
 }

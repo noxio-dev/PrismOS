@@ -13,10 +13,16 @@
 // sigreturn trampoline) and, in process.rs, `fork` with a copy-on-write
 // address space clone and the blocking `wait`.
 //
+// Phase 2.6: fd.rs -- the descriptor layer.  A fd table per process
+// (0/1/2 on the console), open file descriptions shared by fork and dup,
+// pipes with bounded blocking, the /dev devices, and the six syscalls
+// read / open / close / lseek / dup / pipe (plus `write`, rerouted).
+//
 // usermode.rs also carries the built-in flat test programs; shell/shuser.rs
 // exposes them as `user` / `usertest` / `ps` / `kill`.
 
 pub mod elf;
+pub mod fd;
 pub mod fpu;
 pub mod process;
 pub mod signal;

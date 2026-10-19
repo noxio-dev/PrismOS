@@ -136,14 +136,14 @@ $B/kernel: FORCE
 	@cmp -s $(KERNEL_ELF) $@ || cp -f $(KERNEL_ELF) $@
 FORCE:
 
-# ---- user space (phases 2.4 + 2.5) ------------------------------------------------
+# ---- user space (phases 2.4 + 2.5 + 2.6) ------------------------------------------
 # Programs are static PIE ELF files (the kernel's loader applies the RELATIVE
 # relocations at USER_BASE), linked with page-aligned segments so each one
 # gets its own protection (W^X).  usr/lib = crt0 + mini libc, usr/<name>/<name>.c
 # = one program, installed as /bin/<name> in the ext4 root.
 
 LLD       ?= ld.lld
-USR_PROGS := hello fork
+USR_PROGS := hello fork fd
 USR_CFLAGS := -target x86_64-unknown-none-elf -ffreestanding -fPIE -fno-stack-protector \
               -fno-asynchronous-unwind-tables -fno-math-errno -O2 -Wall -Wextra \
               -nostdinc -isystem $(CCRES) -I usr/include
@@ -188,7 +188,7 @@ root: $B/root.stamp
 $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) $(USR_BINS)
 	rm -rf $B/root
 	mkdir -p $B/root/boot/lua $B/root/boot/defaults $B/root/boot/kernel \
-                 $B/root/bin $B/root/etc $B/root/usr
+                 $B/root/bin $B/root/dev $B/root/etc $B/root/usr
 	cp boot/lua/*.lua $B/root/boot/lua/
 	cp boot/conf/defaults-loader.conf $B/root/boot/defaults/loader.conf
 	cp boot/conf/loader.conf $B/root/boot/loader.conf

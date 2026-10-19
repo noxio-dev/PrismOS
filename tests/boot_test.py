@@ -106,7 +106,8 @@ def main():
 
     hello = ["Hello, world!", "PrismOS kernel", "gdt/tss", "idt", "pic",
              "pit      : channel 0 at 100 Hz", "pmm      :", "vmm      :",
-             "heap     :", "kbd      :", "interrupts enabled", "prism# "]
+             "heap     :", "kbd      :", "interrupts enabled",
+             "vfs      : devfs on /dev", "prism# "]
     scenarios = [
         # BIOS gets a VBE linear framebuffer now: the loader switches to it at the
         # point of no return and the kernel double-buffers its console.
@@ -147,7 +148,7 @@ def main():
           ("pid 5 hello -- exited with status 0", "exec hello fault\r"),
           ("pid 6 hello -- killed by exception 14", "exec hello exit 42\r"),
           ("pid 7 hello -- exited with status 42", "exec notelf\r")],
-         ['argv[2] = "alpha"', "env: PRISMOS=2.5", "main() runs at 0x80", "AT_PAGESZ = 4096",
+         ['argv[2] = "alpha"', "env: PRISMOS=2.6", "main() runs at 0x80", "AT_PAGESZ = 4096",
           "float check: ok",
           "hello chain: pid 2 calls execve()", 'argv[2] = "(after execve)"', 'argv[4] = "y"',
           "execve(/nonexistent)         -> -2", "execve(/boot/loader.conf)    -> -13",
@@ -173,6 +174,37 @@ def main():
           "fork: all 10 passed",
           "pid 1 fork -- exited with status 0",
           "process table empty"], 240),
+        # Phase 2.6: per-process descriptors on the VFS, pipes, /dev.
+        # /bin/fd (built like /bin/hello and /bin/fork) exercises them end to
+        # end: stdio through the table, file offsets with lseek, the /dev
+        # devices (null EOF, zero zeroes, console write), pipes (round trip,
+        # FIFO order, blocking until a forked writer writes, EOF / EPIPE),
+        # descriptor inheritance across fork (shared file offset, bytes
+        # handed back through an inherited pipe), dup (shared description,
+        # the close(1) + open renumbering trick), a real read of fd 0 from
+        # the serial line, and fds surviving execve.  The `ls /dev` and
+        # `mount` steps check the namespace side (devfs, the mount table).
+        ("BIOS shell: descriptors, pipes, /dev (phase 2.6)", bios_cmd,
+         [("prism# ", "exec fd\r"),
+          ("type 4 bytes:", "wxyz\r"),
+          ("prism# ", "ps\r"),
+          ("prism# ", "ls /dev\r"),
+          ("prism# ", "mount\r"),
+          ("prism# ", "df\r")],
+         ["fd (pid 1): descriptors, pipes and /dev",
+          "stdio     ok", "file      ok", "dev       ok", "pipe      ok",
+          "pblock    ok", "epipe     ok", "forkfd    ok", "dups      ok",
+          "stdin     ok", "execfd    ok",
+          "fd: all 10 passed",
+          "read blocked", "parent read \"0123\", child (shared offset) \"4567\"",
+          "(written to /dev/console)",
+          "(written to a dup of stdout)",
+          "postexec: stdout survived execve",
+          "postexec: read 4 bytes after execve",
+          "read 4 byte(s): \"wxyz\"",
+          "pid 1 fd -- exited with status 0",
+          "process table empty",
+          "devfs on /dev (devfs, ro)"], 240),
     ]
     if code and vars_ and os.path.exists(code):
         scenarios += [

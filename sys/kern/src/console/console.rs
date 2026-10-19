@@ -98,6 +98,37 @@ struct LogBuf {
     len: usize,
 }
 
+/// Print raw bytes on the console (phase 2.6): every write to the console
+/// device -- fd 1 / fd 2 of a process, `/dev/console`, -- funnels here.
+/// Valid UTF-8 goes through as is; control characters (other than newline /
+/// tab) and invalid sequences print as '?', so a user program cannot inject
+/// terminal escapes into the console.  Incomplete multi-byte sequences are
+/// decoded across the chunk boundaries the callers copy with.
+pub fn write_bytes(mut b: &[u8]) {
+    while !b.is_empty() {
+        let (valid, skip, bad) = match core::str::from_utf8(b) {
+            Ok(s) => (s, b.len(), false),
+            Err(e) => {
+                let v = e.valid_up_to();
+                // SAFETY: from_utf8 vouches for the prefix.
+                let s = unsafe { core::str::from_utf8_unchecked(&b[..v]) };
+                (s, v + e.error_len().unwrap_or(b.len() - v), true)
+            }
+        };
+        for ch in valid.chars() {
+            if ch.is_control() && ch != '\n' && ch != '\t' {
+                crate::kprint!("?");
+            } else {
+                crate::kprint!("{}", ch);
+            }
+        }
+        if bad {
+            crate::kprint!("?");
+        }
+        b = &b[skip.min(b.len())..];
+    }
+}
+
 impl Default for LogBuf {
     fn default() -> Self {
         LogBuf { buf: [0; 1024], len: 0 }

@@ -75,6 +75,7 @@ use crate::arch::intr::IsrFrame;
 use crate::mem::vmm::{self, AddressSpace};
 use crate::user::elf::Loaded;
 use crate::user::fpu::FpuState;
+use crate::user::fd::FdTable;
 use crate::user::signal::{SignalState, SIGCHLD, WNOHANG};
 use crate::user::usermode::{self, Prog, DEFAULT_TIMEOUT_TICKS};
 
@@ -183,6 +184,10 @@ pub struct Process {
     pub fpu: FpuState,
     /// Signal handlers / pending bits (phase 2.5).
     pub signals: SignalState,
+    /// Open file descriptors (phase 2.6): fd -> shared open file
+    /// descriptions (user/fd.rs).  fork copies the table (the descriptions
+    /// themselves are shared), execve keeps it, death releases it.
+    pub fds: FdTable,
     /// The pid a `Waiting` process waits for (0 = any child).
     wait_pid: u64,
     /// Priority level, 0 = best.
@@ -312,6 +317,7 @@ fn spawn_common(
         start,
         fpu: FpuState::new(),
         signals: SignalState::new(),
+        fds: FdTable::with_stdio(),
         wait_pid: 0,
         prio,
         slice_left: SLICE_TICKS,
@@ -392,9 +398,11 @@ pub fn with_pid_mut<R>(pid: u64, f: impl FnOnce(&mut Process) -> R) -> Option<R>
 /// first writer pays for the copy.  The child is a Ready process entered
 /// through its own trampoline with the parent's register frame (rax = 0:
 /// the child's fork returns 0, the parent's returns the child's pid).  The
-/// child keeps the name, priority and signal handlers; it gets a fresh
-/// watchdog budget, a copy of the parent's x87 / SSE state and empty
-/// pending / blocked signal masks.  Returns the child's pid or -ENOMEM.
+/// child keeps the name, priority, signal handlers and the descriptor
+/// table (the descriptions themselves are shared: same file offsets, same
+/// pipe ends -- POSIX); it gets a fresh watchdog budget, a copy of the
+/// parent's x87 / SSE state and empty pending / blocked signal masks.
+/// Returns the child's pid or -ENOMEM.
 pub fn fork_current(frame: &IsrFrame) -> i64 {
     let Some(cur) = current() else { return -EFAULT };
     if cur.aspace.is_none() {
@@ -419,6 +427,9 @@ pub fn fork_current(frame: &IsrFrame) -> i64 {
     let (name, prio, pid_of_parent) = (cur.name.clone(), cur.prio, cur.pid);
     let fpu = cur.fpu.snapshot();
     let signals = cur.signals.fork_copy();
+    // The child shares the parent's open descriptions (Rc bumps): the
+    // tables are separate, what they point at is not.
+    let fds = cur.fds.fork_copy();
     let aspace = {
         let Some(a) = cur.aspace.as_mut() else { return -EFAULT };
         match a.fork_cow() {
@@ -433,10 +444,12 @@ pub fn fork_current(frame: &IsrFrame) -> i64 {
     match spawn_common(name, Some(aspace), Entry::UserFrame(child_frame), (0, 0), 0, prio, pid_of_parent) {
         Ok(pid) => {
             // Single CPU: the child cannot run before we yield, so the fixup
-            // below happens-before its first switch.
+            // below happens-before its first switch.  The stdio table the
+            // spawn built is dropped here, replaced by the parent's copy.
             let _ = with_pid_mut(pid, |c| {
                 c.fpu = fpu;
                 c.signals = signals;
+                c.fds = fds;
             });
             pid as i64
         }
@@ -835,14 +848,17 @@ fn wake_sleepers(now: u64) {
 }
 
 /// Turn a process into a zombie: outcome, death order, address space freed
-/// (its Drop releases the COW-shared leaves, mem/cow.rs).  Everything that
-/// terminates a process funnels here (exit, watchdog, fault containment,
-/// signals, the shell's kill).
+/// (its Drop releases the COW-shared leaves, mem/cow.rs) and descriptors
+/// released (phase 2.6: POSIX closes everything at death -- the last clone
+/// of each description is what closes the file / pipe end).  Everything
+/// that terminates a process funnels here (exit, watchdog, fault
+/// containment, signals, the shell's kill).
 fn zombify_common(p: &mut Process, outcome: Outcome) {
     p.outcome = outcome;
     p.state = State::Zombie;
     p.exit_seq = next_exit_seq();
     drop(p.aspace.take());
+    p.fds.release();
 }
 
 /// Bookkeeping after `pid` died: its children are adopted by the kernel

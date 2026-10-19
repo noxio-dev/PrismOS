@@ -20,6 +20,11 @@ Phase 2.5 adds the Unix trio: `fork` (with copy-on-write), `wait` (zombies,
 blocking, WNOHANG, a Linux-style status word) and basic signals (handlers,
 SIGCHLD, `kill`, a sigreturn trampoline that restores the interrupted context
 register for register).
+Phase 2.6 gives every process its own file descriptors on top of the VFS:
+open file descriptions shared by `fork` and `dup`, pipes (bounded blocking,
+EOF / EPIPE), a `/dev` directory (devfs) with `console`, `null` and `zero`,
+and six new syscalls (`read`, `open`, `close`, `lseek`, `dup`, `pipe`; `write`
+now routes through the table).
 
 | Area                     | State   | Notes                                                                 |
 |--------------------------|---------|-----------------------------------------------------------------------|
@@ -35,6 +40,7 @@ register for register).
 | Processes / scheduler    | done    | PCB, kernel stacks, context switch, kernel threads (2.2); preemptive round-robin on the timer tick, 4 priority levels, `sleep`/`setprio` syscalls, CPU-time watchdog (2.3); FXSAVE state per process (2.4); parent/child links, `fork` + copy-on-write, blocking `wait`, wait-deadlock guard (2.5) |
 | ELF loader / `execve`    | done    | static ELF64 (`ET_EXEC` / static PIE with RELATIVE relocations), W^X segments, System V initial stack with argv / envp / auxv, `execve` syscall, `/bin/hello` demo built from `usr/` (2.4) |
 | fork / wait / signals     | done    | `fork` clones the address space copy-on-write (refcounted shared pages, fault-time copies), `wait` reaps zombies (blocking, WNOHANG, by pid, Linux status word), SIGKILL/SIGTERM/SIGINT/SIGCHLD/SIGUSR1 with per-process handlers delivered at the syscall boundary and restored register-for-register by a sigreturn trampoline (2.5) |
+| Descriptors / pipes / /dev | done   | a fd table per process (0/1/2 on the console), open file descriptions shared by fork / dup (shared offsets, POSIX), pipes with bounded blocking and EOF / EPIPE, devfs on /dev with `console` / `null` / `zero` served by the descriptor layer, syscalls read / open / close / lseek / dup / pipe (2.6) |
 | Networking, USB, SMP     | todo    | not started                                                            |
 
 **Testing.** `make fstest` (11 scenarios against `mke2fs` images, each validated
@@ -48,7 +54,14 @@ fault containment, exit status), and a phase 2.5 scenario (`/bin/fork`:
 copy-on-write isolation, fork pids and status round trips, blocking and WNOHANG
 waits, wait-by-pid, a SIGCHLD handler, a SIGTERM kill, a self-signal whose
 `kill` return value must survive the handler round trip, `execve` from a
-forked child, orphan adoption, `kill` error paths).
+forked child, orphan adoption, `kill` error paths), and a phase 2.6 scenario
+(`/bin/fd`: stdio through the table, lseek with a shared description, the
+`/dev` devices, pipes -- round trip, FIFO order across split reads, blocking
+until a forked writer writes, EOF, EPIPE -- descriptor inheritance across
+fork (the child reads where the parent left off and hands the bytes back
+through an inherited pipe), dup (shared description, the close(1) + open
+renumbering trick), a real read of fd 0 from the serial line, and fds
+surviving `execve`).
 
 **Known limits of phase 1.4.** No journal (writes go straight to disk; a crash
 mid-operation can need an `fsck`; journals that need recovery mount read-only),
@@ -81,7 +94,7 @@ Phase 2 — ring 3 and processes
 - [x] Phase 2.3 — scheduler: preemptive round-robin on the LAPIC timer, then priorities, sleep/wakeup
 - [x] Phase 2.4 — ELF loader: `execve` from the VFS, argv/envp, auxv
 - [x] Phase 2.5 — `fork`, `wait`, `exit`, signals (basic), copy-on-write
-- [ ] Phase 2.6 — file descriptors per process on top of the VFS, pipes, `/dev` (`console`, `null`, `zero`)
+- [x] Phase 2.6 — file descriptors per process on top of the VFS, pipes, `/dev` (`console`, `null`, `zero`)
 
 Phase 3 — POSIX userspace
 - [ ] Phase 3.1 — syscall set for newlib: `open/read/write/lseek/close/stat/dup/pipe/mmap/brk/getcwd/...`
@@ -104,7 +117,7 @@ Phase 5 — self-hosting
 Beyond (nice to have)
 - [ ] networking: virtio-net or e1000, ARP/IP/UDP/TCP, a tiny `ping` and `wget`
 - [ ] USB (xHCI) keyboard and mass storage, NVMe
-- [ ] other file systems: FAT32 R/W in the kernel, tmpfs, devfs
+- [ ] other file systems: FAT32 R/W in the kernel, tmpfs
 - [ ] graphics: framebuffer userspace API, a minimal window system
 - [ ] AArch64 port of the kernel and loader
 
@@ -138,6 +151,55 @@ more at once, `usertest` runs them all (outcome, fault type and page-leak check,
 plus a two-process interleaving, a kernel-thread scenario and the 2.3
 preemption / priority / wake-up scenarios) -- also part of
 `make test`.
+
+## Descriptors, pipes and /dev (phase 2.6)
+
+`user/fd.rs` (the descriptor layer), `fs/devfs.rs` (the /dev directory) and
+the `Opened::Dev` arm of `fs/vfs.rs`; the demo / test program is `/bin/fd`
+(usr/fd).
+
+- **Open file descriptions**: what one `open` produced -- what it is
+  connected to (a slot of the VFS open-file table, a device, one end of a
+  pipe) plus its flags -- is `Rc`-shared.  `fork` hands the child the *same*
+  descriptions (not copies), so file offsets are shared; `dup` adds a second
+  number for the same one; `execve` keeps the table as POSIX says.  Dropping
+  the last clone is what closes the underlying thing, so death (which
+  releases the whole table) closes every descriptor at once.
+- **Per-process tables**: 64 numbers, fd 0/1/2 start on the console (three
+  separate descriptions, like any unix boot), `open` installs at the lowest
+  free number (`-EMFILE` past 63).  `write` (syscall 1) now routes through
+  the table like everything else; the six new calls are 13 `read`, 14 `open`,
+  15 `close`, 16 `lseek`, 17 `dup`, 18 `pipe`.
+- **Files**: the offset and the permission checks live in the VFS slot
+  (`fs/vfs.rs`), so a shared description is shared exactly; `lseek`
+  SET/CUR/END works on any file fd, pipes and devices answer `-ESPIPE`.
+- **/dev (devfs)**: a read-only in-memory file system mounted on /dev at
+  boot, holding `console` (crw--w----), `null` and `zero`.  It only provides
+  the *namespace* -- `open("/dev/console")` resolves to a device node
+  (`FileType::Dev(id)`), and the descriptor layer turns the id into the
+  device that does the I/O.  Console writes go through the sanitising path
+  (no terminal escapes from ring 3), console reads park for a key or a
+  serial byte; null reads EOF and swallows writes; zero produces zeroes.
+- **Pipes**: one 16 KiB ring buffer shared by both ends, plus the count of
+  live descriptions per end, so a reader can tell EOF (`writers == 0`) from
+  would-block, and a writer gets `-EPIPE` (`readers == 0`) instead of
+  blocking forever.  Reads drain in FIFO order, short counts are returned
+  as is.
+- **Blocking**: a pipe read on an empty buffer (writers alive) and a console
+  read with nothing typed park the process -- ~20 ms at a time, re-checked
+  on every wake -- for at most 10 s, then `-EAGAIN`.  The bound is
+  deliberate: the shell is blocked while its children run, so nothing may
+  wait forever (the same rule `sleep` follows).
+
+Limits worth knowing: no O_NONBLOCK / O_CLOEXEC, no dup2 / fcntl, no
+per-process cwd (paths resolve against the shell's, like `execve`'s), no
+getdents (a directory fd opens but cannot be read), no SIGPIPE delivery (a
+readerless write returns `-EPIPE`), and nothing about permissions (single
+user, ring 0).
+
+Shell: `ls /dev` and `mount` show the device directory (`c` type chars,
+devfs read-only); `exec fd` runs the ten phase 2.6 scenarios and prints
+`fd: all 10 passed` -- also part of `make test`.
 
 ## fork, wait and signals (phase 2.5)
 
@@ -346,7 +408,8 @@ Layers (all in `sys/kern/src/`):
 |---------------|-------------------------------------------------------------------|
 | `vfs.rs`      | `FileSystem` trait, mount table, path walk (symlinks, `..`, mount points), open-file table (`open/read/write/seek/close`) |
 | `ext4/`       | the driver: `mod.rs` (mount, block cache, inodes), `balloc.rs` (group descriptors, bitmaps, allocators), `extent.rs` (extent trees, file data), `dir.rs`, `ops.rs` (create, mkdir, rename, link, ...), `crc.rs` |
-| `fsys.rs`     | kernel glue: global VFS, cwd, GPT partition scan, boot-time mount, RTC clock |
+| `devfs.rs`    | the /dev device directory (phase 2.6): console, null, zero nodes |
+| `fsys.rs`     | kernel glue: global VFS, cwd, GPT partition scan, boot-time mounts (ext4 root, devfs on /dev), RTC clock |
 | `shfs.rs`     | shell commands                                                    |
 
 ext4 support: extents (or classic block maps for reading), 32/64-bit

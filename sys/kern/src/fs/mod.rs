@@ -7,8 +7,10 @@
 //             table.  It only depends on `alloc` / `core` (and hw/blk.rs), so
 //             tests/fstest builds it on the host together with ext4/.
 //   ext4/     the ext2/3/4 driver
+//   devfs.rs  the /dev device directory (phase 2.6): console, null, zero
 //   fsys.rs   kernel glue: global VFS, cwd, GPT scan, boot-time mount, clock
 
+pub mod devfs;
 pub mod ext4;
 pub mod fsys;
 pub mod vfs;
