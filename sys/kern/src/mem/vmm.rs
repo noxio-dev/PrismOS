@@ -52,6 +52,12 @@ pub const USER_END: u64 = 128 << 39;
 pub const USER_CODE_BASE: u64 = USER_BASE;
 /// Initial user RSP; the stack grows down, the page under it is a guard.
 pub const USER_STACK_TOP: u64 = USER_END;
+/// The signal-return trampoline page (phase 2.5): 16 bytes of r-x code at a
+/// fixed address far above any loaded image (<= 64 MiB span) and far below
+/// the stack, mapped into every user address space.  A signal handler
+/// "returns" onto this code, which makes the `sigreturn` syscall; the kernel
+/// then restores the register state it pushed on the user stack at delivery.
+pub const USER_SIGCODE: u64 = USER_BASE + (256 << 20);
 
 // PTE bits
 const P: u64 = 1;
@@ -59,6 +65,11 @@ const RW: u64 = 2;
 const US: u64 = 4;
 const PS: u64 = 0x80;
 const NX: u64 = 1 << 63;
+/// Software-available PTE bit 9: the page is shared copy-on-write.  On such
+/// a page the RW bit is cleared (even for writable data), so the first write
+/// raises #PF; the handler (below) resolves it by copying (or re-arming RW
+/// when the page has become exclusively owned again).
+const COW: u64 = 1 << 9;
 
 /// PML4 slots (0..256) the kernel owns in every address space.  Filled once
 /// at the end of `init` so user spaces share them and never reuse them.
@@ -577,7 +588,8 @@ unsafe fn walk_user(table: u64, idx: usize) -> Option<u64> {
 
 /// Free a page-table subtree and every leaf page below it.  `level` is the
 /// level of `table` itself (3 = PDPT, 2 = PD, 1 = PT whose entries are the
-/// user's own pages).
+/// user's own pages).  Leaves shared with another address space (phase 2.5
+/// fork / copy-on-write) only drop their refcount.
 unsafe fn free_tree(table: u64, level: u32) {
     for i in 0..512usize {
         let e = tr_live(table, i);
@@ -586,7 +598,9 @@ unsafe fn free_tree(table: u64, level: u32) {
         }
         let child = e & PHYS_MASK;
         if level == 1 {
-            crate::mem::pmm::free_page(child);
+            if crate::mem::cow::release(child) {
+                crate::mem::pmm::free_page(child);
+            }
         } else if e & PS == 0 {
             free_tree(child, level - 1);
         }
@@ -791,6 +805,219 @@ impl AddressSpace {
         }
         true
     }
+
+    // ---- copy-on-write (phase 2.5) ---------------------------------------
+
+    /// Resolve copy-on-write at `virt` (when the page is a shared COW leaf)
+    /// and report whether the page is writable afterwards.  This is how the
+    /// kernel writes into user memory that a fork may have turned read-only
+    /// (the wait status word, the signal delivery frames) -- without it, a
+    /// plain `write` on a COW page would either fail (it must not) or
+    /// bypass the copy (it must never: the sibling would see the change).
+    ///
+    /// # Safety
+    /// Must run in the owning process's context (its CR3 live, interrupts
+    /// masked): `handle_cow_fault` needs the right TLB context for invlpg.
+    pub fn ensure_writable(&self, virt: u64) -> bool {
+        // SAFETY: as the safety contract.
+        unsafe {
+            let _ = self.handle_cow_fault(virt);
+        }
+        matches!(self.translate(virt), Some((_, true)))
+    }
+
+    /// Address of the PT entry mapping `virt` (through the direct map), or
+    /// None when any level is missing / a huge page is in the way.
+    fn pte_slot(&self, virt: u64) -> Option<u64> {
+        if !user_range_ok(virt, 1) {
+            return None;
+        }
+        let i4 = ((virt >> 39) & 0x1FF) as usize;
+        if slot_is_kernel(i4) {
+            return None;
+        }
+        let i3 = ((virt >> 30) & 0x1FF) as usize;
+        let i2 = ((virt >> 21) & 0x1FF) as usize;
+        let i1 = ((virt >> 12) & 0x1FF) as usize;
+        // SAFETY: read-only walk through the direct map.
+        unsafe {
+            let e = tr_live(self.pml4, i4);
+            if e & P == 0 {
+                return None;
+            }
+            let e = tr_live(e & PHYS_MASK, i3);
+            if e & P == 0 || e & PS != 0 {
+                return None;
+            }
+            let e = tr_live(e & PHYS_MASK, i2);
+            if e & P == 0 || e & PS != 0 {
+                return None;
+            }
+            let pt = e & PHYS_MASK;
+            if tr_live(pt, i1) & P == 0 {
+                return None;
+            }
+            Some(DIRECT_MAP_BASE + pt + i1 as u64 * 8)
+        }
+    }
+
+    /// Duplicate the user half for `fork`: every present leaf page is mapped
+    /// at the same virtual address into a fresh PML4.  Pages that were
+    /// writable become read-only + COW in *both* spaces (each side copies on
+    /// its first write); pages that were already read-only (code, rodata) are
+    /// shared as is -- every shared leaf gets a refcount, so whichever space
+    /// dies first only drops the count.  The intermediate tables are fresh
+    /// allocations (walk_user creates them on the child's path).
+    ///
+    /// On a partial failure the freshly built child tables are dropped by
+    /// RAII and the caller stays valid: parent pages already turned read-only
+    /// keep their COW bit, but with no other owner the next write fault
+    /// simply re-arms RW (see `handle_cow_fault`), so no rollback is needed.
+    ///
+    /// The caller runs in the parent's context; the TLB entries of the pages
+    /// turned read-only are flushed before returning (CR3 reload).
+    pub fn fork_cow(&mut self) -> Option<AddressSpace> {
+        let child = AddressSpace::new()?;
+        // SAFETY: both trees are reached through the direct map; the child is
+        // exclusively ours until we return it, the parent is only mutated at
+        // its leaf entries.
+        unsafe {
+            let mut ok = true;
+            for i in 0..256usize {
+                if slot_is_kernel(i) {
+                    continue;
+                }
+                let e = tr_live(self.pml4, i);
+                if e & P == 0 {
+                    continue;
+                }
+                match walk_user(child.pml4, i) {
+                    Some(sub) => {
+                        if !fork_tree(e & PHYS_MASK, sub, 3) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                return None;
+            }
+            // The parent's PTEs changed: drop the stale writable entries.
+            let cr3 = crate::arch::regs::read_cr3();
+            crate::arch::regs::write_cr3(cr3);
+        }
+        Some(child)
+    }
+
+    /// Resolve a write #PF on a COW page of the *currently running* address
+    /// space (the faulting process's tables must be the live ones).  Returns
+    /// true when handled -- the faulting store re-executes -- and false when
+    /// `cr2` is not a copy-on-write page (a genuine protection violation).
+    ///
+    /// # Safety
+    /// Interrupts masked (interrupt-gate #PF path); called with the faulting
+    /// process's CR3 active so the invlpg targets the right PCID context.
+    pub unsafe fn handle_cow_fault(&self, cr2: u64) -> bool {
+        let Some(slot) = self.pte_slot(cr2) else { return false };
+        // SAFETY: the slot points at a present PTE of this address space.
+        let pte = unsafe { (slot as *const u64).read_volatile() };
+        if pte & P == 0 || pte & COW == 0 {
+            return false; // not ours: a real protection fault
+        }
+        let phys = pte & PHYS_MASK;
+        let va = cr2 & !(PAGE - 1);
+        if crate::mem::cow::refcount(phys) <= 1 {
+            // No other owner (the sibling died, or the fork failed halfway):
+            // the page is exclusively ours again, just make it writable.
+            // SAFETY: present leaf slot of this space.
+            unsafe { (slot as *mut u64).write_volatile((pte | RW) & !COW) };
+        } else {
+            // Shared: copy it.  No room -> the caller reports the fault.
+            let Some(fresh) = crate::mem::pmm::alloc_page() else { return false };
+            let (src, dst) = match (phys_access(phys), phys_access(fresh)) {
+                (Some(s), Some(d)) => (s, d),
+                _ => {
+                    crate::mem::pmm::free_page(fresh);
+                    return false;
+                }
+            };
+            // SAFETY: both are kernel aliases of whole, distinct pages.
+            unsafe { core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, PAGE as usize) };
+            // SAFETY: present leaf slot of this space; the new entry keeps
+            // the flags (US, NX...) minus COW plus RW.
+            unsafe {
+                (slot as *mut u64).write_volatile(fresh | ((pte | RW) & !COW & !PHYS_MASK));
+                // One less owner for the old page.
+                let _ = crate::mem::cow::release(phys);
+            }
+        }
+        // SAFETY: the TLB may hold the old (read-only) entry.
+        unsafe { crate::arch::regs::invlpg(va) };
+        true
+    }
+
+    /// Map the signal-return trampoline page (r-x, private copy): the 16
+    /// bytes of code a handler "returns" into, making the `sigreturn`
+    /// syscall.  Fresh address spaces get it from the loader (elf.rs /
+    /// usermode.rs); fork children inherit it through the COW clone.
+    pub fn map_sigcode(&mut self) -> bool {
+        if !self.alloc_map(USER_SIGCODE, PAGE, false, true) {
+            return false;
+        }
+        // mov eax, 12 (SYS_SIGRETURN); syscall; ud2 -- position independent,
+        // no relocations, exactly the ABI the dispatch expects.
+        const CODE: [u8; 9] = [0xb8, 0x0c, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x0f, 0x0b];
+        self.write(USER_SIGCODE, &CODE, true)
+    }
+}
+
+/// Clone one user subtree for `fork` (phase 2.5): every present entry of
+/// `src` is duplicated into `dst`, which starts empty.  `level` follows the
+/// `free_tree` convention (3 = PDPT, 2 = PD, 1 = PT, whose entries are the
+/// process's own pages).  At level 1 the leaf is shared: the refcount table
+/// gains an owner and both PTEs (parent's and child's) are rewritten
+/// read-only + COW, so whichever side writes first pays for the copy.
+///
+/// # Safety
+/// `src` is a user subtree of a live space, `dst` a fresh, empty table
+/// reachable through the direct map; interrupts must be masked.
+unsafe fn fork_tree(src: u64, dst: u64, level: u32) -> bool {
+    for i in 0..512usize {
+        let e = tr_live(src, i);
+        if e & P == 0 {
+            continue;
+        }
+        if level == 1 {
+            let phys = e & PHYS_MASK;
+            if !crate::mem::cow::track(phys) {
+                return false; // out of kernel heap: abort, self-heals
+            }
+            if e & RW != 0 {
+                // Writable data page: read-only + COW on both sides, the
+                // first writer pays for the copy.
+                tw_live(src, i, (e & !RW) | COW);
+                tw_live(dst, i, (e & !RW) | COW);
+            } else {
+                // Read-only page (code, rodata): shared as is -- no COW bit,
+                // a write stays a protection violation.
+                tw_live(dst, i, e);
+            }
+        } else {
+            if e & PS != 0 {
+                return false; // user spaces never map huge pages
+            }
+            let Some(sub) = walk_user(dst, i) else { return false };
+            if !fork_tree(e & PHYS_MASK, sub, level - 1) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 impl Drop for AddressSpace {

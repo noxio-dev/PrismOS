@@ -23,7 +23,7 @@
 // `AT_PAGESZ`, `AT_ENTRY`, `AT_RANDOM`, `AT_EXECFN`, ... terminated by
 // `AT_NULL`); the strings themselves sit above, at the top of the stack.
 
-use crate::mem::vmm::{AddressSpace, PAGE, USER_BASE, USER_CODE_BASE, USER_END, USER_STACK_TOP};
+use crate::mem::vmm::{AddressSpace, PAGE, USER_BASE, USER_CODE_BASE, USER_END, USER_SIGCODE, USER_STACK_TOP};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -275,6 +275,11 @@ pub fn load(image: &[u8], execfn: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>]) -> 
     if load_lo < USER_BASE || load_hi > stack_bottom - PAGE || load_hi < load_lo {
         return Err(ExecError::Unsupported("segments outside user address space"));
     }
+    // The signal-return trampoline page (phase 2.5) is mapped at a fixed
+    // address; an image reaching it would collide with the kernel's code.
+    if page_down(vmm_sigcode()) <= load_hi && load_lo <= page_up(vmm_sigcode()).unwrap() {
+        return Err(ExecError::Unsupported("segments overlap the signal trampoline page"));
+    }
     // Segments must not share a page (each page has one protection).
     for w in segs.windows(2) {
         let prev_end = page_up(w[0].vaddr + w[0].memsz).unwrap();
@@ -322,7 +327,18 @@ pub fn load(image: &[u8], execfn: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>]) -> 
         return Err(ExecError::NoMemory);
     }
     let rsp = build_stack(&aspace, stack_bottom, argv, envp, execfn, entry, phdr_addr, e_phnum)?;
+    // ---- signal-return trampoline (phase 2.5): one r-x page holding the
+    // `sigreturn` code a handler returns into.  A fork child inherits it
+    // shared through the copy-on-write clone.
+    if !aspace.map_sigcode() {
+        return Err(ExecError::NoMemory);
+    }
     Ok(Loaded { aspace, entry, rsp, argc: argv.len(), image_end: load_hi })
+}
+
+/// The trampoline address as a plain value (import gymnastics-free).
+fn vmm_sigcode() -> u64 {
+    USER_SIGCODE
 }
 
 /// Apply the `R_X86_64_RELATIVE` relocations listed by `DT_RELA`.

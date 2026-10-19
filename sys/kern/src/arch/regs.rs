@@ -79,3 +79,14 @@ pub fn read_rsp() -> u64 {
     unsafe { asm!("mov {}, rsp", out(reg) v, options(nomem, preserves_flags)) };
     v
 }
+
+/// Invalidate the TLB entry (all paging-mode caches) of one page.
+///
+/// # Safety
+/// Privileged instruction; `v` must be a canonical address the caller has a
+/// reason to flush.
+#[inline]
+pub unsafe fn invlpg(v: u64) {
+    // SAFETY: deliberate TLB invalidation.
+    unsafe { asm!("invlpg [{}]", in(reg) v, options(nostack, preserves_flags)) };
+}

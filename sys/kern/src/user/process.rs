@@ -69,11 +69,13 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::naked_asm;
 use core::ptr::addr_of_mut;
+use core::sync::atomic::Ordering;
 
 use crate::arch::intr::IsrFrame;
 use crate::mem::vmm::{self, AddressSpace};
 use crate::user::elf::Loaded;
 use crate::user::fpu::FpuState;
+use crate::user::signal::{SignalState, SIGCHLD, WNOHANG};
 use crate::user::usermode::{self, Prog, DEFAULT_TIMEOUT_TICKS};
 
 pub use crate::user::usermode::Outcome;
@@ -92,6 +94,10 @@ pub const SLICE_TICKS: u32 = 2;
 /// process sleeps, so an absurd request must not wedge the machine.
 pub const MAX_SLEEP_MS: u64 = 10_000;
 
+const EFAULT: i64 = 14;
+const ECHILD: i64 = 10;
+const ENOMEM: i64 = 12;
+
 // ------------------------------------------------------------------- state
 
 /// Life cycle of a process.
@@ -103,6 +109,8 @@ pub enum State {
     Running,
     /// Parked by `sleep` until `wake_at`.
     Sleeping,
+    /// Parked by `wait` until a matching child dies (phase 2.5).
+    Waiting,
     /// Terminated; resources freed by the reaper, outcome kept for the shell.
     Zombie,
 }
@@ -136,9 +144,13 @@ impl SavedCtx {
 }
 
 /// What a process runs.  Kernel entries are for in-kernel worker/demo
-/// threads; user entries describe the initial ring 3 context.
+/// threads; user entries describe the initial ring 3 context -- a flat
+/// image started from its first byte, or (phase 2.5, `fork`) a whole
+/// register frame captured at the fork point.
 pub enum Entry {
     User,
+    /// A `fork` child: the parent's syscall frame with rax = 0.
+    UserFrame(IsrFrame),
     Kernel(fn()),
 }
 
@@ -146,6 +158,9 @@ pub enum Entry {
 pub struct Process {
     /// Sequential process id (0 belongs to the kernel itself).
     pub pid: u64,
+    /// Parent pid (phase 2.5): 0 for processes started by the kernel / the
+    /// shell, which also adopts the orphans of dead parents.
+    pub ppid: u64,
     /// Program name (shell display, `ps`); `execve` renames the process.
     pub name: String,
     /// Life cycle state.
@@ -166,6 +181,10 @@ pub struct Process {
     start: (u64, u64),
     /// x87 / SSE registers while the process is off the CPU.
     pub fpu: FpuState,
+    /// Signal handlers / pending bits (phase 2.5).
+    pub signals: SignalState,
+    /// The pid a `Waiting` process waits for (0 = any child).
+    wait_pid: u64,
     /// Priority level, 0 = best.
     pub prio: u8,
     /// Ticks left in the current time slice.
@@ -250,7 +269,8 @@ pub fn count() -> usize {
 // ------------------------------------------------------------------ spawn
 
 /// Create a process, ready to be scheduled.  `timeout_ticks` is the
-/// watchdog budget (0 = default 3 s).
+/// watchdog budget (0 = default 3 s); `ppid` is the parent (0 = the
+/// kernel / shell itself).
 fn spawn_common(
     name: String,
     aspace: Option<AddressSpace>,
@@ -258,6 +278,7 @@ fn spawn_common(
     start: (u64, u64),
     timeout_ticks: u64,
     prio: u8,
+    ppid: u64,
 ) -> Result<u64, &'static str> {
     if prio >= PRIO_LEVELS {
         return Err("bad priority");
@@ -279,6 +300,7 @@ fn spawn_common(
 
     let proc = Process {
         pid: 0, // assigned below, under the interrupt guard
+        ppid,
         name,
         state: State::Ready,
         outcome: Outcome::None,
@@ -289,6 +311,8 @@ fn spawn_common(
         entry: Some(entry),
         start,
         fpu: FpuState::new(),
+        signals: SignalState::new(),
+        wait_pid: 0,
         prio,
         slice_left: SLICE_TICKS,
         used: 0,
@@ -324,19 +348,248 @@ pub fn spawn_user_prio(prog: &Prog, prio: u8) -> Result<u64, &'static str> {
     // (RAII: its Drop frees the user half through the direct map).
     let aspace = usermode::build_aspace(prog.image())?;
     let start = (vmm::USER_CODE_BASE, vmm::USER_STACK_TOP);
-    spawn_common(String::from(prog.name), Some(aspace), Entry::User, start, prog.timeout, prio)
+    spawn_common(String::from(prog.name), Some(aspace), Entry::User, start, prog.timeout, prio, 0)
 }
 
 /// Spawn a process from a loaded ELF image (phase 2.4).
 pub fn spawn_loaded(name: String, prog: Loaded, prio: u8) -> Result<u64, &'static str> {
-    spawn_common(name, Some(prog.aspace), Entry::User, (prog.entry, prog.rsp), 0, prio)
+    spawn_common(name, Some(prog.aspace), Entry::User, (prog.entry, prog.rsp), 0, prio, 0)
 }
 
 /// Spawn a kernel thread (runs `f` in ring 0 on its own kernel stack).
 /// Kernel threads have no watchdog and are never preempted: they must
 /// cooperate on their own.
 pub fn spawn_kernel(name: &'static str, f: fn()) -> Result<u64, &'static str> {
-    spawn_common(String::from(name), None, Entry::Kernel(f), (0, 0), 0, PRIO_DEFAULT)
+    spawn_common(String::from(name), None, Entry::Kernel(f), (0, 0), 0, PRIO_DEFAULT, 0)
+}
+
+/// Run `f` on the process with the given pid, if it is in the table.
+/// Interrupts are masked for the walk (the tick shares the table).
+pub fn with_pid_mut<R>(pid: u64, f: impl FnOnce(&mut Process) -> R) -> Option<R> {
+    let flags = crate::arch::io::cli_save();
+    // SAFETY: interrupts masked; the callback must not switch away.
+    let r = unsafe {
+        let table = &mut *addr_of_mut!(TABLE);
+        let mut r = None;
+        for p in table.iter_mut() {
+            if p.pid == pid {
+                r = Some(f(p));
+                break;
+            }
+        }
+        r
+    };
+    // SAFETY: flags came from cli_save on this stack.
+    unsafe { crate::arch::io::restore_flags(flags) };
+    r
+}
+
+// ---------------------------------------------------------- fork (phase 2.5)
+
+/// `fork()` (syscall 8): duplicate the calling process.  The address space
+/// is cloned copy-on-write (mem/vmm.rs): no data page is copied up front,
+/// every writable page is turned read-only + COW in both spaces and the
+/// first writer pays for the copy.  The child is a Ready process entered
+/// through its own trampoline with the parent's register frame (rax = 0:
+/// the child's fork returns 0, the parent's returns the child's pid).  The
+/// child keeps the name, priority and signal handlers; it gets a fresh
+/// watchdog budget, a copy of the parent's x87 / SSE state and empty
+/// pending / blocked signal masks.  Returns the child's pid or -ENOMEM.
+pub fn fork_current(frame: &IsrFrame) -> i64 {
+    let Some(cur) = current() else { return -EFAULT };
+    if cur.aspace.is_none() {
+        return -EFAULT; // a kernel thread cannot fork
+    }
+    // Rough pre-check: the COW clone needs its own page-table tree (PML4
+    // plus one table per 2 MiB of image).  The walk also fails per page
+    // under pressure, which self-heals (no child, parent COW bits clear
+    // themselves on the next write).
+    {
+        let free = crate::mem::pmm::stats_snapshot().free_pages.load(Ordering::Relaxed);
+        if free < 64 {
+            return -ENOMEM;
+        }
+    }
+    // Capture the live FPU state first: the registers still hold what the
+    // parent's user code last executed.
+    // SAFETY: the FPU is enabled for user processes (usermode::init), and
+    // the kernel itself is soft-float.
+    unsafe { cur.fpu.save() };
+
+    let (name, prio, pid_of_parent) = (cur.name.clone(), cur.prio, cur.pid);
+    let fpu = cur.fpu.snapshot();
+    let signals = cur.signals.fork_copy();
+    let aspace = {
+        let Some(a) = cur.aspace.as_mut() else { return -EFAULT };
+        match a.fork_cow() {
+            Some(c) => c,
+            None => return -ENOMEM,
+        }
+    };
+    // The child resumes as if fork() had just returned 0.
+    let mut child_frame = *frame;
+    child_frame.rax = 0;
+    child_frame.rflags = (child_frame.rflags | 0x200) & !0x100; // IF on, TF off
+    match spawn_common(name, Some(aspace), Entry::UserFrame(child_frame), (0, 0), 0, prio, pid_of_parent) {
+        Ok(pid) => {
+            // Single CPU: the child cannot run before we yield, so the fixup
+            // below happens-before its first switch.
+            let _ = with_pid_mut(pid, |c| {
+                c.fpu = fpu;
+                c.signals = signals;
+            });
+            pid as i64
+        }
+        Err(_) => -ENOMEM,
+    }
+}
+
+// ---------------------------------------------------------- wait (phase 2.5)
+
+/// The wait() status word for an outcome (the Linux encoding): exit status
+/// in bits 8..15, the killing signal in bits 0..6.
+pub fn wait_status(o: Outcome) -> u16 {
+    match o {
+        Outcome::Exited(c) => (((c & 0xff) << 8) & 0xff00) as u16,
+        Outcome::Fault { vector, .. } => {
+            let sig = match vector {
+                0 | 16 | 19 => 8,  // #DE / x87 / SIMD -> SIGFPE
+                6 => 4,             // #UD -> SIGILL
+                _ => 11,            // the rest is memory-ish -> SIGSEGV
+            };
+            sig as u16
+        }
+        Outcome::Timeout | Outcome::Killed => 9, // SIGKILL
+        Outcome::Signaled(s) => (s & 0x7f) as u16,
+        Outcome::None => 0,
+    }
+}
+
+/// Read the outcome of `pid` from the table.
+fn outcome_of(pid: u64) -> Outcome {
+    let flags = crate::arch::io::cli_save();
+    // SAFETY: read-only walk with interrupts masked.
+    let o = unsafe {
+        let table = &*addr_of_mut!(TABLE);
+        let mut o = Outcome::None;
+        for p in table.iter() {
+            if p.pid == pid {
+                o = p.outcome;
+                break;
+            }
+        }
+        o
+    };
+    // SAFETY: as cli_save.
+    unsafe { crate::arch::io::restore_flags(flags) };
+    o
+}
+
+/// Free the kernel stack of a process taken out of the table, then drop the
+/// PCB.  The address space is already gone (zombify took it).
+fn drop_reaped(p: Box<Process>) {
+    // SAFETY: the layout is the one the stack was allocated with; nobody
+    // can be running on it (it left the table, the CPU is elsewhere).
+    unsafe {
+        dealloc(p.kstack, Layout::from_size_align(KSTACK_SIZE, 4096).unwrap());
+    }
+    drop(p);
+}
+
+/// `wait(pid, status_ptr, flags)` (syscall 9): reap a child.  `pid` is a
+/// child pid, or 0 / (u64)-1 for "any child"; `flags` & 1 is WNOHANG.
+/// Blocks (State::Waiting, woken by the child's death) when children exist
+/// but none has died yet.  Returns the reaped pid, 0 for WNOHANG with a
+/// living child, -ECHILD with no matching child, -EFAULT for an unwritable
+/// status word.
+pub fn wait_current(pid_arg: u64, status_ptr: u64, flags: u64) -> i64 {
+    let Some(cur0) = current() else { return -EFAULT };
+    let me = cur0.pid;
+    drop(cur0);
+    let want = if pid_arg == 0 || pid_arg == u64::MAX { 0 } else { pid_arg };
+    let wnohang = flags & WNOHANG != 0;
+    loop {
+        // One matching zombie child, if any, and whether children exist.
+        // SAFETY: syscall context, IF=0; read-only walk.
+        let (zpid, have_kids) = unsafe {
+            let table = &*addr_of_mut!(TABLE);
+            let mut zpid = None;
+            let mut have_kids = false;
+            for q in table.iter() {
+                if q.ppid != me {
+                    continue;
+                }
+                if want != 0 && q.pid != want {
+                    continue;
+                }
+                have_kids = true;
+                if q.state == State::Zombie {
+                    zpid = Some(q.pid);
+                    break;
+                }
+            }
+            (zpid, have_kids)
+        };
+        let Some(zpid) = zpid else {
+            if !have_kids {
+                return -ECHILD;
+            }
+            if wnohang {
+                return 0;
+            }
+            // Park until a matching child dies; zombify flips us back to
+            // Ready and the scheduler (main loop or a peer) switches to us.
+            // SAFETY: syscall context, IF=0, we are CURRENT.
+            unsafe {
+                let cur = CURRENT;
+                (*cur).wait_pid = want;
+                (*cur).state = State::Waiting;
+                match pick_ready((*cur).pid, u8::MAX) {
+                    Some(next) => {
+                        cpu_state_for(next);
+                        switch_ctx(&mut (*cur).saved, &(*next).saved);
+                    }
+                    None => switch_to_main(&mut (*cur).saved),
+                }
+                (*CURRENT).state = State::Running;
+            }
+            continue; // re-scan with the fresh table
+        };
+
+        // Write the status word first: on a bad pointer the child stays
+        // reapable and the caller gets -EFAULT (Linux keeps it too).
+        if status_ptr != 0 {
+            let Some(cur) = current() else { return -EFAULT };
+            let Some(aspace) = cur.aspace.as_ref() else { return -EFAULT };
+            // The word may sit on a page the fork turned copy-on-write:
+            // resolve it so the plain write below succeeds.
+            if !aspace.ensure_writable(status_ptr) {
+                return -EFAULT;
+            }
+            let st = wait_status(outcome_of(zpid)) as u32;
+            if !aspace.write(status_ptr, &st.to_le_bytes(), false) {
+                return -EFAULT;
+            }
+        }
+        // Take it out and free its kernel stack.
+        // SAFETY: the zombie is not on the CPU; removal under IF=0.
+        let mut removed: Option<Box<Process>> = None;
+        unsafe {
+            let table = &mut *addr_of_mut!(TABLE);
+            let mut i = 0;
+            while i < table.len() {
+                if table[i].pid == zpid {
+                    removed = Some(table.remove(i));
+                    break;
+                }
+                i += 1;
+            }
+        }
+        if let Some(p) = removed {
+            drop_reaped(p);
+        }
+        return zpid as i64;
+    }
 }
 
 // ----------------------------------------------------------- context switch
@@ -405,6 +658,18 @@ extern "C" fn proc_start() -> ! {
             // SAFETY: fully initialised ring 3 frame; interrupts masked, so
             // no window between the (kernel) GS hand-off and iretq.
             unsafe { usermode::iretq_to_user(&mut frame) }
+        }
+        Some(Entry::UserFrame(mut f)) => {
+            // A fork child (phase 2.5): the parent's syscall frame, rax = 0.
+            // It was sanitised at fork time; the ring 3 selectors are kept
+            // as a belt-and-braces invariant.
+            if f.cs & 3 != 3 {
+                f.cs = crate::arch::gdt::USER_CS as u64 + 3;
+                f.ss = crate::arch::gdt::USER_DS as u64 + 3;
+            }
+            // SAFETY: the frame holds a full ring 3 context, interrupts
+            // masked until iretq turns them back on in ring 3.
+            unsafe { usermode::iretq_to_user(&mut f) }
         }
         Some(Entry::Kernel(f)) => {
             f();
@@ -569,11 +834,64 @@ fn wake_sleepers(now: u64) {
     }
 }
 
+/// Turn a process into a zombie: outcome, death order, address space freed
+/// (its Drop releases the COW-shared leaves, mem/cow.rs).  Everything that
+/// terminates a process funnels here (exit, watchdog, fault containment,
+/// signals, the shell's kill).
+fn zombify_common(p: &mut Process, outcome: Outcome) {
+    p.outcome = outcome;
+    p.state = State::Zombie;
+    p.exit_seq = next_exit_seq();
+    drop(p.aspace.take());
+}
+
+/// Bookkeeping after `pid` died: its children are adopted by the kernel
+/// (ppid 0, the shell reaps them), a parent parked in `wait` is woken when
+/// the child matches, and a listening parent gets a pending SIGCHLD.
+///
+/// # Safety
+/// Interrupts masked; called after the dying process was zombified.
+unsafe fn after_death(pid: u64) {
+    // SAFETY: as the safety contract.
+    unsafe {
+        let table = &mut *addr_of_mut!(TABLE);
+        // 1. find the parent (it zombified already, so its ppid is final)
+        let mut ppid = 0;
+        for q in table.iter() {
+            if q.pid == pid {
+                ppid = q.ppid;
+                break;
+            }
+        }
+        // 2. orphans: the kernel / shell adopts them
+        for q in table.iter_mut() {
+            if q.ppid == pid && q.state != State::Zombie {
+                q.ppid = 0;
+            }
+        }
+        // 3. wake the waiting parent / raise SIGCHLD
+        if ppid != 0 {
+            for q in table.iter_mut() {
+                if q.pid == ppid && q.state != State::Zombie {
+                    if q.state == State::Waiting && (q.wait_pid == 0 || q.wait_pid == pid) {
+                        q.state = State::Ready;
+                    }
+                    if q.signals.handlers[SIGCHLD as usize] != 0 {
+                        q.signals.pending |= 1 << SIGCHLD;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// End the current process and go back to the main context.  Never returns
 /// to the caller: the process is a zombie, the scheduler will not pick it
-/// again; its kernel stack is freed by the reaper.  The address space is
-/// freed here (its Drop walks the tables through the shared direct map, so
-/// it works from any of our CR3s).
+/// again; its kernel stack is freed by the reaper (or by its parent's
+/// `wait`).  The address space is freed here (its Drop walks the tables
+/// through the shared direct map, so it works from any of our CR3s), the
+/// parent is woken and told, the children are adopted.
 pub fn exit_current(outcome: Outcome) -> ! {
     // SAFETY: the running process exists; interrupts are masked on every
     // exit path (syscall SFMASK, exception entry, tick handler).
@@ -585,18 +903,92 @@ pub fn exit_current(outcome: Outcome) -> ! {
             crate::kprintln!("\nkernel: exit with no running process, parking");
             crate::arch::intr::park();
         }
-        let p = &mut *cur;
-        p.outcome = outcome;
-        p.state = State::Zombie;
-        p.exit_seq = next_exit_seq();
-        // Free the user half now; the kernel stack is still in use -- the
-        // reaper frees it from the main context once we are off it.
-        drop(p.aspace.take());
+        let pid = (*cur).pid;
+        {
+            let p = &mut *cur;
+            zombify_common(p, outcome);
+        }
+        after_death(pid);
         // Abandon this stack; execution continues in run_until_idle.
         switch_to_main(&mut (*cur).saved);
         // Only reachable if a bug resurrected a zombie: park defensively.
         crate::arch::intr::park();
     }
+}
+
+/// True when `pid` names a live (non-zombie) process of the table.
+pub fn has_live(pid: u64) -> bool {
+    let flags = crate::arch::io::cli_save();
+    // SAFETY: read-only walk with interrupts masked.
+    let found = unsafe {
+        let table = &*addr_of_mut!(TABLE);
+        table.iter().any(|p| p.pid == pid && p.state != State::Zombie)
+    };
+    // SAFETY: as cli_save.
+    unsafe { crate::arch::io::restore_flags(flags) };
+    found
+}
+
+/// Set the pending bit of `sig` in `pid` when it has a handler for it
+/// (sys_kill on another process).  Returns true when the bit was raised.
+pub fn post_signal(pid: u64, sig: u64) -> bool {
+    let flags = crate::arch::io::cli_save();
+    // SAFETY: table walk with interrupts masked; state flips only.
+    let raised = unsafe {
+        let table = &mut *addr_of_mut!(TABLE);
+        let mut raised = false;
+        for p in table.iter_mut() {
+            if p.pid == pid && p.state != State::Zombie {
+                if p.signals.handlers[sig as usize] != 0 {
+                    p.signals.pending |= 1 << sig;
+                    raised = true;
+                }
+                break;
+            }
+        }
+        raised
+    };
+    // SAFETY: as cli_save.
+    unsafe { crate::arch::io::restore_flags(flags) };
+    raised
+}
+
+/// Terminate a *not currently running* process with a signal (sys_kill's
+/// default action, the wait-deadlock guard).  Returns false when there is
+/// no such live process.
+pub fn signal_target(pid: u64, sig: u64) -> bool {
+    let flags = crate::arch::io::cli_save();
+    // SAFETY: the target cannot be CURRENT (single CPU, we are running);
+    // the table walk and the zombify run with interrupts masked.
+    let found = unsafe {
+        let table = &mut *addr_of_mut!(TABLE);
+        let mut found = false;
+        for p in table.iter_mut() {
+            if p.pid == pid && p.state != State::Zombie {
+                zombify_common(p, Outcome::Signaled(sig));
+                found = true;
+                break;
+            }
+        }
+        if found {
+            after_death(pid);
+        }
+        found
+    };
+    // SAFETY: as cli_save.
+    unsafe { crate::arch::io::restore_flags(flags) };
+    found
+}
+
+/// A write #PF in ring 3 may be a copy-on-write page of the running
+/// process (fork, phase 2.5): try to service it.  True = resolved, the
+/// faulting store re-executes.
+pub fn handle_cow_current(cr2: u64) -> bool {
+    let Some(cur) = current() else { return false };
+    let Some(aspace) = cur.aspace.as_ref() else { return false };
+    // SAFETY: interrupt path (IF=0) with the faulting process's CR3 live,
+    // exactly what the COW fault handler expects.
+    unsafe { aspace.handle_cow_fault(cr2) }
 }
 
 /// Free the kernel stacks of dead processes.  Called from the main context
@@ -610,8 +1002,7 @@ fn reap() {
         while i < table.len() {
             if table[i].state == State::Zombie {
                 let p = table.remove(i);
-                // SAFETY: the layout is the one the stack was allocated with.
-                dealloc(p.kstack, Layout::from_size_align(KSTACK_SIZE, 4096).unwrap());
+                drop_reaped(p);
             } else {
                 i += 1;
             }
@@ -644,10 +1035,28 @@ pub fn run_until_idle() {
                     if table.iter().any(|p| p.state == State::Sleeping) {
                         // Only sleepers left: let the tick wake one up.
                         crate::arch::intr::idle_wait();
+                    } else if table.iter().any(|p| p.state == State::Waiting) {
+                        // Waiters whose children can never die for them
+                        // (their children all wait too: a wait cycle).
+                        // Terminate the waiters rather than wedge the
+                        // machine; the shell reports them as killed by
+                        // SIGKILL and the run ends.
+                        let stuck: Vec<u64> = table
+                            .iter()
+                            .filter(|p| p.state == State::Waiting)
+                            .map(|p| p.pid)
+                            .collect();
+                        crate::kprintln!(
+                            "\nscheduler: wait deadlock (pids {:?}) -- terminating them",
+                            stuck
+                        );
+                        for pid in stuck {
+                            let _ = signal_target(pid, 9);
+                        }
                     } else {
-                        // Nobody ready, nobody sleeping, nobody running
-                        // (a process is Ready before it switches away, dead
-                        // ones are zombies): all done.
+                        // Nobody ready, nobody sleeping, nobody waiting,
+                        // nobody running (a process is Ready before it
+                        // switches away, dead ones are zombies): all done.
                         break;
                     }
                 }
@@ -743,12 +1152,12 @@ pub fn kill(pid: u64) -> bool {
         let mut found = false;
         for p in table.iter_mut() {
             if p.pid == pid && p.state != State::Zombie {
-                p.outcome = Outcome::Killed;
-                p.state = State::Zombie;
-                p.exit_seq = next_exit_seq();
-                drop(p.aspace.take());
+                zombify_common(p, Outcome::Killed);
                 found = true;
             }
+        }
+        if found {
+            after_death(pid);
         }
         found
     };

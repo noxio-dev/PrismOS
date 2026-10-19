@@ -289,10 +289,20 @@ extern "C" fn isr_handler(frame: &mut IsrFrame) {
 /// Exception entry: a few are recoverable test hooks, the rest are fatal.
 /// Anything raised in ring 3 is the program's own fault: the process is
 /// killed and the kernel returns to the scheduler (never a kernel panic).
+/// Exception, since phase 2.5, a write #PF on a copy-on-write page (a fork
+/// clone, mem/vmm.rs): the fault is serviced and the instruction retried
+/// instead of ending the program.
 fn handle_exception(frame: &mut IsrFrame) {
     let v = frame.vector as u8;
     if frame.cs & 3 == 3 && v != 2 {
         // NMI is never the program's fault; everything else ends it.
+        // A *write* to a present page may be copy-on-write (a fork clone,
+        // mem/vmm.rs): service it and retry the instruction instead.
+        if v == 14 && frame.errcode & 0x2 != 0
+            && crate::user::process::handle_cow_current(super::regs::read_cr2())
+        {
+            return;
+        }
         crate::user::process::on_user_exception(frame);
     }
     match v {

@@ -371,7 +371,7 @@ pub(super) fn cmd_usertest(_args: &mut Args) {
 }
 
 /// Default environment of programs started from the shell.
-const DEFAULT_ENV: [&str; 3] = ["PATH=/bin", "HOME=/", "PRISMOS=2.4"];
+const DEFAULT_ENV: [&str; 3] = ["PATH=/bin", "HOME=/", "PRISMOS=2.5"];
 
 pub(super) fn cmd_exec(args: &mut Args) {
     use crate::user::elf;
@@ -458,25 +458,27 @@ pub(super) fn cmd_ps(_args: &mut Args) {
         return;
     }
     crate::kprintln!(
-        "  {:>4} {:10} {:8} {:>4} {:>6} {:>8} {}",
-        "pid", "name", "state", "prio", "cpu", "preempt", "outcome"
+        "  {:>4} {:>4} {:10} {:8} {:>4} {:>6} {:>8} {}",
+        "pid", "ppid", "name", "state", "prio", "cpu", "preempt", "outcome"
     );
     process::for_each(|p| {
         let state = match p.state {
             State::Ready => "ready",
             State::Running => "running",
             State::Sleeping => "sleeping",
+            State::Waiting => "waiting",
             State::Zombie => "zombie",
         };
         crate::kprint!(
-            "  {:>4} {:10} {:8} {:>4} {:>6} {:>8} ",
-            p.pid, p.name, state, p.prio, p.used, p.preempts
+            "  {:>4} {:>4} {:10} {:8} {:>4} {:>6} {:>8} ",
+            p.pid, p.ppid, p.name, state, p.prio, p.used, p.preempts
         );
         match p.outcome {
             Outcome::None => crate::kprintln!("-"),
             Outcome::Exited(c) => crate::kprintln!("exit {}", c),
             Outcome::Timeout => crate::kprintln!("timeout"),
             Outcome::Killed => crate::kprintln!("killed"),
+            Outcome::Signaled(s) => crate::kprintln!("signal {}", s),
             Outcome::Fault { vector, rip, .. } => {
                 crate::kprintln!("fault {} at {:#x}", vector, rip)
             }

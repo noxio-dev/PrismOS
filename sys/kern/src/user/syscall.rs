@@ -14,6 +14,9 @@
 //     3 uptime_ms()           4 yield()
 //     5 sleep(ms)             6 setprio(level)   (phase 2.3)
 //     7 execve(path, argv, envp)                    (phase 2.4)
+//     8 fork()                9 wait(pid, status_ptr, flags)  (phase 2.5)
+//    10 kill(pid, sig)       11 signal(sig, handler)
+//    12 sigreturn()
 //
 // `exit` never returns to the caller.  `yield` and `sleep` switch to another
 // process and come back here only when the process is scheduled again (the
@@ -26,9 +29,19 @@
 //
 // `execve` replaces the calling process's image by an ELF executable of the
 // VFS (user/elf.rs): new address space, fresh System V stack (argc, argv,
-// envp, auxv), fresh FPU state; the pid, priority and CPU budget stay.  It
-// returns only on failure (-ENOENT, -ENOEXEC, -EACCES, -E2BIG, -ENOMEM,
-// -EFAULT ...) and then the caller is untouched.
+// envp, auxv), fresh FPU state and clean signal handlers; the pid, priority
+// and CPU budget stay.  It returns only on failure (-ENOENT, -ENOEXEC,
+// -EACCES, -E2BIG, -ENOMEM, -EFAULT ...) and then the caller is untouched.
+//
+// Phase 2.5: `fork` clones the caller copy-on-write and returns the child's
+// pid (the child resumes in ring 3 with rax = 0).  `wait` reaps a dead
+// child (-ECHILD when there is none, WNOHANG returns 0 instead of
+// blocking) and writes its Linux-style status word.  `kill` and `signal`
+// are the basic signal API (user/signal.rs); `sigreturn` is what a handler
+// returns into (through the trampoline page) -- it restores the frame
+// pushed at delivery, so the interrupted code keeps its registers and its
+// syscall return value.  A pending signal is delivered between the return
+// value and `sysretq`.
 //
 // The descriptor API of fs/vfs.rs (open / read / write / seek / close) is
 // meant to sit behind this table later (phase 2.6).
@@ -37,6 +50,7 @@ use crate::arch::intr::IsrFrame;
 use crate::mem::vmm::AddressSpace;
 use crate::user::elf;
 use crate::user::process;
+use crate::user::signal;
 use crate::user::usermode::{EBADF, EFAULT, ENOSYS};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -191,6 +205,7 @@ fn sys_execve(frame: &mut IsrFrame, path_p: u64, argv_p: u64, envp_p: u64) -> i6
     drop(old);
     cur.name = elf::base_name(&abs);
     cur.fpu.reset();
+    cur.signals.reset(); // POSIX: execve resets caught signal handlers
     // SAFETY: CR0/CR4 were set up by usermode::init; the image is pristine.
     unsafe { cur.fpu.restore() };
     *frame = crate::user::usermode::user_frame(new.entry, new.rsp);
@@ -216,10 +231,26 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         }
         6 => process::setprio_current(a0),
         7 => sys_execve(frame, a0, a1, a2),
+        // ---- phase 2.5 --------------------------------------------------
+        8 => process::fork_current(frame),
+        9 => process::wait_current(a0, a1, a2),
+        10 => signal::sys_kill(a0, a1),
+        11 => signal::sys_signal(a0, a1),
+        12 => {
+            // The frame is the one pushed at delivery: restore it verbatim
+            // and skip the rax overwrite below (the saved rax is the
+            // interrupted syscall's return value).
+            signal::sys_sigreturn(frame);
+            return;
+        }
         _ => -ENOSYS,
     };
-    // A successful execve rebuilt the whole frame: rax must stay 0.
     frame.rax = ret as u64;
+    // A pending signal is delivered between the syscall's return value and
+    // the drop into ring 3 (phase 2.5).  After a successful execve there is
+    // never anything pending (handlers were reset); after a fork the child
+    // starts with an empty mask too.
+    signal::deliver(frame);
     // A user program can never reach non-canonical code addresses, so
     // `sysretq` is safe by construction; nothing else to check.
 }

@@ -16,6 +16,10 @@ preemptive: time slices on the LAPIC timer, strict priorities and
 sleep/wakeup.  Phase 2.4 adds an ELF loader: compiled C programs (static PIE)
 are loaded from the ext4 root, started with argv/envp/auxv, and can replace
 themselves with `execve`; the FPU/SSE state is now saved per process.
+Phase 2.5 adds the Unix trio: `fork` (with copy-on-write), `wait` (zombies,
+blocking, WNOHANG, a Linux-style status word) and basic signals (handlers,
+SIGCHLD, `kill`, a sigreturn trampoline that restores the interrupted context
+register for register).
 
 | Area                     | State   | Notes                                                                 |
 |--------------------------|---------|-----------------------------------------------------------------------|
@@ -28,8 +32,9 @@ themselves with `execve`; the FPU/SSE state is now saved per process.
 | VFS                      | done    | mounts, path walk, symlinks, descriptor API                            |
 | ext4                     | partial | R/W, extents, checksums written; no journal, see limits below          |
 | Ring 3                   | done    | user page tables per process, `syscall`/`sysret`, TSS stacks, fault containment (phase 2.1) |
-| Processes / scheduler    | done    | PCB, kernel stacks, context switch, kernel threads (2.2); preemptive round-robin on the timer tick, 4 priority levels, `sleep`/`setprio` syscalls, CPU-time watchdog (2.3); FXSAVE state per process (2.4) |
+| Processes / scheduler    | done    | PCB, kernel stacks, context switch, kernel threads (2.2); preemptive round-robin on the timer tick, 4 priority levels, `sleep`/`setprio` syscalls, CPU-time watchdog (2.3); FXSAVE state per process (2.4); parent/child links, `fork` + copy-on-write, blocking `wait`, wait-deadlock guard (2.5) |
 | ELF loader / `execve`    | done    | static ELF64 (`ET_EXEC` / static PIE with RELATIVE relocations), W^X segments, System V initial stack with argv / envp / auxv, `execve` syscall, `/bin/hello` demo built from `usr/` (2.4) |
+| fork / wait / signals     | done    | `fork` clones the address space copy-on-write (refcounted shared pages, fault-time copies), `wait` reaps zombies (blocking, WNOHANG, by pid, Linux status word), SIGKILL/SIGTERM/SIGINT/SIGCHLD/SIGUSR1 with per-process handlers delivered at the syscall boundary and restored register-for-register by a sigreturn trampoline (2.5) |
 | Networking, USB, SMP     | todo    | not started                                                            |
 
 **Testing.** `make fstest` (11 scenarios against `mke2fs` images, each validated
@@ -39,7 +44,11 @@ the ext4 root partition (read-write, re-checked with `e2fsck` on the host), a
 partition-layout assertion, a ring 3 process / context switch scenario
 (phase 2.2) and an ELF scenario (phase 2.4: `/bin/hello` with argv/envp/auxv,
 `execve`, its error paths, two float workloads interleaved by the scheduler,
-fault containment, exit status).
+fault containment, exit status), and a phase 2.5 scenario (`/bin/fork`:
+copy-on-write isolation, fork pids and status round trips, blocking and WNOHANG
+waits, wait-by-pid, a SIGCHLD handler, a SIGTERM kill, a self-signal whose
+`kill` return value must survive the handler round trip, `execve` from a
+forked child, orphan adoption, `kill` error paths).
 
 **Known limits of phase 1.4.** No journal (writes go straight to disk; a crash
 mid-operation can need an `fsck`; journals that need recovery mount read-only),
@@ -71,7 +80,7 @@ Phase 2 — ring 3 and processes
 - [x] Phase 2.2 — processes and threads: PCB, kernel stacks, context switch
 - [x] Phase 2.3 — scheduler: preemptive round-robin on the LAPIC timer, then priorities, sleep/wakeup
 - [x] Phase 2.4 — ELF loader: `execve` from the VFS, argv/envp, auxv
-- [ ] Phase 2.5 — `fork`, `wait`, `exit`, signals (basic), copy-on-write
+- [x] Phase 2.5 — `fork`, `wait`, `exit`, signals (basic), copy-on-write
 - [ ] Phase 2.6 — file descriptors per process on top of the VFS, pipes, `/dev` (`console`, `null`, `zero`)
 
 Phase 3 — POSIX userspace
@@ -121,13 +130,69 @@ Beyond (nice to have)
   and returns to the scheduler; the kernel never panics because of user code.
 - **Syscalls** (rax = number, args rdi/rsi/rdx, result in rax, `-errno` on failure):
   `0 exit`, `1 write(fd 1|2)`, `2 getpid`, `3 uptime_ms`, `4 yield` (phase 2.2),
-  `5 sleep`, `6 setprio` (2.3), `7 execve` (2.4).
+  `5 sleep`, `6 setprio` (2.3), `7 execve` (2.4), `8 fork`, `9 wait`, `10 kill`,
+  `11 signal`, `12 sigreturn` (2.5).
 
 Shell: `user` lists the built-in test programs, `user <name>...` runs one or
 more at once, `usertest` runs them all (outcome, fault type and page-leak check,
 plus a two-process interleaving, a kernel-thread scenario and the 2.3
 preemption / priority / wake-up scenarios) -- also part of
 `make test`.
+
+## fork, wait and signals (phase 2.5)
+
+`fork` (user/process.rs + mem/vmm.rs + mem/cow.rs), `wait` (user/process.rs),
+signals (user/signal.rs); the demo / test program is `/bin/fork` (usr/fork).
+
+- **`fork`**: the child gets a fresh kernel stack and PML4 whose *leaf*
+  entries point at the parent's physical pages: no data page is copied up
+  front.  Writable pages are turned read-only + COW (PTE software bit 9) in
+  *both* spaces; already read-only pages (code, rodata) are shared as is.
+  Every shared leaf gets a refcount in a kernel-side open-addressing table
+  (mem/cow.rs), so whichever address space dies first only drops the count.
+  The first write to a COW page faults (#PF, write, user); the handler copies
+  the page -- or just re-arms RW when the other owner already exited, a
+  self-healing path also taken when a fork fails halfway.  The child resumes
+  in ring 3 through the standard trampoline with the parent's whole register
+  frame and `rax = 0`; the parent's `fork` returns the child's pid.  It keeps
+  the name, priority and signal handlers (execve resets those), gets a copy
+  of the live x87/SSE state and a fresh watchdog budget.
+- **`exit` / zombies**: every death funnels through one helper -- outcome,
+  death order, address space freed (shared pages uncounted), children adopted
+  by pid 0, a waiting parent woken, SIGCHLD raised in a listening parent.
+  A dead-but-unreaped process keeps its kernel stack until `wait` or the
+  shell's reaper frees it.
+- **`wait(pid, &status, flags)`**: blocking (a new `Waiting` state, woken by
+  the matching child's death), `WNOHANG`, by pid or any child; writes a
+  Linux-style status word (`exit << 8`, or the signal that killed it) and
+  frees the zombie.  `-ECHILD` without a matching child, `-EFAULT` on an
+  unwritable status word.  A wait cycle (two processes waiting on each
+  other) is detected by the scheduler's idle path, which terminates the
+  waiters with a message instead of wedging the machine.
+- **Signals (basic)**: per-process handlers (`signal(sig, handler)`, SIGKILL
+  uncatchable), `kill(pid, sig)` (self-kills act at once; a handled signal on
+  another process goes pending), SIGKILL/SIGTERM/SIGINT terminate by default,
+  everything else is ignored, SIGCHLD is raised in a parent when a child
+  dies.  Delivery happens at the syscall boundary: the kernel pushes the
+  *whole* interrupted register frame on the user stack (below the red zone),
+  enters the handler like a call (`rdi` = signal) and plants the return
+  address on a one-page trampoline (`mov eax, 12; syscall`) mapped into every
+  address space; when the handler returns, `sigreturn` restores the saved
+  frame verbatim -- so the interrupted code keeps its registers *and* its
+  syscall return value.  While a handler runs the signal is blocked; standard
+  signals coalesce.  Not here: `sigprocmask`, stop/continue, `SA_RESTART`,
+  altstacks, real-time queues, and fault-signal delivery (a #PF kills even
+  with a SIGSEGV handler: resuming the instruction would just fault again).
+
+Limits worth knowing: `wait` only looks at the process table snapshot (a pid
+reused later is a different process), the wait-deadlock guard kills *all*
+stranded waiters together, and signals are only delivered at syscall returns
+(a tight loop without syscalls only meets SIGKILL).
+
+Shell: `ps` shows pid, **ppid**, state (ready / running / sleeping / waiting /
+zombie), priority, CPU ticks, preemptions and outcome (`signal 9` for a killed
+child).  `/bin/fork` (`exec fork`) runs the ten phase 2.5 scenarios and prints
+`fork: all 10 passed` -- also part of `make test`.
 
 ## Processes and scheduler (phases 2.2 and 2.3)
 
@@ -208,13 +273,15 @@ how they ended; several programs separated by `--` run concurrently.
 
 `usr/` holds the user side: `usr/lib/crt0.S` (`_start`), `usr/lib/prism.c`
 (freestanding mini libc: memcpy & co, `printf`, `getauxval`, ...),
-`usr/include/prism.h` (syscall wrappers) and one directory per program.
-`make` builds every program listed in `USR_PROGS` (static PIE, `ld.lld`) and
-installs it as `/bin/<name>` in the ext4 root.  `/bin/hello` is the demo and test:
+`usr/include/prism.h` (syscall wrappers, signal numbers, wait macros) and one
+directory per program.  `make` builds every program listed in `USR_PROGS`
+(static PIE, `ld.lld`) and installs it as `/bin/<name>` in the ext4 root.
+`/bin/hello` is the phase 2.4 demo and test:
 `hello [info]`, `hello fpu <tag>` (x87 + SSE workload, run two at once to check the
 per-process FPU state), `hello chain` (`execve` of itself), `hello errors` (all
 the `execve` error paths), `hello exit <n>`, `hello fault` (NULL dereference,
-contained by the kernel).  `/bin/notelf` is an executable text file used to check
+contained by the kernel).  `/bin/fork` is the phase 2.5 one (see above).
+`/bin/notelf` is an executable text file used to check
 `-ENOEXEC`.
 
 ## Boot chain
@@ -358,7 +425,7 @@ contrib/lua              Lua 5.4.8 (MIT)
 include/                 prism.inc (shared constants), prism/boot.h
 sys/kern                 Rust kernel (no_std, x86_64-unknown-none)
 tools/mkimage.py         GPT disk image builder (ESP + BIOS boot + ext4 root)
-usr/                     user space: crt0 + mini libc (usr/lib), headers, programs (usr/hello)
+usr/                     user space: crt0 + mini libc (usr/lib), headers, programs (usr/hello, usr/fork)
 tests/boot_test.py       QEMU boot tests (incl. ext4 root, layout assertion)
 tests/fs_test.py         host VFS/ext4 tests (tests/fstest is the harness)
 ```

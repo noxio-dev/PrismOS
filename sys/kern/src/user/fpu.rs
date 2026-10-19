@@ -46,6 +46,14 @@ impl FpuState {
         *self = FpuState::new();
     }
 
+    /// A copy of the saved image, for the child of a `fork` (phase 2.5): the
+    /// caller must have `save`d the live registers first.
+    pub fn snapshot(&self) -> FpuState {
+        let mut area = [0u8; 512];
+        area.copy_from_slice(&self.area);
+        FpuState { area }
+    }
+
     /// Store the CPU's x87/SSE registers here.
     ///
     /// # Safety

@@ -231,6 +231,9 @@ pub enum Outcome {
     Timeout,
     /// Killed by the shell (`kill` command).
     Killed,
+    /// Terminated by a signal (phase 2.5): `sys_kill`, or the shell's kill
+    /// command, ended it.  The number is the signal (9 for SIGKILL ...).
+    Signaled(u64),
 }
 
 /// Which protections `init` managed to switch on.
@@ -331,7 +334,9 @@ pub fn user_frame(rip: u64, rsp: u64) -> IsrFrame {
 /// Map a flat program image and its stack into a fresh address space.
 /// The image is copied to USER_CODE_BASE (mapped r-x) and entered at its
 /// first byte; the stack is a private rw- NX region ending at
-/// USER_STACK_TOP with an unmapped guard page below.
+/// USER_STACK_TOP with an unmapped guard page below.  The signal-return
+/// trampoline page (phase 2.5) is mapped too, so every process can take
+/// deliveries even if it never installs a handler.
 pub fn build_aspace(image: &[u8]) -> Result<AddressSpace, &'static str> {
     if !ready() {
         return Err("usermode not initialised");
@@ -347,6 +352,9 @@ pub fn build_aspace(image: &[u8]) -> Result<AddressSpace, &'static str> {
     }
     if !aspace.alloc_map(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE, true, false) {
         return Err("cannot map the user stack");
+    }
+    if !aspace.map_sigcode() {
+        return Err("cannot map the signal trampoline");
     }
     Ok(aspace)
 }
@@ -748,6 +756,7 @@ pub fn describe(o: Outcome) {
         Outcome::Exited(c) => crate::kprintln!("exited with status {}", c),
         Outcome::Timeout => crate::kprintln!("killed by the watchdog (time-out)"),
         Outcome::Killed => crate::kprintln!("killed by the shell"),
+        Outcome::Signaled(s) => crate::kprintln!("killed by signal {}", s),
         Outcome::Fault { vector, err, rip, cr2 } => crate::kprintln!(
             "killed by exception {} at rip {:#x} (errcode {:#x}, cr2 {:#x})",
             vector, rip, err, cr2

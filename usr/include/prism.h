@@ -18,15 +18,36 @@
 enum {
 	SYS_EXIT = 0, SYS_WRITE = 1, SYS_GETPID = 2, SYS_UPTIME_MS = 3,
 	SYS_YIELD = 4, SYS_SLEEP = 5, SYS_SETPRIO = 6, SYS_EXECVE = 7,
+	SYS_FORK = 8, SYS_WAIT = 9, SYS_KILL = 10, SYS_SIGNAL = 11,
+	SYS_SIGRETURN = 12,
 };
 
 /* errno values returned (negated) by the kernel */
 enum {
-	PRISM_EPERM = 1, PRISM_ENOENT = 2, PRISM_E2BIG = 7, PRISM_ENOEXEC = 8,
-	PRISM_EBADF = 9, PRISM_ENOMEM = 12, PRISM_EACCES = 13, PRISM_EFAULT = 14,
+	PRISM_EPERM = 1, PRISM_ENOENT = 2, PRISM_ESRCH = 3, PRISM_E2BIG = 7,
+	PRISM_ENOEXEC = 8, PRISM_EBADF = 9, PRISM_ECHILD = 10,
+	PRISM_ENOMEM = 12, PRISM_EACCES = 13, PRISM_EFAULT = 14,
 	PRISM_EISDIR = 21, PRISM_EINVAL = 22, PRISM_ENAMETOOLONG = 36,
 	PRISM_ENOSYS = 38,
 };
+
+/* signals (the basic set the kernel implements) */
+enum {
+	PRISM_SIGHUP = 1, PRISM_SIGINT = 2, PRISM_SIGQUIT = 3, PRISM_SIGILL = 4,
+	PRISM_SIGTRAP = 5, PRISM_SIGABRT = 6, PRISM_SIGBUS = 7, PRISM_SIGFPE = 8,
+	PRISM_SIGKILL = 9, PRISM_SIGUSR1 = 10, PRISM_SIGSEGV = 11,
+	PRISM_SIGUSR2 = 12, PRISM_SIGPIPE = 13, PRISM_SIGALRM = 14,
+	PRISM_SIGTERM = 15, PRISM_SIGCHLD = 17,
+};
+
+/* wait() flags and status decoding (Linux encoding) */
+#define PRISM_WNOHANG 1
+#define PRISM_WEXITSTATUS(s) (((s) >> 8) & 0xff)
+#define PRISM_WTERMSIG(s) ((s) & 0x7f)
+#define PRISM_WIFEXITED(s) (((s) & 0x7f) == 0)
+#define PRISM_WIFSIGNALED(s) (((s) & 0x7f) != 0)
+/* wait "any child" (also 0); a specific pid waits for that child */
+#define PRISM_WAIT_ANY (-1L)
 
 static inline long syscall3(long n, long a, long b, long c)
 {
@@ -57,6 +78,17 @@ static inline long sys_execve(const char *path, char *const argv[], char *const 
 {
 	return syscall3(SYS_EXECVE, (long)path, (long)argv, (long)envp);
 }
+static inline long sys_fork(void) { return syscall3(SYS_FORK, 0, 0, 0); }
+static inline long sys_wait(long pid, int *status, long flags)
+{
+	return syscall3(SYS_WAIT, pid, (long)status, flags);
+}
+static inline long sys_kill(long pid, long sig) { return syscall3(SYS_KILL, pid, sig, 0); }
+static inline long sys_signal(long sig, void (*handler)(int))
+{
+	return syscall3(SYS_SIGNAL, sig, (long)handler, 0);
+}
+/* The PRISM_W* macros above decode the int *status word filled by sys_wait. */
 
 /* ---- auxiliary vector ------------------------------------------------- */
 

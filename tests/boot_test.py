@@ -147,7 +147,7 @@ def main():
           ("pid 5 hello -- exited with status 0", "exec hello fault\r"),
           ("pid 6 hello -- killed by exception 14", "exec hello exit 42\r"),
           ("pid 7 hello -- exited with status 42", "exec notelf\r")],
-         ['argv[2] = "alpha"', "env: PRISMOS=2.4", "main() runs at 0x80", "AT_PAGESZ = 4096",
+         ['argv[2] = "alpha"', "env: PRISMOS=2.5", "main() runs at 0x80", "AT_PAGESZ = 4096",
           "float check: ok",
           "hello chain: pid 2 calls execve()", 'argv[2] = "(after execve)"', 'argv[4] = "y"',
           "execve(/nonexistent)         -> -2", "execve(/boot/loader.conf)    -> -13",
@@ -157,6 +157,22 @@ def main():
           "fpu 1: 40 rounds ok", "fpu 2: 40 rounds ok",
           "hello fault: about to dereference NULL", "pid 6 hello -- killed by exception 14",
           "pid 7 hello -- exited with status 42", "/bin/notelf: not an ELF file"], 240),
+        # Phase 2.5: fork with copy-on-write, wait, signals (/bin/fork, built
+        # like /bin/hello): COW isolation, pid / status round trips, blocking
+        # and WNOHANG waits, SIGCHLD handlers, SIGTERM kills, register
+        # restoration through sigreturn, execve from a forked child, orphan
+        # adoption.
+        ("BIOS shell: fork, wait, signals (phase 2.5)", bios_cmd,
+         [("prism# ", "exec fork\r"),
+          ("fork: all 10 passed", "ps\r")],
+         ["fork (pid 1): fork, wait, signals and copy-on-write",
+          "cow       ok -- 3 pages rewritten by the child, parent copy intact",
+          "pids      ok", "waiterr   ok", "waitpid   ok",
+          "sigchld   ok", "sigterm   ok", "sigself   ok",
+          "exec      ok", "orphan    ok", "sigkill   ok",
+          "fork: all 10 passed",
+          "pid 1 fork -- exited with status 0",
+          "process table empty"], 240),
     ]
     if code and vars_ and os.path.exists(code):
         scenarios += [
