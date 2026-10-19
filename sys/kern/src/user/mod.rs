@@ -18,6 +18,12 @@
 // pipes with bounded blocking, the /dev devices, and the six syscalls
 // read / open / close / lseek / dup / pipe (plus `write`, rerouted).
 //
+// Phase 3.1: the newlib syscall set.  sysc.rs carries the memory / process
+// half (brk, mmap, munmap, chdir, getcwd, uname); fd.rs grows the
+// descriptor half (stat, fstat, dup2, fcntl, getdents, ioctl, unlink,
+// mkdir, rmdir, rename, link) plus O_NONBLOCK / O_CLOEXEC, a per-process
+// cwd (process.rs) and the SIGPIPE rule.
+//
 // usermode.rs also carries the built-in flat test programs; shell/shuser.rs
 // exposes them as `user` / `usertest` / `ps` / `kill`.
 
@@ -26,5 +32,6 @@ pub mod fd;
 pub mod fpu;
 pub mod process;
 pub mod signal;
+pub mod sysc;
 pub mod syscall;
 pub mod usermode;

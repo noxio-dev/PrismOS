@@ -59,7 +59,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     kprintln!("Hello, world!");
     kprintln!();
-    kprintln!("PrismOS kernel {} (x86_64)", env!("CARGO_PKG_VERSION"));
+    kprintln!("PrismOS kernel {} (Rust, x86_64)", env!("CARGO_PKG_VERSION"));
 
     match bi {
         Some(bi) => {

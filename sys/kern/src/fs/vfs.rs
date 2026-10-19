@@ -273,6 +273,14 @@ pub const O_CREATE: u32 = 4;
 pub const O_TRUNC: u32 = 8;
 pub const O_APPEND: u32 = 16;
 pub const O_EXCL: u32 = 32;
+/// Non-blocking I/O on the description (phase 3.1): a pipe / console read
+/// with nothing pending answers -EAGAIN at once instead of parking, a full
+/// pipe write ditto.  Description-level (shared by dup / fork).
+pub const O_NONBLOCK: u32 = 64;
+/// Close-on-exec (phase 3.1): an fd-*number* property (kept by the
+/// descriptor layer's table, never here) -- `execve` closes the marked
+/// numbers, dup / dup2 clear it on their new number.
+pub const O_CLOEXEC: u32 = 128;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Whence {
@@ -840,6 +848,50 @@ impl Vfs {
         let (mid, ino) = (f.mount, f.ino);
         let mi = self.mount_index(mid)?;
         self.mounts[mi].fs.stat(ino)
+    }
+
+    /// Positional read that does not touch the description's offset (phase
+    /// 3.1: `mmap` fills a private file mapping through it, and a shared
+    /// offset would surprise whoever holds the fd).
+    pub fn pread(&mut self, fd: usize, off: u64, buf: &mut [u8]) -> FsResult<usize> {
+        let f = self.file(fd)?;
+        if f.is_dir {
+            return Err(FsError::IsDir);
+        }
+        if f.flags & O_READ == 0 {
+            return Err(FsError::BadFd);
+        }
+        let (mid, ino) = (f.mount, f.ino);
+        let mi = self.mount_index(mid)?;
+        self.mounts[mi].fs.read(ino, off, buf)
+    }
+
+    /// Read the directory open as `fd`, one entry at a time, from its
+    /// current offset (which doubles as the entry index -- `lseek(fd, 0,
+    /// SET)` rewinds, getdents-style).  `fill` returns false when its
+    /// buffer is full; the walk stops there and the returned offset is what
+    /// the next call resumes from.  Returns the new offset, or the number
+    /// of entries handed out so far when `fill` refused one.  A non-directory
+    /// fd is NotDir (phase 3.1: the getdents half of opendir/readdir).
+    pub fn getdents_fd(&mut self, fd: usize, fill: &mut dyn FnMut(&DirEntry) -> bool) -> FsResult<u64> {
+        let f = self.file(fd)?;
+        if !f.is_dir {
+            return Err(FsError::NotDir);
+        }
+        let (mid, ino, off) = (f.mount, f.ino, f.off);
+        let mi = self.mount_index(mid)?;
+        let entries = self.mounts[mi].fs.readdir(ino)?;
+        let mut i = (off as usize).min(entries.len());
+        while i < entries.len() {
+            if !fill(&entries[i]) {
+                break;
+            }
+            i += 1;
+        }
+        if let Some(Some(f)) = self.files.get_mut(fd) {
+            f.off = i as u64;
+        }
+        Ok(i as u64)
     }
 
     pub fn ftruncate(&mut self, fd: usize, size: u64) -> FsResult<()> {

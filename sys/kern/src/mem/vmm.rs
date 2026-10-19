@@ -58,6 +58,11 @@ pub const USER_STACK_TOP: u64 = USER_END;
 /// "returns" onto this code, which makes the `sigreturn` syscall; the kernel
 /// then restores the register state it pushed on the user stack at delivery.
 pub const USER_SIGCODE: u64 = USER_BASE + (256 << 20);
+/// Where `mmap` hands out anonymous / private file mappings (phase 3.1):
+/// far above any loaded image (the loader caps spans at 64 MiB and the
+/// trampoline sits at +256 MiB) and far below the stack, with the `brk`
+/// heap growing below it.  First-fit, page-granular, upward.
+pub const USER_MMAP_BASE: u64 = USER_BASE + (4 << 30);
 
 // PTE bits
 const P: u64 = 1;
@@ -973,6 +978,62 @@ impl AddressSpace {
         // no relocations, exactly the ABI the dispatch expects.
         const CODE: [u8; 9] = [0xb8, 0x0c, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x0f, 0x0b];
         self.write(USER_SIGCODE, &CODE, true)
+    }
+
+    /// Unmap the pages covering `[virt, virt + len)` (phase 3.1: `munmap` /
+    /// a shrinking `brk`).  Absent pages inside the range are skipped, so a
+    /// partial mapping (an `alloc_map` that ran out of memory halfway)
+    /// unmaps cleanly too.  Every *present* leaf is released through the
+    /// COW table first: after a fork it may still be shared with a sibling,
+    /// in which case only the refcount drops.  True = the range was inside
+    /// user space; what an absent page is worth is the caller's business.
+    ///
+    /// # Safety
+    /// Must run in the owning process's context (its CR3 live, interrupts
+    /// masked) when the pages may be cached in the TLB: the `invlpg` below
+    /// targets the current translation context.
+    pub unsafe fn unmap(&mut self, virt: u64, len: u64) -> bool {
+        let start = virt & !(PAGE - 1);
+        let Some(end) = virt.checked_add(len).and_then(|e| e.checked_add(PAGE - 1)) else {
+            return false;
+        };
+        let end = end & !(PAGE - 1);
+        if !user_range_ok(start, 1) || !user_range_ok(end.saturating_sub(1), 1) || end < start {
+            return false;
+        }
+        let mut v = start;
+        while v < end {
+            if let Some(slot) = self.pte_slot(v) {
+                // SAFETY: pte_slot only reports present leaves of this space.
+                unsafe {
+                    let pte = (slot as *const u64).read_volatile();
+                    if pte & P != 0 {
+                        let phys = pte & PHYS_MASK;
+                        (slot as *mut u64).write_volatile(0);
+                        crate::arch::regs::invlpg(v);
+                        if crate::mem::cow::release(phys) {
+                            crate::mem::pmm::free_page(phys);
+                        }
+                    }
+                }
+            }
+            v += PAGE;
+        }
+        true
+    }
+
+    /// True when no page of `[virt, virt + len)` is mapped -- the free-gap
+    /// probe behind `mmap`'s first-fit placement (phase 3.1).
+    pub fn range_free(&self, virt: u64, len: u64) -> bool {
+        let Some(end) = virt.checked_add(len) else { return false };
+        let mut v = virt & !(PAGE - 1);
+        while v < end {
+            if self.translate(v).is_some() {
+                return false;
+            }
+            v += PAGE;
+        }
+        true
     }
 }
 

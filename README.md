@@ -25,6 +25,12 @@ open file descriptions shared by `fork` and `dup`, pipes (bounded blocking,
 EOF / EPIPE), a `/dev` directory (devfs) with `console`, `null` and `zero`,
 and six new syscalls (`read`, `open`, `close`, `lseek`, `dup`, `pipe`; `write`
 now routes through the table).
+Phase 3.1 rounds out the POSIX surface a newlib port needs: seventeen new
+syscalls (`stat`, `fstat`, `brk`, `mmap`, `munmap`, `chdir`, `getcwd`, `dup2`,
+`fcntl`, `getdents`, `ioctl`, `unlink`, `mkdir`, `rmdir`, `rename`, `link`,
+`uname`), `O_NONBLOCK` / `O_CLOEXEC`, a working directory *per process*, the
+POSIX SIGPIPE rule and the `isatty` ioctl pair -- the ABI a `x86_64-prismos`
+toolchain (phase 3.2) will build against.
 
 | Area                     | State   | Notes                                                                 |
 |--------------------------|---------|-----------------------------------------------------------------------|
@@ -41,6 +47,7 @@ now routes through the table).
 | ELF loader / `execve`    | done    | static ELF64 (`ET_EXEC` / static PIE with RELATIVE relocations), W^X segments, System V initial stack with argv / envp / auxv, `execve` syscall, `/bin/hello` demo built from `usr/` (2.4) |
 | fork / wait / signals     | done    | `fork` clones the address space copy-on-write (refcounted shared pages, fault-time copies), `wait` reaps zombies (blocking, WNOHANG, by pid, Linux status word), SIGKILL/SIGTERM/SIGINT/SIGCHLD/SIGUSR1 with per-process handlers delivered at the syscall boundary and restored register-for-register by a sigreturn trampoline (2.5) |
 | Descriptors / pipes / /dev | done   | a fd table per process (0/1/2 on the console), open file descriptions shared by fork / dup (shared offsets, POSIX), pipes with bounded blocking and EOF / EPIPE, devfs on /dev with `console` / `null` / `zero` served by the descriptor layer, syscalls read / open / close / lseek / dup / pipe (2.6) |
+| POSIX syscalls (newlib set) | done | 17 new syscalls (stat / fstat / brk / mmap / munmap / chdir / getcwd / dup2 / fcntl / getdents / ioctl / unlink / mkdir / rmdir / rename / link / uname), `O_NONBLOCK` / `O_CLOEXEC`, per-process cwd, the SIGPIPE rule, `uname` / the isatty ioctl pair; x86-64 Linux `struct stat` and `linux_dirent64` layouts (3.1) |
 | Networking, USB, SMP     | todo    | not started                                                            |
 
 **Testing.** `make fstest` (11 scenarios against `mke2fs` images, each validated
@@ -62,6 +69,16 @@ fork (the child reads where the parent left off and hands the bytes back
 through an inherited pipe), dup (shared description, the close(1) + open
 renumbering trick), a real read of fd 0 from the serial line, and fds
 surviving `execve`).
+Phase 3.1 adds a scenario of its own (`/bin/posix`): stat / fstat with the
+x86-64 Linux layouts (file types, `rdev` of the devices, a fifo pipe end),
+the program break, anonymous and file `mmap` (W^X, `MAP_FIXED`, `munmap`,
+copy-on-write across fork, a private file mapping whose fill leaves the
+fd offset alone), the per-process cwd (a relative `open` that lands in the
+process's directory, not the shell's), `dup2` / `fcntl` / `F_DUPFD` / an
+`O_CLOEXEC` fd checked from a re-`execve`d child, `O_NONBLOCK` pipes, the
+SIGPIPE rule (a readerless writer dies by signal 13 unless it ignores the
+signal), `getdents` over `/bin` and `/dev`, the name-space syscalls with
+their error paths, and `uname` / `isatty`.
 
 **Known limits of phase 1.4.** No journal (writes go straight to disk; a crash
 mid-operation can need an `fsck`; journals that need recovery mount read-only),
@@ -97,7 +114,7 @@ Phase 2 — ring 3 and processes
 - [x] Phase 2.6 — file descriptors per process on top of the VFS, pipes, `/dev` (`console`, `null`, `zero`)
 
 Phase 3 — POSIX userspace
-- [ ] Phase 3.1 — syscall set for newlib: `open/read/write/lseek/close/stat/dup/pipe/mmap/brk/getcwd/...`
+- [x] Phase 3.1 — syscall set for newlib: `open/read/write/lseek/close/stat/dup/pipe/mmap/brk/getcwd/...`
 - [ ] Phase 3.2 — newlib port and a `x86_64-prismos` toolchain target
 - [ ] Phase 3.3 — `init`, TTY layer with line discipline, `/proc` and `/tmp` (tmpfs)
 - [ ] Phase 3.4 — BusyBox and a userspace shell
@@ -191,15 +208,101 @@ the `Opened::Dev` arm of `fs/vfs.rs`; the demo / test program is `/bin/fd`
   deliberate: the shell is blocked while its children run, so nothing may
   wait forever (the same rule `sleep` follows).
 
-Limits worth knowing: no O_NONBLOCK / O_CLOEXEC, no dup2 / fcntl, no
-per-process cwd (paths resolve against the shell's, like `execve`'s), no
-getdents (a directory fd opens but cannot be read), no SIGPIPE delivery (a
-readerless write returns `-EPIPE`), and nothing about permissions (single
-user, ring 0).
+Limits worth knowing, as phase 2.6 left them (the newlib set of phase 3.1
+lifted most -- see below): no `O_NONBLOCK` / `O_CLOEXEC`, no `dup2` /
+`fcntl`, no per-process cwd (paths resolved against the shell's, like
+`execve`'s), no `getdents` (a directory fd opened but could not be read),
+no SIGPIPE delivery (a readerless write returned `-EPIPE`), and nothing
+about permissions (single user, ring 0).
 
 Shell: `ls /dev` and `mount` show the device directory (`c` type chars,
 devfs read-only); `exec fd` runs the ten phase 2.6 scenarios and prints
 `fd: all 10 passed` -- also part of `make test`.
+
+## The newlib syscall set (phase 3.1)
+
+`user/sysc.rs` (the memory / process half: `brk`, `mmap`, `munmap`,
+`chdir`, `getcwd`, `uname`) and the descriptor layer grown to POSIX size
+(`user/fd.rs`: `stat`, `fstat`, `dup2`, `fcntl`, `getdents`, `ioctl`,
+`unlink`, `mkdir`, `rmdir`, `rename`, `link`); the demo / test program is
+`/bin/posix` (usr/posix).  The dispatch (user/syscall.rs) reads up to six
+arguments now -- `mmap` needs r10 / r8 / r9, the Linux order.
+
+- **stat / fstat** fill the x86-64 Linux `struct stat` layout (144 bytes)
+  exactly -- the ABI the future newlib port compiles against.  The file
+  type lives in the mode's `S_IFMT` bits (`S_IFREG` / `S_IFDIR` / `S_IFLNK`),
+  a devfs node is `S_IFCHR` with `st_rdev` = `(1 << 8) | id` (Linux's mem
+  major), a pipe end fstats as a fifo.  `st_dev` is 0 (no device numbering
+  yet), `st_blksize` is 4096.
+- **brk** is sbrk's engine, the 1975 contract: one break per process,
+  growing from the page after the loaded image (`brk_base`, a PCB field)
+  to `USER_MMAP_BASE`, byte-granular in the value and page-granular on the
+  pages.  `brk(0)` / any invalid address answers the current break
+  (Linux's way of saying no); a fork child inherits the break with the
+  copy-on-write pages, `execve` restarts it at the new image's end.
+- **mmap / munmap** place everything first-fit above `USER_MMAP_BASE`
+  (4 GiB into user space, above the trampoline and any image, below the
+  stack) by probing the page tables -- there is no VMA list.
+  `MAP_ANONYMOUS` hands out zero pages (`MAP_SHARED` included: it is just
+  memory); a `MAP_PRIVATE` file mapping is filled eagerly through the new
+  VFS `pread` (the description's offset never moves, bytes past EOF read
+  as zero instead of the POSIX SIGBUS); `MAP_FIXED` first unmaps whatever
+  was there.  W^X is enforced (`PROT_WRITE | PROT_EXEC` is `-EACCES`, the
+  loader's rule), `PROT_NONE` and unknown bits are `-EINVAL`, mappings
+  over the signal trampoline page are refused, and `MAP_SHARED` of a file
+  is `-ENOSYS` (no page cache to write back through).  `munmap` releases
+  pages through the COW table, so a fork sibling keeps its copy.
+- **chdir / getcwd**: a cwd *per process* (a PCB string; the shell keeps
+  its own in fsys.rs).  A fresh process starts from the shell's cwd,
+  `fork` copies it, `execve` keeps it, and every path-taking syscall
+  (`open`, `stat`, `unlink`, `execve`...) resolves against it -- a
+  relative `open` lands where the process stands, not where the shell
+  does.  `getcwd` returns the length including the NUL, `-ERANGE` when
+  the buffer cannot hold it.
+- **dup2 / fcntl / O_CLOEXEC**: `dup2` pins the description to an exact
+  number (closing what occupied it -- the shell-redirection trick),
+  `F_DUPFD` takes the lowest free number at or past its argument, and
+  `F_GETFD` / `F_SETFD` manage `FD_CLOEXEC` -- a property of the *number*,
+  kept in the per-process table, cleared by every dup, set by `open`
+  with `O_CLOEXEC` and honoured by `execve` (which closes the marked
+  numbers and keeps the rest, POSIX).  `F_GETFL` / `F_SETFL` read and
+  rewrite the *description's* flags (shared by every dup, exactly POSIX):
+  `O_NONBLOCK` and `O_APPEND` may change after the open.
+- **O_NONBLOCK**: a pipe read with nothing buffered and writers alive, a
+  full pipe write, and a console read with nothing typed all answer
+  `-EAGAIN` at once instead of parking.
+- **SIGPIPE** is the POSIX rule now: a write to a readerless pipe kills
+  the writer by signal 13 (the `wait` status word says so) unless it
+  installed a handler or `SIG_IGN` -- `signal` grew dispositions beyond
+  a plain handler (`0` default, `1` ignore, the classic values) -- in
+  which case the write answers `-EPIPE` and the program carries on.
+- **getdents** walks a directory fd in the x86-64 Linux
+  `linux_dirent64` record format (`d_ino`, `d_off`, `d_reclen`, `d_type`,
+  name), so opendir / readdir wrappers are one loop away.  The VFS slot's
+  offset doubles as the entry cursor (`lseek(fd, 0, SET)` rewinds),
+  `d_off` is the next entry's index, records go back whole or not at
+  all, and the call ends at 0 (the EOF).
+- **ioctl** answers the `isatty` pair on the console: `TCGETS` succeeds
+  (a zeroed termios -- nothing to configure yet) and `TIOCGWINSZ`
+  reports the 80x25 text grid; every other request, and every
+  non-console descriptor, is `-ENOTTY`.
+- **unlink / mkdir / rmdir / rename / link** are the VFS name-space calls
+  exposed to ring 3, with the errno surface a POSIX program expects
+  (`-EEXIST`, `-ENOTEMPTY`, `-EISDIR` through unlink, `-ENOTDIR`,
+  `-EXDEV` across mounts, `-EMLINK` at the link limit).  `mkdir`'s mode
+  bits reach the inode (nothing checks them yet -- phase 3.5).
+- **uname** fills the six 65-byte fields (`PrismOS` / `prismos` / `3.1` /
+build string / `x86_64` / `(none)`).
+
+Not here (yet): `select` / `poll`, `mprotect`, `MAP_SHARED` of a file,
+`PROT_NONE`, `fchmod` / `chmod` and anything permission-shaped (phase
+3.5), `clock_gettime` and friends (phase 3.5), `wait4`-style rusage, and
+`getdents` `d_type` for file systems that do not know one (ext4 and devfs
+always do).
+
+Shell: `exec posix` runs the ten phase 3.1 scenarios and prints
+`posix: all 10 passed` -- also part of `make test` (the re-`execve`d
+child reports `postexec: O_CLOEXEC fd closed, dupfd alive, stdout ok`).
 
 ## fork, wait and signals (phase 2.5)
 
@@ -488,7 +591,7 @@ contrib/lua              Lua 5.4.8 (MIT)
 include/                 prism.inc (shared constants), prism/boot.h
 sys/kern                 Rust kernel (no_std, x86_64-unknown-none)
 tools/mkimage.py         GPT disk image builder (ESP + BIOS boot + ext4 root)
-usr/                     user space: crt0 + mini libc (usr/lib), headers, programs (usr/hello, usr/fork)
+usr/                     user space: crt0 + mini libc (usr/lib), headers, programs (usr/hello, usr/fork, usr/fd, usr/posix)
 tests/boot_test.py       QEMU boot tests (incl. ext4 root, layout assertion)
 tests/fs_test.py         host VFS/ext4 tests (tests/fstest is the harness)
 ```

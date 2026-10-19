@@ -20,6 +20,13 @@
 //    13 read(fd, buf, len)   14 open(path, flags)      15 close(fd)
 //    16 lseek(fd, off, whence)  17 dup(fd)            18 pipe(int *fds)
 //                                                          (phase 2.6)
+//    19 stat(path, st)       20 fstat(fd, st)          21 brk(addr)
+//    22 mmap(a,len,prot,fl,fd,off)  23 munmap(addr, len)
+//    24 chdir(path)          25 getcwd(buf, size)      (phase 3.1:
+//    26 dup2(old, new)       27 fcntl(fd, cmd, arg)     the newlib
+//    28 getdents(fd, buf, len)  29 ioctl(fd, req, arg)   syscall set)
+//    30 unlink(path)         31 mkdir(path, mode)      32 rmdir(path)
+//    33 rename(old, new)     34 link(old, new)         35 uname(buf)
 //
 // `exit` never returns to the caller.  `yield` and `sleep` switch to another
 // process and come back here only when the process is scheduled again (the
@@ -52,6 +59,13 @@
 // open descriptions with the child, `write`/`read`/`open`/`close`/
 // `lseek`/`dup`/`pipe` are the six syscalls above, and the device nodes of
 // /dev (devfs) resolve through it.
+//
+// Phase 3.1 (the newlib set): stat / fstat / brk / mmap / munmap /
+// chdir / getcwd / uname (user/sysc.rs) and dup2 / fcntl / getdents /
+// ioctl / unlink / mkdir / rmdir / rename / link (user/fd.rs) -- 17 new
+// numbers, plus O_NONBLOCK / O_CLOEXEC, a per-process cwd and the SIGPIPE
+// rule inside the old ones.  Arguments beyond the third arrive in
+// r10 / r8 / r9 (mmap needs six).
 
 use crate::arch::intr::IsrFrame;
 use crate::mem::vmm::AddressSpace;
@@ -59,6 +73,7 @@ use crate::user::elf;
 use crate::user::fd;
 use crate::user::process;
 use crate::user::signal;
+use crate::user::sysc;
 use crate::user::usermode::{EFAULT, ENOSYS};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -143,7 +158,7 @@ fn sys_execve(frame: &mut IsrFrame, path_p: u64, argv_p: u64, envp_p: u64) -> i6
             Ok(v) => v,
             Err(e) => return e,
         };
-        let abs = crate::fs::fsys::abs(&path);
+        let abs = process::abs_current(&path);
         // A program started without argv still gets argv[0].
         let argv = if argv.is_empty() { alloc::vec![path.clone().into_bytes()] } else { argv };
         match elf::load_path(&abs, &argv, &envp) {
@@ -162,6 +177,10 @@ fn sys_execve(frame: &mut IsrFrame, path_p: u64, argv_p: u64, envp_p: u64) -> i6
     cur.name = elf::base_name(&abs);
     cur.fpu.reset();
     cur.signals.reset(); // POSIX: execve resets caught signal handlers
+    cur.brk_base = new.image_end; // the new image's heap bounds (3.1)
+    cur.brk = new.image_end;
+    cur.fds.close_exec(); // POSIX: the O_CLOEXEC numbers go (phase 3.1)
+    // The cwd, priority, CPU budget and the surviving descriptors stay.
     // SAFETY: CR0/CR4 were set up by usermode::init; the image is pristine.
     unsafe { cur.fpu.restore() };
     *frame = crate::user::usermode::user_frame(new.entry, new.rsp);
@@ -172,6 +191,8 @@ fn sys_execve(frame: &mut IsrFrame, path_p: u64, argv_p: u64, envp_p: u64) -> i6
 /// frame on the current process's kernel stack.  `exit` never returns.
 pub extern "C" fn dispatch(frame: &mut IsrFrame) {
     let (a0, a1, a2) = (frame.rdi, frame.rsi, frame.rdx);
+    // r10 / r8 / r9 carry arguments 4..6 (the Linux order; mmap is the
+    // only six-argument call so far).
     let ret: i64 = match frame.rax {
         0 => process::exit_current(process::Outcome::Exited(a0)),
         2 => process::getpid() as i64,
@@ -206,6 +227,24 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         16 => fd::sys_lseek(a0, a1, a2),
         17 => fd::sys_dup(a0),
         18 => fd::sys_pipe(a0),
+        // ---- phase 3.1: the newlib set ---------------------------------
+        19 => fd::sys_stat(a0, a1),
+        20 => fd::sys_fstat(a0, a1),
+        21 => sysc::sys_brk(a0),
+        22 => sysc::sys_mmap([a0, a1, a2, frame.r10, frame.r8, frame.r9]),
+        23 => sysc::sys_munmap(a0, a1),
+        24 => sysc::sys_chdir(a0),
+        25 => sysc::sys_getcwd(a0, a1),
+        26 => fd::sys_dup2(a0, a1),
+        27 => fd::sys_fcntl(a0, a1, a2),
+        28 => fd::sys_getdents(a0, a1, a2),
+        29 => fd::sys_ioctl(a0, a1, a2),
+        30 => fd::sys_unlink(a0),
+        31 => fd::sys_mkdir(a0, a1),
+        32 => fd::sys_rmdir(a0),
+        33 => fd::sys_rename(a0, a1),
+        34 => fd::sys_link(a0, a1),
+        35 => sysc::sys_uname(a0),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

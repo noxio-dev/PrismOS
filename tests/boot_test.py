@@ -148,7 +148,7 @@ def main():
           ("pid 5 hello -- exited with status 0", "exec hello fault\r"),
           ("pid 6 hello -- killed by exception 14", "exec hello exit 42\r"),
           ("pid 7 hello -- exited with status 42", "exec notelf\r")],
-         ['argv[2] = "alpha"', "env: PRISMOS=2.6", "main() runs at 0x80", "AT_PAGESZ = 4096",
+         ['argv[2] = "alpha"', "env: PRISMOS=3.1", "main() runs at 0x80", "AT_PAGESZ = 4096",
           "float check: ok",
           "hello chain: pid 2 calls execve()", 'argv[2] = "(after execve)"', 'argv[4] = "y"',
           "execve(/nonexistent)         -> -2", "execve(/boot/loader.conf)    -> -13",
@@ -205,6 +205,33 @@ def main():
           "pid 1 fd -- exited with status 0",
           "process table empty",
           "devfs on /dev (devfs, ro)"], 240),
+        # Phase 3.1: the newlib syscall set.  /bin/posix (built like the
+        # other /bin programs) drives all seventeen new numbers end to end:
+        # stat / fstat with the Linux x86-64 layout, the program break,
+        # anonymous + file mmap (W^X, MAP_FIXED, munmap, copy-on-write across
+        # fork, a file mapping whose pread fill leaves the fd offset alone),
+        # the per-process cwd (a relative open that lands in the process's
+        # directory, not the shell's), dup2 / fcntl / F_DUPFD /
+        # FD_CLOEXEC-surviving-execve (checked from a re-exec'ed child),
+        # O_NONBLOCK pipes, the SIGPIPE rule (a readerless writer dies by
+        # signal 13 unless it ignores the signal), getdents (the linux
+        # dirent records of /bin and /dev), the name-space syscalls (mkdir,
+        # unlink, rmdir, rename, link) and uname / the isatty ioctl pair.
+        # The shell steps also exercise its own `cd` + `pwd`.
+        ("BIOS shell: newlib syscall set (phase 3.1)", bios_cmd,
+         [("prism# ", "exec posix\r"),
+          ("posix: all 10 passed", "ps\r"),
+          ("prism# ", "cd /boot\r"),
+          ("prism# ", "pwd\r")],
+         ["posix (pid 1): the newlib syscall set",
+          "stat      ok", "brk       ok", "mmap      ok", "cwd       ok",
+          "dup2      ok", "nonblk    ok", "sigpipe   ok", "getdents  ok",
+          "fsops     ok", "uname     ok",
+          "posix: all 10 passed",
+          "postexec: O_CLOEXEC fd closed, dupfd alive, stdout ok",
+          "pid 1 posix -- exited with status 0",
+          "process table empty",
+          "/boot"], 240),
     ]
     if code and vars_ and os.path.exists(code):
         scenarios += [

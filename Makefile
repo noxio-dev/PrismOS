@@ -136,14 +136,14 @@ $B/kernel: FORCE
 	@cmp -s $(KERNEL_ELF) $@ || cp -f $(KERNEL_ELF) $@
 FORCE:
 
-# ---- user space (phases 2.4 + 2.5 + 2.6) ------------------------------------------
+# ---- user space (phases 2.4 + 2.5 + 2.6 + 3.1) -----------------------------------
 # Programs are static PIE ELF files (the kernel's loader applies the RELATIVE
 # relocations at USER_BASE), linked with page-aligned segments so each one
 # gets its own protection (W^X).  usr/lib = crt0 + mini libc, usr/<name>/<name>.c
 # = one program, installed as /bin/<name> in the ext4 root.
 
 LLD       ?= ld.lld
-USR_PROGS := hello fork fd
+USR_PROGS := hello fork fd posix
 USR_CFLAGS := -target x86_64-unknown-none-elf -ffreestanding -fPIE -fno-stack-protector \
               -fno-asynchronous-unwind-tables -fno-math-errno -O2 -Wall -Wextra \
               -nostdinc -isystem $(CCRES) -I usr/include

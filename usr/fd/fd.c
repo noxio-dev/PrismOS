@@ -274,9 +274,15 @@ static int sc_epipe(void)
 
         if (sys_pipe(p))
                 return check("epipe", 0, "pipe failed"), 1;
+        /* Phase 3.1: a readerless write is a death sentence by SIGPIPE
+         * now (the POSIX default).  Ignore the signal here so the write
+         * itself can be observed -- the sigpipe scenario of /bin/posix
+         * covers both sides of the rule. */
+        sys_signal(PRISM_SIGPIPE, PRISM_SIG_IGN);
         sys_close(p[0]); /* no reader left */
         w = sys_write(p[1], "x", 1);
         sys_close(p[1]);
+        sys_signal(PRISM_SIGPIPE, PRISM_SIG_DFL);
 
         fmt(d, sizeof d, "write with no reader returned %ld", w);
         check("epipe", w == -PRISM_EPIPE, d);

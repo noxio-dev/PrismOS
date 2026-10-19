@@ -186,8 +186,22 @@ pub struct Process {
     pub signals: SignalState,
     /// Open file descriptors (phase 2.6): fd -> shared open file
     /// descriptions (user/fd.rs).  fork copies the table (the descriptions
-    /// themselves are shared), execve keeps it, death releases it.
+    /// themselves are shared), execve keeps it (minus the O_CLOEXEC ones,
+    /// phase 3.1), death releases it.
     pub fds: FdTable,
+    /// Current working directory (phase 3.1): absolute, normalized.  A
+    /// fresh process starts from the shell's, `fork` copies it, `execve`
+    /// keeps it, `chdir` changes it -- every path-taking syscall of the
+    /// process resolves against it.
+    pub cwd: String,
+    /// Where the heap began: the page after the loaded image (phase 3.1).
+    /// The break may shrink back to it but never below -- `brk`'s notion of
+    /// "the image ends here" survives growth and shrinkage.
+    pub brk_base: u64,
+    /// Program break (phase 3.1): the first byte past the heap.  `brk`
+    /// grows / shrinks it between `brk_base` and USER_MMAP_BASE; the value
+    /// is byte-granular, the pages are mapped page-granular.
+    pub brk: u64,
     /// The pid a `Waiting` process waits for (0 = any child).
     wait_pid: u64,
     /// Priority level, 0 = best.
@@ -254,6 +268,19 @@ pub fn getpid() -> u64 {
     current().map_or(0, |p| p.pid)
 }
 
+/// The absolute, normalized form of `path` as the *calling process* sees
+/// it: relative paths resolve against the process's own cwd (phase 3.1),
+/// or the shell's when no process is running (kernel context).  This is
+/// what every path-taking syscall uses; the shell's own commands keep
+/// resolving against fsys::cwd().
+pub fn abs_current(path: &str) -> String {
+    let cwd = match current() {
+        Some(p) if !p.cwd.is_empty() => p.cwd.clone(),
+        _ => String::from(crate::fs::fsys::cwd()),
+    };
+    crate::fs::vfs::normalize(&cwd, path)
+}
+
 /// Iterate over the table, main context only (shell commands: `ps`).
 pub fn for_each<F: FnMut(&Process)>(mut f: F) {
     // SAFETY: read-only walk from the main context with no process running
@@ -275,7 +302,9 @@ pub fn count() -> usize {
 
 /// Create a process, ready to be scheduled.  `timeout_ticks` is the
 /// watchdog budget (0 = default 3 s); `ppid` is the parent (0 = the
-/// kernel / shell itself).
+/// kernel / shell itself).  `cwd` is the starting working directory,
+/// `brk_base` / `brk` the heap bounds (0 = none, kernel threads; a fresh
+/// image starts with both on the page after its last segment).
 fn spawn_common(
     name: String,
     aspace: Option<AddressSpace>,
@@ -284,6 +313,9 @@ fn spawn_common(
     timeout_ticks: u64,
     prio: u8,
     ppid: u64,
+    cwd: String,
+    brk_base: u64,
+    brk: u64,
 ) -> Result<u64, &'static str> {
     if prio >= PRIO_LEVELS {
         return Err("bad priority");
@@ -318,6 +350,9 @@ fn spawn_common(
         fpu: FpuState::new(),
         signals: SignalState::new(),
         fds: FdTable::with_stdio(),
+        cwd,
+        brk_base: brk,
+        brk,
         wait_pid: 0,
         prio,
         slice_left: SLICE_TICKS,
@@ -354,19 +389,37 @@ pub fn spawn_user_prio(prog: &Prog, prio: u8) -> Result<u64, &'static str> {
     // (RAII: its Drop frees the user half through the direct map).
     let aspace = usermode::build_aspace(prog.image())?;
     let start = (vmm::USER_CODE_BASE, vmm::USER_STACK_TOP);
-    spawn_common(String::from(prog.name), Some(aspace), Entry::User, start, prog.timeout, prio, 0)
+    // The flat image is read-only code; the break starts on the page after
+    // it, where `brk` can map heap pages (phase 3.1).
+    let brk = vmm::USER_CODE_BASE + (prog.image().len() as u64).div_ceil(vmm::PAGE) * vmm::PAGE;
+    let cwd = String::from(crate::fs::fsys::cwd());
+    spawn_common(String::from(prog.name), Some(aspace), Entry::User, start, prog.timeout, prio, 0, cwd, brk, brk)
 }
 
-/// Spawn a process from a loaded ELF image (phase 2.4).
+/// Spawn a process from a loaded ELF image (phase 2.4).  The break starts
+/// right after the last segment (phase 3.1), the cwd is the shell's.
 pub fn spawn_loaded(name: String, prog: Loaded, prio: u8) -> Result<u64, &'static str> {
-    spawn_common(name, Some(prog.aspace), Entry::User, (prog.entry, prog.rsp), 0, prio, 0)
+    let brk = prog.image_end;
+    let cwd = String::from(crate::fs::fsys::cwd());
+    spawn_common(name, Some(prog.aspace), Entry::User, (prog.entry, prog.rsp), 0, prio, 0, cwd, brk, brk)
 }
 
 /// Spawn a kernel thread (runs `f` in ring 0 on its own kernel stack).
 /// Kernel threads have no watchdog and are never preempted: they must
 /// cooperate on their own.
 pub fn spawn_kernel(name: &'static str, f: fn()) -> Result<u64, &'static str> {
-    spawn_common(String::from(name), None, Entry::Kernel(f), (0, 0), 0, PRIO_DEFAULT, 0)
+    spawn_common(
+        String::from(name),
+        None,
+        Entry::Kernel(f),
+        (0, 0),
+        0,
+        PRIO_DEFAULT,
+        0,
+        String::from("/"),
+        0,
+        0,
+    )
 }
 
 /// Run `f` on the process with the given pid, if it is in the table.
@@ -430,6 +483,10 @@ pub fn fork_current(frame: &IsrFrame) -> i64 {
     // The child shares the parent's open descriptions (Rc bumps): the
     // tables are separate, what they point at is not.
     let fds = cur.fds.fork_copy();
+    // The child keeps the parent's working directory and program break
+    // (phase 3.1: the COW clone copies the heap pages, so the break value
+    // carries over as is).
+    let (cwd, brk_base, brk) = (cur.cwd.clone(), cur.brk_base, cur.brk);
     let aspace = {
         let Some(a) = cur.aspace.as_mut() else { return -EFAULT };
         match a.fork_cow() {
@@ -441,7 +498,18 @@ pub fn fork_current(frame: &IsrFrame) -> i64 {
     let mut child_frame = *frame;
     child_frame.rax = 0;
     child_frame.rflags = (child_frame.rflags | 0x200) & !0x100; // IF on, TF off
-    match spawn_common(name, Some(aspace), Entry::UserFrame(child_frame), (0, 0), 0, prio, pid_of_parent) {
+    match spawn_common(
+        name,
+        Some(aspace),
+        Entry::UserFrame(child_frame),
+        (0, 0),
+        0,
+        prio,
+        pid_of_parent,
+        cwd,
+        brk_base,
+        brk,
+    ) {
         Ok(pid) => {
             // Single CPU: the child cannot run before we yield, so the fixup
             // below happens-before its first switch.  The stdio table the

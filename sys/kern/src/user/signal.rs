@@ -49,11 +49,25 @@ pub const SIGFPE: u64 = 8;
 pub const SIGKILL: u64 = 9;
 pub const SIGUSR1: u64 = 10;
 pub const SIGSEGV: u64 = 11;
+pub const SIGPIPE: u64 = 13;
 pub const SIGTERM: u64 = 15;
 pub const SIGCHLD: u64 = 17;
 
+/// `signal()` dispositions beyond a plain handler (phase 3.1): 0 is the
+/// default action (as before), 1 is SIG_IGN -- "ignore".  The value is the
+/// classic `((void *)1)` of every unix, and what lets a program opt out of
+/// the default SIGPIPE death when writing to a readerless pipe.
+pub const SIG_IGN: u64 = 1;
+
 const ESRCH: i64 = 3;
 const EINVAL: i64 = 22;
+const EPIPE: i64 = 32;
+
+/// Signals whose default action terminates the process (SIGPIPE joined the
+/// set in phase 3.1: a readerless pipe write is a death sentence by POSIX).
+fn terminates_by_default(sig: u64) -> bool {
+    sig == SIGKILL || sig == SIGTERM || sig == SIGINT || sig == SIGPIPE
+}
 
 /// Wait flags (the part wait() understands).
 pub const WNOHANG: u64 = 1;
@@ -92,9 +106,10 @@ fn with_current<R>(f: impl FnOnce(&mut SignalState) -> R) -> Option<R> {
     process::current().map(|p| f(&mut p.signals))
 }
 
-/// `signal(sig, handler)`: install (0 = default) and return the old one.
-/// The handler must live in user space: a kernel address there would either
-/// fault on `sysretq` or hand ring 3 a path it must not have.
+/// `signal(sig, handler)`: install a handler (0 = default action, 1 =
+/// SIG_IGN) and return the old disposition.  A handler must live in user
+/// space: a kernel address there would either fault on `sysretq` or hand
+/// ring 3 a path it must not have.
 pub fn sys_signal(sig: u64, handler: u64) -> i64 {
     if sig == 0 || sig >= NSIG as u64 {
         return -EINVAL;
@@ -102,7 +117,7 @@ pub fn sys_signal(sig: u64, handler: u64) -> i64 {
     if sig == SIGKILL {
         return -EINVAL; // catching SIGKILL is refused, like everywhere
     }
-    if handler != 0 && !(USER_BASE..USER_END).contains(&handler) {
+    if handler != 0 && handler != SIG_IGN && !(USER_BASE..USER_END).contains(&handler) {
         return -EINVAL;
     }
     match with_current(|s| core::mem::replace(&mut s.handlers[sig as usize], handler)) {
@@ -136,7 +151,7 @@ pub fn sys_kill(pid: u64, sig: u64) -> i64 {
         }) {
             Some(true) => 0,
             Some(false) => {
-                if sig == SIGTERM || sig == SIGINT {
+                if terminates_by_default(sig) {
                     process::exit_current(process::Outcome::Signaled(sig));
                 }
                 0 // SIGCHLD and the rest are ignored by default
@@ -157,7 +172,7 @@ pub fn sys_kill(pid: u64, sig: u64) -> i64 {
         return 0; // pending: delivered at its next syscall return
     }
     // Default action on the target.
-    if sig == SIGKILL || sig == SIGTERM || sig == SIGINT {
+    if terminates_by_default(sig) {
         if !process::signal_target(pid, sig) {
             return -ESRCH; // it died in between: not an error worth hiding
         }
@@ -222,18 +237,40 @@ fn sanitize_user_frame(f: &mut IsrFrame) -> bool {
 
 // ---------------------------------------------------------------- delivery
 
+/// The write side of a readerless pipe met the POSIX SIGPIPE rule (phase
+/// 3.1, called from user/fd.rs): with the default disposition the process
+/// dies by signal 13 and this never returns; with SIG_IGN -- or a handler
+/// installed, in which case the signal goes pending for the syscall return
+/// -- the caller reports -EPIPE and carries on.
+pub fn pipe_sigpipe() -> i64 {
+    let handler = with_current(|s| s.handlers[SIGPIPE as usize]);
+    match handler {
+        Some(SIG_IGN) => -EPIPE,
+        Some(h) if h != 0 => {
+            let _ = with_current(|s| s.pending |= 1 << SIGPIPE);
+            -EPIPE
+        }
+        _ => process::exit_current(process::Outcome::Signaled(SIGPIPE)),
+    }
+}
+
 /// Deliver one pending signal to the running process by rewriting its trap
 /// frame: the current user context is pushed on the user stack (below the
 /// red zone), the handler becomes the new return target, and the return
 /// address planted for it is the `sigreturn` trampoline.  Called from the
 /// syscall dispatch, just before `sysretq`.
 pub fn deliver(frame: &mut IsrFrame) {
-    // Pick a signal: lowest number first, handlers only, nothing blocked.
+    // Pick a signal: lowest number first, handlers only (SIG_IGN counts as
+    // "installed" -- its pending bit is simply dropped), nothing blocked.
     let pick = with_current(|s| {
         let mut pick = None;
         for sig in 1..NSIG as u64 {
             let bit = 1u32 << sig;
             if s.pending & bit == 0 || s.blocked & bit != 0 {
+                continue;
+            }
+            if s.handlers[sig as usize] == SIG_IGN {
+                s.pending &= !bit; // ignored: consume and move on
                 continue;
             }
             if s.handlers[sig as usize] != 0 {
