@@ -54,9 +54,13 @@
 // ditto.
 //
 // Paths resolve against the *calling process's* cwd (phase 3.1; before
-// that they went to the shell's).  Still not here: O_NONBLOCK on the
-// console *output* (writes never block anyway), select/poll, and anything
-// about permissions (single user, ring 0 -- see the README).
+// that they went to the shell's).  Phase 3.2 adds the multiplex pair on
+// top of the table: poll / select watch the descriptors through a
+// readiness probe (files always ready, console input when a byte is
+// pending, pipes by their buffer state), parking the bounded way.  Still
+// not here: O_NONBLOCK on the console *output* (writes never block
+// anyway), and anything about permissions (single user, ring 0 -- see the
+// README).
 
 use alloc::collections::VecDeque;
 use alloc::rc::Rc;
@@ -1166,4 +1170,280 @@ pub fn sys_link(old_p: u64, new_p: u64) -> i64 {
         Err(e) => return e,
     };
     crate::fs::fsys::vfs().link(&old, &new).map_or_else(|e| -fs_errno(e), |_| 0)
+}
+
+// ------------------------------------------------------- poll / select (3.2)
+
+/// poll(2) event bits (the Linux values).
+const POLLIN: i32 = 0x001;
+const POLLOUT: i32 = 0x004;
+const POLLERR: i32 = 0x008;
+const POLLHUP: i32 = 0x010;
+const POLLNVAL: i32 = 0x020;
+/// The readable / writable questions an entry may ask: POLLIN |
+/// POLLRDNORM | POLLRDBAND (0x001 | 0x040 | 0x080) and POLLOUT |
+/// POLLWRNORM | POLLWRBAND (0x004 | 0x100 | 0x200) -- everything a caller
+/// can mean maps onto the two directions.
+const READ_ASKED: i32 = POLLIN | 0x040 | 0x080;
+const WRITE_ASKED: i32 = POLLOUT | 0x100 | 0x200;
+
+/// Most descriptors one poll / select call may watch (an fd_set's worth;
+/// our tables are 64 deep, the libc's sets 1024).
+const MAX_POLLFDS: usize = 1024;
+/// fd_set: 1024 bits, 128 bytes, 16 words.
+const FDSET_WORDS: usize = 16;
+
+/// What poll / select report about one description: whether a `read` /
+/// `write` would not park, and the exceptional bits (a readerless pipe).
+/// Files, /dev/null and /dev/zero are always ready in the directions they
+/// were opened for (a read returns data or EOF -- EOF is readiness, a read
+/// answers 0 -- and file writes never park); the console is readable
+/// exactly when a decoded byte is pending (the same merge the line reader
+/// polls); a pipe read end is readable with buffered bytes or at EOF (no
+/// writer left -- POLLHUP), a pipe write end writable with buffer space,
+/// or POLLERR when nobody reads the other end.
+struct Ready {
+    read: bool,
+    write: bool,
+    err: bool,
+    hup: bool,
+}
+
+/// The readiness probe behind both multiplex syscalls.
+fn desc_ready(desc: &Rc<FileDesc>) -> Ready {
+    let f = desc.flags();
+    match &desc.kind {
+        Kind::Vfs(_) => Ready { read: f & O_READ != 0, write: f & O_WRITE != 0, err: false, hup: false },
+        Kind::Console => Ready { read: input_pending(), write: f & O_WRITE != 0, err: false, hup: false },
+        Kind::DevNull | Kind::DevZero => {
+            Ready { read: f & O_READ != 0, write: f & O_WRITE != 0, err: false, hup: false }
+        }
+        Kind::PipeRead(p) => {
+            let p = p.borrow();
+            let eof = p.writers == 0;
+            Ready { read: !p.buf.is_empty() || eof, write: false, err: false, hup: eof }
+        }
+        Kind::PipeWrite(p) => {
+            let p = p.borrow();
+            let broken = p.readers == 0;
+            Ready { read: false, write: PIPE_CAPACITY - p.buf.len() > 0 || broken, err: broken, hup: false }
+        }
+    }
+}
+
+/// Whether the keyboard or the serial line holds an input byte (the
+/// non-destructive twin of `get_input_byte`).
+fn input_pending() -> bool {
+    crate::hw::kbd::has_char() || crate::hw::serial::has_byte()
+}
+
+/// The common deadline: `timeout_ms` (poll's int; negative = forever) or a
+/// `struct timeval` at `tv_p` (select; NULL = forever), house-capped like
+/// every bounded blocker here (WAIT_MAX_MS): the shell is blocked while
+/// its children run, so nothing may wait forever.
+fn wait_deadline(timeout_ms: u64, start: u64) -> u64 {
+    if timeout_ms as i64 >= 0 {
+        start + timeout_ms.min(WAIT_MAX_MS)
+    } else {
+        start + WAIT_MAX_MS // negative = "forever", by the house rule
+    }
+}
+
+/// `poll(fds, nfds, timeout_ms)` (syscall 41, phase 3.2): the Linux pollfd
+/// array -- 8 bytes per entry (int fd, short events, short revents).
+/// POLLIN / POLLOUT follow the readiness probe; POLLERR / POLLHUP /
+/// POLLNVAL are always reported (they are output-only bits).  The call
+/// parks (bounded, like every blocking wait here) until some descriptor is
+/// ready or the timeout expires, then answers the number of entries with a
+/// non-zero revents (0 on timeout), revents written back for every entry.
+/// A negative fd is skipped (POSIX: ignored, revents 0); a closed number
+/// polls POLLNVAL.  Unknown event bits are dropped on the floor.
+pub fn sys_poll(fds_p: u64, nfds: u64, timeout_ms: u64) -> i64 {
+    let n = nfds as usize;
+    if n > MAX_POLLFDS {
+        return -EINVAL;
+    }
+    // The array in kernel memory (8 KB worst case -- the heap, not the
+    // 16 KiB kernel stack).
+    let mut buf: Vec<u8> = alloc::vec![0u8; n * 8];
+    if n > 0 {
+        let Some(cur) = process::current() else { return -EFAULT };
+        let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return -EFAULT };
+        if !aspace.read(fds_p, &mut buf) {
+            return -EFAULT;
+        }
+    }
+    let start = uptime_ms();
+    let deadline = wait_deadline(timeout_ms, start);
+    let mut revents: Vec<i32> = alloc::vec![0; n];
+    loop {
+        let mut ready = 0i64;
+        for i in 0..n {
+            let fd = i32::from_le_bytes(buf[i * 8..i * 8 + 4].try_into().unwrap());
+            let events = i16::from_le_bytes(buf[i * 8 + 4..i * 8 + 6].try_into().unwrap()) as i32;
+            let mut re = 0i32;
+            if fd >= 0 {
+                match desc_of(fd as usize) {
+                    None => re = POLLNVAL, // a closed number is not a watchable one
+                    Some(d) => {
+                        let r = desc_ready(&d);
+                        if r.err {
+                            re |= POLLERR;
+                        }
+                        if r.hup {
+                            re |= POLLHUP;
+                        }
+                        // The directions asked about, answered.
+                        if r.read && events & READ_ASKED != 0 {
+                            re |= POLLIN;
+                        }
+                        if r.write && events & WRITE_ASKED != 0 {
+                            re |= POLLOUT;
+                        }
+                    }
+                }
+            }
+            revents[i] = re;
+            if re != 0 {
+                ready += 1;
+            }
+        }
+        if ready > 0 || uptime_ms() >= deadline {
+            // Write the revents back into the array and hand it to the user
+            // (fd / events go back as they came -- the ABI leaves them
+            // alone, and so do we).
+            for i in 0..n {
+                let re = revents[i] as i16;
+                buf[i * 8 + 6..i * 8 + 8].copy_from_slice(&re.to_le_bytes());
+            }
+            if n > 0 && !copy_out(fds_p, 0, &buf) {
+                return -EFAULT;
+            }
+            return ready;
+        }
+        park_once();
+    }
+}
+
+/// `select(nfds, readfds, writefds, exceptfds, timeout)` (syscall 42, phase
+/// 3.2; five arguments -- r10 / r8 carry 4 and 5): the classic three
+/// bitsets (fd_set: 1024 bits) plus a `struct timeval`.  Readiness follows
+/// the same probe as poll; exceptfds is accepted and always comes back
+/// empty (nothing exceptional ever happens here).  The call parks (bounded)
+/// until a watched descriptor is ready or the timeout (NULL = forever,
+/// capped; a zero timeval is a single probe) expires; it answers the number
+/// of bits set in the returned sets (0 on timeout), -EBADF when a watched
+/// number is not open (POSIX), -EINVAL for a bad nfds, -EFAULT for bad
+/// pointers.  Bits above nfds are ignored, like everywhere.
+pub fn sys_select(nfds: u64, r_p: u64, w_p: u64, e_p: u64, tv_p: u64) -> i64 {
+    if nfds as usize > MAX_POLLFDS {
+        return -EINVAL;
+    }
+    // The three sets in, 384 bytes of kernel stack.
+    let mut r = [0u64; FDSET_WORDS];
+    let mut w = [0u64; FDSET_WORDS];
+    let mut e = [0u64; FDSET_WORDS];
+    {
+        let Some(cur) = process::current() else { return -EFAULT };
+        let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return -EFAULT };
+        for (ptr, set) in [(r_p, &mut r), (w_p, &mut w), (e_p, &mut e)] {
+            if ptr == 0 {
+                continue;
+            }
+            let mut bytes = [0u8; FDSET_WORDS * 8];
+            if !aspace.read(ptr, &mut bytes) {
+                return -EFAULT;
+            }
+            for (i, word) in set.iter_mut().enumerate() {
+                *word = u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
+            }
+        }
+    }
+    // Bits past nfds never existed (a libc zeroes them; so do we).
+    if nfds < 1024 {
+        let last = (nfds / 64) as usize;
+        let mask = (1u64 << (nfds % 64)).wrapping_sub(1);
+        for set in [&mut r, &mut w, &mut e] {
+            for (i, word) in set.iter_mut().enumerate() {
+                if i > last {
+                    *word = 0;
+                } else if i == last {
+                    *word &= mask;
+                }
+            }
+        }
+    }
+    // The deadline: a timeval (NULL = forever), house-capped like above.
+    let start = uptime_ms();
+    let deadline = if tv_p == 0 {
+        start + WAIT_MAX_MS
+    } else {
+        let got: Result<u64, i64> = {
+            let Some(cur) = process::current() else { return -EFAULT };
+            let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return -EFAULT };
+            let mut bytes = [0u8; 16];
+            if !aspace.read(tv_p, &mut bytes) {
+                return -EFAULT;
+            }
+            let sec = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
+            let usec = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
+            if !(0..1_000_000).contains(&usec) {
+                return -EINVAL;
+            }
+            let ms = sec.saturating_mul(1000).saturating_add(usec / 1000);
+            Ok(ms.max(0) as u64)
+        };
+        match got {
+            Ok(ms) => start + ms.min(WAIT_MAX_MS),
+            Err(e) => return e,
+        }
+    };
+    loop {
+        let mut outr = [0u64; FDSET_WORDS];
+        let mut outw = [0u64; FDSET_WORDS];
+        let mut count = 0i64;
+        for fd in 0..nfds {
+            let (word, bit) = ((fd / 64) as usize, 1u64 << (fd % 64));
+            let want_r = r[word] & bit != 0;
+            let want_w = w[word] & bit != 0;
+            let want_e = e[word] & bit != 0;
+            if !want_r && !want_w && !want_e {
+                continue;
+            }
+            let Some(d) = desc_of(fd as usize) else {
+                return -EBADF; // POSIX: a watched number that is not open
+            };
+            let ready = desc_ready(&d);
+            if want_r && ready.read {
+                outr[word] |= bit;
+                count += 1;
+            }
+            if want_w && ready.write {
+                outw[word] |= bit;
+                count += 1;
+            }
+            // exceptfds: nothing exceptional ever happens here -- the set
+            // comes back empty, which POSIX lets us choose.
+        }
+        if count > 0 || uptime_ms() >= deadline {
+            // The modified sets go back (a NULL set pointer stays NULL --
+            // nothing to answer into).
+            let Some(cur) = process::current() else { return -EFAULT };
+            let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return -EFAULT };
+            for (ptr, set) in [(r_p, &outr), (w_p, &outw)] {
+                if ptr == 0 {
+                    continue;
+                }
+                let mut bytes = [0u8; FDSET_WORDS * 8];
+                for (i, word) in set.iter().enumerate() {
+                    bytes[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
+                }
+                if !aspace.ensure_writable(ptr) || !aspace.write(ptr, &bytes, false) {
+                    return -EFAULT;
+                }
+            }
+            return count;
+        }
+        park_once();
+    }
 }

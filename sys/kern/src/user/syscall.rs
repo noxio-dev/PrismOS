@@ -28,6 +28,17 @@
 //    30 unlink(path)         31 mkdir(path, mode)      32 rmdir(path)
 //    33 rename(old, new)     34 link(old, new)         35 uname(buf)
 //
+// Phase 3.2 (the mlibc prerequisites, first step):
+//    36 arch_prctl(code, addr)          TLS: the FS/GS base pair
+//    37 futex(uaddr, op, val, timeout, uaddr2, val3) -- six arguments
+//                                      (r10 / r8 / r9 carry 4..6, like
+//                                      mmap)
+//    38 sigaction(sig, act, oldact)    39 sigprocmask(how, set, oldset)
+//    40 mprotect(addr, len, prot)     41 poll(fds, nfds, timeout_ms)
+//    42 select(nfds, r, w, e, tv)     43 clock_gettime(clk, ts)
+//                                      (select's 4th and 5th ride in
+//                                      r10 / r8)
+//
 // `exit` never returns to the caller.  `yield` and `sleep` switch to another
 // process and come back here only when the process is scheduled again (the
 // trap frame stayed on its kernel stack).  `yield` only hands the CPU to a
@@ -71,6 +82,7 @@ use crate::arch::intr::IsrFrame;
 use crate::mem::vmm::AddressSpace;
 use crate::user::elf;
 use crate::user::fd;
+use crate::user::futex;
 use crate::user::process;
 use crate::user::signal;
 use crate::user::sysc;
@@ -176,10 +188,15 @@ fn sys_execve(frame: &mut IsrFrame, path_p: u64, argv_p: u64, envp_p: u64) -> i6
     drop(old);
     cur.name = elf::base_name(&abs);
     cur.fpu.reset();
-    cur.signals.reset(); // POSIX: execve resets caught signal handlers
+    cur.signals.exec_reset(); // POSIX: caught -> default, SIG_IGN kept, mask kept
     cur.brk_base = new.image_end; // the new image's heap bounds (3.1)
     cur.brk = new.image_end;
     cur.fds.close_exec(); // POSIX: the O_CLOEXEC numbers go (phase 3.1)
+    // The fresh image has no TLS of its own yet (phase 3.2): zero the
+    // thread registers -- arch_prctl installs the new ones.
+    cur.fs_base = 0;
+    cur.gs_base = 0;
+    crate::user::usermode::set_user_thread(0, 0);
     // The cwd, priority, CPU budget and the surviving descriptors stay.
     // SAFETY: CR0/CR4 were set up by usermode::init; the image is pristine.
     unsafe { cur.fpu.restore() };
@@ -245,6 +262,15 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         33 => fd::sys_rename(a0, a1),
         34 => fd::sys_link(a0, a1),
         35 => sysc::sys_uname(a0),
+        // ---- phase 3.2: the mlibc prerequisites ------------------------
+        36 => sysc::sys_arch_prctl(a0, a1),
+        37 => futex::sys_futex([a0, a1, a2, frame.r10, frame.r8, frame.r9]),
+        38 => signal::sys_sigaction(a0, a1, a2),
+        39 => signal::sys_sigprocmask(a0, a1, a2),
+        40 => sysc::sys_mprotect(a0, a1, a2),
+        41 => fd::sys_poll(a0, a1, a2),
+        42 => fd::sys_select(a0, a1, a2, frame.r10, frame.r8),
+        43 => sysc::sys_clock_gettime(a0, a1),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

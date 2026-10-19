@@ -676,6 +676,15 @@ impl AddressSpace {
         }
     }
 
+    /// Identity of this address space for cross-syscall bookkeeping (the
+    /// futex waiter table, phase 3.2): the PML4's physical address.  Two
+    /// processes share futex queues exactly when they share tables -- which
+    /// after a `fork` they do not (the child waits on its own COW copy),
+    /// the same rule Linux's per-mm queues follow.
+    pub fn id(&self) -> u64 {
+        self.pml4
+    }
+
     /// Map the physical page `phys` at `virt` for user access.  `w`: writable,
     /// `x`: executable.  Fails if `virt` is outside user space, unaligned, in
     /// a kernel-owned slot, already mapped, or out of memory.
@@ -1030,6 +1039,111 @@ impl AddressSpace {
         while v < end {
             if self.translate(v).is_some() {
                 return false;
+            }
+            v += PAGE;
+        }
+        true
+    }
+
+    /// `mprotect`'s engine (phase 3.2): change the protection bits of the
+    /// pages covering `[virt, virt + len)`.  Every page of the range must
+    /// be present (false = -ENOMEM's worth); the sigcode page is the
+    /// caller's business to refuse.  COW-aware: making a COW page writable
+    /// resolves the copy first (`handle_cow_fault`, in the owner's
+    /// context); making a *shared* read-only page writable -- a code page a
+    /// fork sibling also maps, `cow::refcount > 1` -- copies it, so the
+    /// sibling never sees the write.  Clearing write clears RW (a COW page
+    /// keeps its COW bit: the next write still copies); NX follows `x`.
+    /// A mid-range failure (a copy that cannot be made) can leave the pages
+    /// before it re-protected -- the false return tells the caller which
+    /// end not to trust.
+    ///
+    /// # Safety
+    /// Must run in the owning process's context (its CR3 live, interrupts
+    /// masked): `invlpg` targets the live translation context and the COW
+    /// resolution resolves through it.
+    pub unsafe fn mprotect(&mut self, virt: u64, len: u64, w: bool, x: bool) -> bool {
+        let start = virt & !(PAGE - 1);
+        let Some(end) = virt.checked_add(len).and_then(|e| e.checked_add(PAGE - 1)) else {
+            return false;
+        };
+        let end = end & !(PAGE - 1);
+        if !user_range_ok(start, 1) || !user_range_ok(end.saturating_sub(1), 1) || end < start {
+            return false;
+        }
+        // Pass 1: the whole range must be mapped (Linux answers ENOMEM for
+        // a hole, and applying half a change is worse than refusing).
+        let mut v = start;
+        while v < end {
+            if self.pte_slot(v).is_none() {
+                return false;
+            }
+            v += PAGE;
+        }
+        // Pass 2: rewrite, page by page.
+        let mut v = start;
+        while v < end {
+            let Some(slot) = self.pte_slot(v) else { return false };
+            // SAFETY: pte_slot only reports present leaves of this space.
+            let mut pte = unsafe { (slot as *const u64).read_volatile() };
+            if w && pte & RW == 0 {
+                if pte & COW != 0 {
+                    // Resolve the copy-on-write first (owner context):
+                    // afterwards the entry is RW, COW clear.
+                    // SAFETY: owner context, interrupts masked.
+                    if !unsafe { self.handle_cow_fault(v) } {
+                        return false; // the copy could not be made
+                    }
+                    // SAFETY: as above.
+                    pte = unsafe { (slot as *const u64).read_volatile() };
+                } else if crate::mem::cow::refcount(pte & PHYS_MASK) > 1 {
+                    // A shared read-only page (code / rodata a fork sibling
+                    // maps too): copy before handing out the write.
+                    let phys = pte & PHYS_MASK;
+                    let Some(fresh) = crate::mem::pmm::alloc_page() else { return false };
+                    let (src, dst) = match (phys_access(phys), phys_access(fresh)) {
+                        (Some(s), Some(d)) => (s, d),
+                        _ => {
+                            crate::mem::pmm::free_page(fresh);
+                            return false;
+                        }
+                    };
+                    // SAFETY: two kernel aliases of whole, distinct pages.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, PAGE as usize)
+                    };
+                    // SAFETY: present leaf slot of this space; the new entry
+                    // keeps every flag bit, swaps the frame, gains RW; one
+                    // less owner for the old page.
+                    unsafe {
+                        let npte = fresh | ((pte | RW) & !PHYS_MASK);
+                        (slot as *mut u64).write_volatile(npte);
+                        let _ = crate::mem::cow::release(phys);
+                        crate::arch::regs::invlpg(v);
+                        pte = npte; // fall through: the rewrite below is a no-op
+                    }
+                }
+            }
+            // The plain rewrite: keep the frame and the COW bit (a COW page
+            // staying read-only keeps its copy-on-write contract), set /
+            // clear RW and NX per the asked protection.
+            let mut npte = (pte & PHYS_MASK) | P | US;
+            if w {
+                npte |= RW;
+            }
+            if pte & COW != 0 && !w {
+                npte |= COW; // still read-only shared: the contract survives
+            }
+            if !x {
+                npte |= NX;
+            }
+            if npte != pte {
+                // SAFETY: present leaf slot of this space.
+                unsafe {
+                    (slot as *mut u64).write_volatile(npte);
+                    // The TLB may hold the old entry.
+                    crate::arch::regs::invlpg(v);
+                }
             }
             v += PAGE;
         }

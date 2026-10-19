@@ -24,12 +24,18 @@
 // mkdir, rmdir, rename, link) plus O_NONBLOCK / O_CLOEXEC, a per-process
 // cwd (process.rs) and the SIGPIPE rule.
 //
+// Phase 3.2, first step: the mlibc prerequisites.  arch_prctl (TLS),
+// mprotect and clock_gettime live in sysc.rs; futex.rs owns the waiter
+// table; signal.rs grows sigaction / sigprocmask and the POSIX mask rules;
+// fd.rs grows poll / select on a readiness probe.
+//
 // usermode.rs also carries the built-in flat test programs; shell/shuser.rs
 // exposes them as `user` / `usertest` / `ps` / `kill`.
 
 pub mod elf;
 pub mod fd;
 pub mod fpu;
+pub mod futex;
 pub mod process;
 pub mod signal;
 pub mod sysc;

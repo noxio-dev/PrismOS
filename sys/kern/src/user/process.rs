@@ -202,6 +202,15 @@ pub struct Process {
     /// grows / shrinks it between `brk_base` and USER_MMAP_BASE; the value
     /// is byte-granular, the pages are mapped page-granular.
     pub brk: u64,
+    /// User FS base (phase 3.2): where `arch_prctl(ARCH_SET_FS)` parked the
+    /// thread pointer -- TLS.  Published to the MSR on every switch to the
+    /// process; `fork` copies it, `execve` clears it (a fresh image installs
+    /// its own).
+    pub fs_base: u64,
+    /// User GS base (phase 3.2): the value swapgs hands to ring 3
+    /// (`arch_prctl` ARCH_SET_GS).  Lives in the shadow slot
+    /// (IA32_KERNEL_GS_BASE) while the kernel runs; switched like fs_base.
+    pub gs_base: u64,
     /// The pid a `Waiting` process waits for (0 = any child).
     wait_pid: u64,
     /// Priority level, 0 = best.
@@ -353,6 +362,8 @@ fn spawn_common(
         cwd,
         brk_base: brk,
         brk,
+        fs_base: 0,
+        gs_base: 0,
         wait_pid: 0,
         prio,
         slice_left: SLICE_TICKS,
@@ -485,8 +496,11 @@ pub fn fork_current(frame: &IsrFrame) -> i64 {
     let fds = cur.fds.fork_copy();
     // The child keeps the parent's working directory and program break
     // (phase 3.1: the COW clone copies the heap pages, so the break value
-    // carries over as is).
+    // carries over as is) -- and its TLS pointers (phase 3.2: the child
+    // returns to ring 3 with the parent's FS / GS base; POSIX keeps the
+    // alternate stack / thread pointer state across fork).
     let (cwd, brk_base, brk) = (cur.cwd.clone(), cur.brk_base, cur.brk);
+    let (fs_base, gs_base) = (cur.fs_base, cur.gs_base);
     let aspace = {
         let Some(a) = cur.aspace.as_mut() else { return -EFAULT };
         match a.fork_cow() {
@@ -518,6 +532,8 @@ pub fn fork_current(frame: &IsrFrame) -> i64 {
                 c.fpu = fpu;
                 c.signals = signals;
                 c.fds = fds;
+                c.fs_base = fs_base;
+                c.gs_base = gs_base;
             });
             pid as i64
         }
@@ -782,6 +798,9 @@ unsafe fn cpu_state_for(next: *mut Process) {
         None => vmm::activate_kernel(),
     }
     usermode::set_kstack_top(p.kstack_top);
+    // The user thread registers (phase 3.2): the FS base (TLS) straight,
+    // the user GS base through the swapgs shadow slot.
+    usermode::set_user_thread(p.fs_base, p.gs_base);
     p.fpu.restore();
 }
 
@@ -797,6 +816,8 @@ unsafe fn switch_to_main(cur: *mut SavedCtx) {
     CURRENT = core::ptr::null_mut();
     vmm::activate_kernel();
     usermode::set_kstack_top(0);
+    // Kernel context: no user TLS in the thread registers (phase 3.2).
+    usermode::set_user_thread(0, 0);
     switch_ctx(cur, addr_of_mut!(MAIN_SAVED));
 }
 
@@ -925,6 +946,9 @@ fn zombify_common(p: &mut Process, outcome: Outcome) {
     p.outcome = outcome;
     p.state = State::Zombie;
     p.exit_seq = next_exit_seq();
+    // Its futex waiter (if any) goes with it: a dead process waits on
+    // nothing, and a wake must not count a corpse (phase 3.2).
+    crate::user::futex::on_death(p.pid);
     drop(p.aspace.take());
     p.fds.release();
 }
@@ -960,7 +984,7 @@ unsafe fn after_death(pid: u64) {
                     if q.state == State::Waiting && (q.wait_pid == 0 || q.wait_pid == pid) {
                         q.state = State::Ready;
                     }
-                    if q.signals.handlers[SIGCHLD as usize] != 0 {
+                    if q.signals.handler_of(SIGCHLD) != 0 {
                         q.signals.pending |= 1 << SIGCHLD;
                     }
                     break;
@@ -1000,6 +1024,18 @@ pub fn exit_current(outcome: Outcome) -> ! {
     }
 }
 
+/// Flip a *not running* process parked by a bounded wait (a futex, phase
+/// 3.2) back to Ready, so the scheduler picks it up on its next pass.  A
+/// process that is merely parked-and-about-to-recheck needs no flip; one
+/// already Ready stays that way.
+pub fn wake_parked(pid: u64) {
+    let _ = with_pid_mut(pid, |p| {
+        if p.state == State::Sleeping {
+            p.state = State::Ready;
+        }
+    });
+}
+
 /// True when `pid` names a live (non-zombie) process of the table.
 pub fn has_live(pid: u64) -> bool {
     let flags = crate::arch::io::cli_save();
@@ -1023,7 +1059,7 @@ pub fn post_signal(pid: u64, sig: u64) -> bool {
         let mut raised = false;
         for p in table.iter_mut() {
             if p.pid == pid && p.state != State::Zombie {
-                if p.signals.handlers[sig as usize] != 0 {
+                if p.signals.handler_of(sig) != 0 {
                     p.signals.pending |= 1 << sig;
                     raised = true;
                 }

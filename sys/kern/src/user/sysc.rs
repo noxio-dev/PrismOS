@@ -13,6 +13,15 @@
 //   25 getcwd(buf, size)              ... and read it back
 //   35 uname(buf)                     struct utsname, the classic six
 //
+// Phase 3.2 (the mlibc prerequisites, first step):
+//
+//   36 arch_prctl(code, addr)         the FS/GS base pair TLS lives on
+//   40 mprotect(addr, len, prot)      re-protect mapped pages (COW-aware)
+//   43 clock_gettime(clk, ts)         uptime / RTC time in POSIX clothes
+//
+// (The futex, sigaction / sigprocmask, poll / select halves of the phase
+// live in user/futex.rs, user/signal.rs and user/fd.rs.)
+//
 // Design notes.
 //
 // * `brk` keeps the Unix of 1975 contract: one break per process, growing
@@ -42,11 +51,12 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::fs::vfs::{FileType, O_READ};
-use crate::mem::vmm::{self, AddressSpace, PAGE};
+use crate::mem::vmm::{self, AddressSpace, PAGE, USER_BASE, USER_END, USER_SIGCODE};
 use crate::user::process;
-use crate::user::usermode::{EBADF, EFAULT, EINVAL, ENOSYS};
+use crate::user::usermode::{self, EBADF, EFAULT, EINVAL, ENOSYS};
 
 const ENOENT: i64 = 2;
 const ENOMEM: i64 = 12;
@@ -360,14 +370,14 @@ pub fn sys_getcwd(buf: u64, size: u64) -> i64 {
 // ----------------------------------------------------------------- uname
 
 /// `uname(buf)` (syscall 35): the 6 x 65-byte utsname (sysname, nodename,
-/// release, version, machine, domainname) -- "PrismOS 3.1" in the classic
+/// release, version, machine, domainname) -- "PrismOS 3.2" in the classic
 /// shape, what uname(1)-style tools print.
 pub fn sys_uname(buf: u64) -> i64 {
     const FIELDS: [&str; 6] = [
         "PrismOS",
         "prismos",
-        "3.1",
-        "PrismOS 3.1 (phase 3.1: the newlib syscall set)",
+        "3.2",
+        "PrismOS 3.2 (phase 3.2: the mlibc prerequisites)",
         "x86_64",
         "(none)",
     ];
@@ -380,6 +390,172 @@ pub fn sys_uname(buf: u64) -> i64 {
     let Some(cur) = process::current() else { return -EFAULT };
     let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return -EFAULT };
     if !aspace.ensure_writable(buf) || !aspace.write(buf, &out, false) {
+        return -EFAULT;
+    }
+    0
+}
+
+// ------------------------------------------------------------- arch_prctl
+
+/// `arch_prctl` codes (the Linux x86-64 values, which are what a mlibc
+/// port's thread-area setup passes).
+pub const ARCH_SET_GS: u64 = 0x1001;
+pub const ARCH_SET_FS: u64 = 0x1002;
+pub const ARCH_GET_FS: u64 = 0x1003;
+pub const ARCH_GET_GS: u64 = 0x1004;
+
+/// `arch_prctl(code, addr)` (syscall 36, phase 3.2): the FS/GS base pair a
+/// thread's TLS lives on -- the x86-64 way, what a mlibc port's
+/// `set_thread_area` boils down to.  SET_FS installs the user FS base (the
+/// MSR is live at once: the caller is the running process; the per-process
+/// value is switched with it, `fork` copies it and `execve` clears it);
+/// SET_GS installs the user GS base, which lives in the swapgs shadow slot
+/// (IA32_KERNEL_GS_BASE) while the kernel runs.  GET_* hands the current
+/// value back through `addr`.  Bases must live in user space -- a TLS
+/// pointer into kernel territory would be a loaded gun.
+pub fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
+    let Some(cur) = process::current() else { return -EFAULT };
+    match code {
+        ARCH_SET_FS | ARCH_SET_GS => {
+            if addr != 0 && !(USER_BASE..USER_END).contains(&addr) {
+                return -EINVAL;
+            }
+            if code == ARCH_SET_FS {
+                cur.fs_base = addr;
+                // SAFETY: scalar MSR write from the running process's own
+                // syscall context.
+                unsafe { crate::arch::io::wrmsr(usermode::MSR_FS_BASE, addr) };
+            } else {
+                cur.gs_base = addr;
+                // While we run, the user GS base lives in the shadow half of
+                // the swapgs pair (usermode.rs owns the convention).
+                // SAFETY: as above.
+                unsafe { crate::arch::io::wrmsr(usermode::MSR_KERNEL_GS_BASE, addr) };
+            }
+            0
+        }
+        ARCH_GET_FS | ARCH_GET_GS => {
+            let val = if code == ARCH_GET_FS { cur.fs_base } else { cur.gs_base };
+            let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return -EFAULT };
+            if !aspace.ensure_writable(addr) || !aspace.write(addr, &val.to_le_bytes(), false) {
+                return -EFAULT;
+            }
+            0
+        }
+        _ => -EINVAL, // the FSIF / MPX / CET family: not here
+    }
+}
+
+// --------------------------------------------------------------- mprotect
+
+/// `mprotect(addr, len, prot)` (syscall 40, phase 3.2): change the
+/// protection of mapped pages -- mmap's cousin, what a libc's RELRO pass
+/// and a mlibc port's `sys_vm_protect` need.  The prot bits are mmap's;
+/// W^X applies (write + exec is -EACCES, the rule every mapper here
+/// enforces) and PROT_NONE is refused (nothing maps nothing here, like
+/// mmap).  Every page of the range must be mapped (-ENOMEM, like Linux);
+/// the signal trampoline page is locked r-x forever -- a writable
+/// trampoline would let a program forge sigreturn frames for every signal
+/// it can catch.  See vmm::AddressSpace::mprotect for the COW-aware walk.
+pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
+    const PROT_KNOWN: u64 = PROT_READ | PROT_WRITE | PROT_EXEC;
+    if prot & !PROT_KNOWN != 0 {
+        return -EINVAL; // unknown bits: refuse rather than guess
+    }
+    if prot == 0 {
+        return -EINVAL; // PROT_NONE: nothing maps nothing here
+    }
+    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+        return -EACCES; // W^X, the same rule the ELF loader enforces
+    }
+    if len == 0 {
+        return 0; // aligned and empty: nothing to ask, nothing to fail
+    }
+    if addr & (PAGE - 1) != 0 {
+        return -EINVAL;
+    }
+    let Some(end) = addr.checked_add(len) else { return -ENOMEM };
+    // The kernel-promise page is not negotiable.
+    let sig_lo = USER_SIGCODE & !(PAGE - 1);
+    if addr < sig_lo + PAGE && end > sig_lo {
+        return -EACCES;
+    }
+    let Some(cur) = process::current() else { return -EFAULT };
+    let Some(aspace) = cur.aspace.as_mut() else { return -EFAULT };
+    // SAFETY: syscall context, our CR3 is live (the walk needs it for the
+    // COW resolution and the invlpg's).
+    if unsafe { aspace.mprotect(addr, len, prot & PROT_WRITE != 0, prot & PROT_EXEC != 0) } {
+        0
+    } else {
+        -ENOMEM // a hole in the range, or a COW copy that could not be made
+    }
+}
+
+// ---------------------------------------------------------- clock_gettime
+
+/// Boot-time realtime anchor in unix milliseconds, read from the RTC once
+/// on first use (0 when the RTC had nothing sane to say -- realtime then
+/// runs off the monotonic clock alone; there is no NTP here).
+static RTC_EPOCH_MS: AtomicU64 = AtomicU64::new(0);
+static RTC_READ: AtomicBool = AtomicBool::new(false);
+
+/// Milliseconds since the epoch, RTC + uptime.
+fn realtime_ms() -> u64 {
+    if !RTC_READ.load(Ordering::Acquire) {
+        // The CMOS reads must not be stretched by a tick storm: mask them.
+        let flags = crate::arch::io::cli_save();
+        if let Some(dt) = crate::hw::rtc::read() {
+            RTC_EPOCH_MS.store(unix_ms(&dt), Ordering::Relaxed);
+        }
+        RTC_READ.store(true, Ordering::Release);
+        // SAFETY: flags came from cli_save on this stack.
+        unsafe { crate::arch::io::restore_flags(flags) };
+    }
+    RTC_EPOCH_MS.load(Ordering::Relaxed) + crate::hw::pit::uptime_ms()
+}
+
+/// A DateTime in unix milliseconds (days_from_civil, Howard Hinnant's
+/// civil-from-days algorithm run backwards).
+fn unix_ms(dt: &crate::hw::rtc::DateTime) -> u64 {
+    let (y, m, d) = (dt.year as i64, dt.month as i64, dt.day as i64);
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468; // days since 1970-01-01
+    let secs =
+        days * 86_400 + dt.hour as i64 * 3_600 + dt.min as i64 * 60 + dt.sec as i64;
+    (secs.max(0) * 1000) as u64
+}
+
+/// `clock_gettime(clk, ts)` (syscall 43, phase 3.2): the uptime clock in
+/// POSIX clothes.  CLOCK_MONOTONIC (and its raw / coarse / boottime
+/// aliases) comes straight from the tick counter; CLOCK_REALTIME (and its
+/// coarse alias) is anchored at the RTC's read of boot -- a lazy once, the
+/// first caller pays the CMOS reads; the two CPUTIME ids are the process's
+/// charged ticks.  Millisecond precision, `struct timespec` (i64 sec, i64
+/// nsec) written to `ts`; -EINVAL for a clock we do not keep.
+pub fn sys_clock_gettime(clk: u64, ts: u64) -> i64 {
+    let ms = match clk {
+        0 | 5 => realtime_ms(),          // REALTIME, REALTIME_COARSE
+        1 | 4 | 6 | 7 => crate::hw::pit::uptime_ms(), // MONOTONIC & friends
+        2 | 3 => {
+            // PROCESS / THREAD CPUTIME: the charged ticks (100 Hz -> 10 ms;
+            // single-threaded, so the two are the same number).
+            let Some(cur) = process::current() else { return -EFAULT };
+            cur.used * 10
+        }
+        _ => return -EINVAL,
+    };
+    let pair = [(ms / 1000) as i64, ((ms % 1000) * 1_000_000) as i64];
+    let mut b = [0u8; 16];
+    b[0..8].copy_from_slice(&pair[0].to_le_bytes());
+    b[8..16].copy_from_slice(&pair[1].to_le_bytes());
+    let Some(cur) = process::current() else { return -EFAULT };
+    let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return -EFAULT };
+    if !aspace.ensure_writable(ts) || !aspace.write(ts, &b, false) {
         return -EFAULT;
     }
     0

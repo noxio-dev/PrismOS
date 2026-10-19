@@ -35,8 +35,14 @@ const MSR_EFER: u32 = 0xC000_0080;
 const MSR_STAR: u32 = 0xC000_0081;
 const MSR_LSTAR: u32 = 0xC000_0082;
 const MSR_SFMASK: u32 = 0xC000_0084;
+/// IA32_FS_BASE: the user FS base (TLS, phase 3.2) -- never swapped, so
+/// whatever `arch_prctl(ARCH_SET_FS)` leaves there is what ring 3 sees.
+pub(crate) const MSR_FS_BASE: u32 = 0xC000_0100;
 const MSR_GS_BASE: u32 = 0xC000_0101;
-const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
+/// IA32_KERNEL_GS_BASE: the user GS base while the kernel runs (the
+/// swapgs shadow slot; the user value a process sets with
+/// `arch_prctl(ARCH_SET_GS)` lives here).
+pub(crate) const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
 const EFER_SCE: u64 = 1;
 
@@ -105,6 +111,22 @@ pub fn set_kstack_top(top: u64) {
     // SAFETY: scalar write through GS; called with interrupts masked.
     current_percpu().kstack_top = top;
     crate::arch::tss::set_rsp0(top);
+}
+
+/// Publish the user thread registers (phase 3.2): the FS base -- where a
+/// process parked its TLS with `arch_prctl(ARCH_SET_FS)` -- and the user GS
+/// base, through the swapgs shadow slot.  The scheduler calls this on every
+/// switch to a user process (with the process's own values) and on every
+/// switch back to the kernel context (with zeros), so ring 3 code always
+/// finds its own thread pointers in place and the kernel's `swapgs`
+/// convention never sees a stale user value.
+pub fn set_user_thread(fs: u64, gs: u64) {
+    // SAFETY: scalar MSR writes; the kernel itself never uses FS, and the
+    // user GS base only matters once swapgs hands it to ring 3.
+    unsafe {
+        crate::arch::io::wrmsr(MSR_FS_BASE, fs);
+        crate::arch::io::wrmsr(MSR_KERNEL_GS_BASE, gs);
+    }
 }
 
 // -------------------------------------------------------------- entry stubs

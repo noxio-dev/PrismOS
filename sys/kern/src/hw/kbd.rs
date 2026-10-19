@@ -839,6 +839,14 @@ pub fn pop_char() -> Option<u8> {
     queue.pop()
 }
 
+/// Whether a decoded character is queued (poll / select's console probe,
+/// phase 3.2) -- the non-destructive side of `pop_char`.
+pub fn has_char() -> bool {
+    // SAFETY: read-only peek at the SPSC ring counters.
+    let queue = unsafe { &*addr_of_mut!(QUEUE) };
+    queue.head.load(Ordering::Relaxed) != queue.tail.load(Ordering::Acquire)
+}
+
 /// Polling fallback used before IRQs are enabled.  Returns true when a
 /// keyboard byte was consumed.
 #[allow(dead_code)] // polling fallback

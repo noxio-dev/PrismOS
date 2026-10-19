@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 noxio-dev
 //
-// Signals (phase 2.5, basic): per-process handlers, pending bits, delivery
-// at the syscall boundary and a sigreturn trampoline.
+// Signals (phase 2.5, basic; phase 3.2: the POSIX mask/disposition half a
+// libc needs).  Per-process state, pending bits, delivery at the syscall
+// boundary and a sigreturn trampoline.
 //
-// Model (kept deliberately small, like early Unix):
+// Model:
 //
-//   * a process installs a handler with `signal(sig, handler)`; SIGKILL (9)
-//     can never be caught or blocked, `execve` resets every handler to the
-//     default and `fork` keeps them;
+//   * a process installs a handler with `signal(sig, handler)` or the full
+//     `sigaction(sig, act, oldact)` (phase 3.2): handler, flags, restorer
+//     and a per-handler mask.  SIGKILL (9) can never be caught or blocked,
+//     `execve` resets every *caught* handler to the default (SIG_IGN
+//     survives, POSIX) and `fork` keeps the lot -- dispositions *and* the
+//     blocked mask;
 //   * `kill(pid, sig)` raises a signal: SIGKILL/SIGTERM/SIGINT terminate the
 //     target at once (or the caller itself, for a self-kill); a signal with
 //     a handler becomes pending instead and is delivered just before the
@@ -16,24 +20,36 @@
 //     a program making calls sees its handlers run "between instructions".
 //     SIGCHLD is raised in a parent when a child dies (if it listens);
 //   * delivery pushes the *whole* register frame (IsrFrame) on the user stack
-//     below a 128-byte red-zone gap, then enters the handler like a call:
-//     rdi = signal number, return address = the `sigreturn` trampoline page
+//     below a 128-byte red-zone gap, prefixed with the interrupted signal
+//     mask (phase 3.2), then enters the handler like a call: rdi = signal
+//     number, return address = the restorer the action installed
+//     (SA_RESTORER -- a libc's own code) or the `sigreturn` trampoline page
 //     (vmm::USER_SIGCODE, mapped in every address space).  When the handler
-//     returns, the trampoline makes the `sigreturn` syscall and the kernel
-//     restores the saved frame verbatim -- rax included, so the interrupted
-//     code still sees the syscall return value it was waiting for;
-//   * while a handler runs the signal is blocked (auto-mask, cleared by
-//     sigreturn): a second occurrence stays pending and is delivered after
-//     the return.  Standard signals coalesce -- one bit each.
+//     returns, the restorer / trampoline makes the `sigreturn` syscall and
+//     the kernel restores the saved frame verbatim -- rax included, so the
+//     interrupted code still sees the syscall return value it was waiting
+//     for -- and the saved mask with it;
+//   * while a handler runs its signal is blocked together with the action's
+//     sa_mask (unless SA_NODEFER; auto-mask before 3.2 was just this with an
+//     empty sa_mask): a second occurrence stays pending and is delivered
+//     after the return.  SA_RESETHAND restores the default disposition at
+//     delivery.  Standard signals coalesce -- one bit each;
+//   * `sigprocmask(how, set, oldset)` (phase 3.2) exchanges the 8-byte
+//     blocked mask: SIG_BLOCK / SIG_UNBLOCK / SIG_SETMASK, SIGKILL's bit
+//     dropped from whatever is installed.  The mask survives `fork` and
+//     `execve` (POSIX); pending bits never do.
 //
-// Not here: signal masks from user space (sigprocmask), stop/continue
-// (SIGSTOP / SIGCONT), SA_RESTART (a wait or sleep interrupted by a delivery
-// is not restarted), alternate stacks, real-time queued signals, and
-// fault-signal delivery (a #PF still kills the program even when a SIGSEGV
-// handler exists: resuming the faulting instruction would just fault again).
+// Not here: stop/continue (SIGSTOP / SIGCONT), SA_RESTART (a wait or sleep
+// interrupted by a delivery is not restarted), alternate stacks (SA_ONSTACK
+// is refused), siginfo delivery (SA_SIGINFO is refused -- the handler would
+// read the info/ucontext pointers we do not build), real-time queued
+// signals, sigpending, and fault-signal delivery (a #PF still kills the
+// program even when a SIGSEGV handler exists: resuming the faulting
+// instruction would just fault again).
 //
 // Syscalls (see user/syscall.rs): 10 kill(pid, sig), 11 signal(sig, handler),
-// 12 sigreturn().
+// 12 sigreturn(), 38 sigaction(sig, act, oldact), 39 sigprocmask(how, set,
+// oldset) (phase 3.2).
 
 use crate::arch::intr::IsrFrame;
 use crate::mem::vmm::{USER_BASE, USER_END, USER_SIGCODE};
@@ -53,11 +69,35 @@ pub const SIGPIPE: u64 = 13;
 pub const SIGTERM: u64 = 15;
 pub const SIGCHLD: u64 = 17;
 
-/// `signal()` dispositions beyond a plain handler (phase 3.1): 0 is the
-/// default action (as before), 1 is SIG_IGN -- "ignore".  The value is the
+/// `signal()` / `sigaction` dispositions beyond a plain handler (phase 3.1):
+/// 0 is the default action, 1 is SIG_IGN -- "ignore".  The value is the
 /// classic `((void *)1)` of every unix, and what lets a program opt out of
 /// the default SIGPIPE death when writing to a readerless pipe.
 pub const SIG_IGN: u64 = 1;
+
+/// `sigaction` flags understood here (the Linux x86-64 values, which are
+/// what a mlibc port passes through).  SA_RESTORER is the one that matters:
+/// the caller supplies the return address its handler will `ret` into (the
+/// restorer that makes the `sigreturn` syscall); without it the kernel
+/// pushes its own trampoline page.  SA_NODEFER / SA_RESETHAND are honored at
+/// delivery.  SA_NOCLDSTOP / SA_NOCLDWAIT / SA_RESTART are accepted and
+/// ignored (no stop/continue, no restart yet); SA_SIGINFO and SA_ONSTACK are
+/// refused -- see the header.
+pub const SA_NOCLDSTOP: u64 = 0x1;
+pub const SA_NOCLDWAIT: u64 = 0x2;
+pub const SA_SIGINFO: u64 = 0x4;
+pub const SA_RESTORER: u64 = 0x0400_0000;
+pub const SA_ONSTACK: u64 = 0x0800_0000;
+pub const SA_RESTART: u64 = 0x1000_0000;
+pub const SA_NODEFER: u64 = 0x4000_0000;
+pub const SA_RESETHAND: u64 = 0x8000_0000;
+const SA_KNOWN: u64 =
+    SA_NOCLDSTOP | SA_NOCLDWAIT | SA_SIGINFO | SA_RESTORER | SA_ONSTACK | SA_RESTART | SA_NODEFER | SA_RESETHAND;
+
+/// `sigprocmask` directions (the Linux values).
+pub const SIG_BLOCK: u64 = 0;
+pub const SIG_UNBLOCK: u64 = 1;
+pub const SIG_SETMASK: u64 = 2;
 
 const ESRCH: i64 = 3;
 const EINVAL: i64 = 22;
@@ -72,30 +112,69 @@ fn terminates_by_default(sig: u64) -> bool {
 /// Wait flags (the part wait() understands).
 pub const WNOHANG: u64 = 1;
 
-/// Per-process signal state.  `handlers` are ring 3 addresses (0 = default
-/// action); `pending` / `blocked` are signal bit masks (bit n = signal n).
-/// The fields are crate-visible: process.rs walks the table to raise
-/// SIGCHLD and pending bits from the exit paths.
+/// One installed disposition (phase 3.2): the handler, its flags, the
+/// restorer SA_RESTORER points at, and the extra mask to wear while the
+/// handler runs.  The struct `sigaction` exchanges with user space is these
+/// four u64 words in this order -- the x86-64 kernel layout a mlibc port
+/// copies into.
+#[derive(Clone, Copy)]
+pub struct SigAction {
+    /// 0 = default action, 1 = SIG_IGN, otherwise a ring 3 address.
+    pub handler: u64,
+    pub flags: u64,
+    pub restorer: u64,
+    pub mask: u64,
+}
+
+impl SigAction {
+    pub const fn new() -> SigAction {
+        SigAction { handler: 0, flags: 0, restorer: 0, mask: 0 }
+    }
+}
+
+/// Per-process signal state.  `actions` are the installed dispositions;
+/// `pending` / `blocked` are signal bit masks (bit n = signal n).  The
+/// fields are crate-visible: process.rs walks the table to raise SIGCHLD
+/// and pending bits from the exit paths.
 pub struct SignalState {
-    pub(crate) handlers: [u64; NSIG],
+    pub(crate) actions: [SigAction; NSIG],
     pub(crate) pending: u32,
     pub(crate) blocked: u32,
 }
 
 impl SignalState {
     pub const fn new() -> SignalState {
-        SignalState { handlers: [0; NSIG], pending: 0, blocked: 0 }
+        SignalState { actions: [SigAction::new(); NSIG], pending: 0, blocked: 0 }
     }
 
-    /// What `fork` hands to the child: the handlers (POSIX keeps them), a
-    /// clean pending / blocked state.
+    /// The installed handler of `sig` (0 = default, SIG_IGN = ignored) --
+    /// the accessor the exit / kill paths of process.rs use.
+    pub(crate) fn handler_of(&self, sig: u64) -> u64 {
+        self.actions[sig as usize].handler
+    }
+
+    /// What `fork` hands to the child: the dispositions (POSIX keeps them),
+    /// an empty pending set and the *blocked mask* (POSIX keeps it too --
+    /// phase 3.2; the pre-3.2 code cleared it).
     pub fn fork_copy(&self) -> SignalState {
-        SignalState { handlers: self.handlers, pending: 0, blocked: 0 }
+        SignalState { actions: self.actions, pending: 0, blocked: self.blocked }
     }
 
-    /// `execve` starts with a clean slate (POSIX resets caught signals).
-    pub fn reset(&mut self) {
-        *self = SignalState::new();
+    /// `execve` (POSIX, phase 3.2): caught handlers go back to the default,
+    /// SIG_IGN stays ignored (a daemon's opt-out survives the exec), the
+    /// flags / restorer / per-handler masks drop with the image, pending is
+    /// discarded -- and the blocked mask is preserved.
+    pub fn exec_reset(&mut self) {
+        for a in self.actions.iter_mut() {
+            if a.handler != SIG_IGN {
+                *a = SigAction::new();
+            } else {
+                a.flags = 0;
+                a.restorer = 0;
+                a.mask = 0;
+            }
+        }
+        self.pending = 0;
     }
 }
 
@@ -109,7 +188,9 @@ fn with_current<R>(f: impl FnOnce(&mut SignalState) -> R) -> Option<R> {
 /// `signal(sig, handler)`: install a handler (0 = default action, 1 =
 /// SIG_IGN) and return the old disposition.  A handler must live in user
 /// space: a kernel address there would either fault on `sysretq` or hand
-/// ring 3 a path it must not have.
+/// ring 3 a path it must not have.  The phase 3.2 `sigaction` is the full
+/// form; this is its plain wrapper (empty mask, no restorer: the kernel
+/// trampoline page brings the handler home).
 pub fn sys_signal(sig: u64, handler: u64) -> i64 {
     if sig == 0 || sig >= NSIG as u64 {
         return -EINVAL;
@@ -120,10 +201,128 @@ pub fn sys_signal(sig: u64, handler: u64) -> i64 {
     if handler != 0 && handler != SIG_IGN && !(USER_BASE..USER_END).contains(&handler) {
         return -EINVAL;
     }
-    match with_current(|s| core::mem::replace(&mut s.handlers[sig as usize], handler)) {
+    match with_current(|s| core::mem::replace(&mut s.actions[sig as usize].handler, handler)) {
         Some(old) => old as i64,
         None => -EFAULT,
     }
+}
+
+/// `sigaction(sig, act, oldact)` (syscall 38, phase 3.2): the full install.
+/// `act` (32 bytes: handler, flags, restorer, mask) replaces the
+/// disposition; `oldact` receives the previous one first.  Either pointer
+/// may be NULL -- a query, or a fire-and-forget install.  Validation is
+/// up front, so a rejected request leaves nothing behind.
+pub fn sys_sigaction(sig: u64, act_p: u64, oldact_p: u64) -> i64 {
+    if sig == 0 || sig >= NSIG as u64 || sig == SIGKILL {
+        return -EINVAL;
+    }
+    // Read the new action first (a bad pointer changes nothing).
+    let mut newact: Option<SigAction> = None;
+    if act_p != 0 {
+        let got: Result<SigAction, i64> = {
+            let Some(cur) = process::current() else { return -EFAULT };
+            let Some(aspace) = cur.aspace.as_ref() else { return -EFAULT };
+            let mut buf = [0u8; 32];
+            if !aspace.read(act_p, &mut buf) {
+                return -EFAULT;
+            }
+            let mut w = [0u64; 4];
+            for i in 0..4 {
+                w[i] = u64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap());
+            }
+            let a = SigAction { handler: w[0], flags: w[1], restorer: w[2], mask: w[3] };
+            if a.handler != 0 && a.handler != SIG_IGN && !(USER_BASE..USER_END).contains(&a.handler) {
+                return -EINVAL; // a kernel address as handler: no
+            }
+            if a.flags & !SA_KNOWN != 0 {
+                return -EINVAL; // unknown bits: refuse rather than guess
+            }
+            if a.flags & (SA_SIGINFO | SA_ONSTACK) != 0 {
+                return -EINVAL; // not here (yet): no siginfo, no alt stack
+            }
+            if a.flags & SA_RESTORER != 0 && !(USER_BASE..USER_END).contains(&a.restorer) {
+                return -EINVAL; // the restorer must live in ring 3 too
+            }
+            Ok(a)
+        };
+        match got {
+            Ok(a) => newact = Some(a),
+            Err(e) => return e,
+        }
+    }
+    // The old action out (first, like POSIX orders the side effects).
+    if oldact_p != 0 {
+        let old = match with_current(|s| s.actions[sig as usize]) {
+            Some(a) => a,
+            None => return -EFAULT,
+        };
+        let Some(cur) = process::current() else { return -EFAULT };
+        let Some(aspace) = cur.aspace.as_ref() else { return -EFAULT };
+        let mut buf = [0u8; 32];
+        for (i, w) in [old.handler, old.flags, old.restorer, old.mask].iter().enumerate() {
+            buf[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+        }
+        if !aspace.ensure_writable(oldact_p) || !aspace.write(oldact_p, &buf, false) {
+            return -EFAULT;
+        }
+    }
+    if let Some(a) = newact {
+        let _ = with_current(|s| s.actions[sig as usize] = a);
+    }
+    0
+}
+
+/// `sigprocmask(how, set, oldset)` (syscall 39, phase 3.2): exchange the
+/// 8-byte blocked mask.  `set` = NULL queries through `oldset` (POSIX: the
+/// `how` argument is then ignored); otherwise SIG_BLOCK / SIG_UNBLOCK /
+/// SIG_SETMASK apply it.  SIGKILL's bit is dropped from whatever is
+/// installed -- it cannot be blocked, only delivered.
+pub fn sys_sigprocmask(how: u64, set_p: u64, oldset_p: u64) -> i64 {
+    // Read the new mask first; compute against the current one.
+    let new_mask: Option<u64> = if set_p != 0 {
+        let got: Result<u64, i64> = {
+            let Some(cur) = process::current() else { return -EFAULT };
+            let Some(aspace) = cur.aspace.as_ref() else { return -EFAULT };
+            let mut buf = [0u8; 8];
+            if !aspace.read(set_p, &mut buf) {
+                return -EFAULT;
+            }
+            Ok(u64::from_le_bytes(buf))
+        };
+        let v = match got {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let old = match with_current(|s| s.blocked as u64) {
+            Some(m) => m,
+            None => return -EFAULT,
+        };
+        match how {
+            SIG_BLOCK => Some(old | v),
+            SIG_UNBLOCK => Some(old & !v),
+            SIG_SETMASK => Some(v),
+            _ => return -EINVAL,
+        }
+    } else {
+        None
+    };
+    if oldset_p != 0 {
+        let old = match with_current(|s| s.blocked as u64) {
+            Some(m) => m,
+            None => return -EFAULT,
+        };
+        let Some(cur) = process::current() else { return -EFAULT };
+        let Some(aspace) = cur.aspace.as_ref() else { return -EFAULT };
+        if !aspace.ensure_writable(oldset_p) || !aspace.write(oldset_p, &old.to_le_bytes(), false) {
+            return -EFAULT;
+        }
+    }
+    if let Some(v) = new_mask {
+        // Bits past the signals we track (and SIGKILL) never stick.
+        let v = v & ((1u64 << NSIG) - 1) & !(1 << SIGKILL);
+        let _ = with_current(|s| s.blocked = v as u32);
+    }
+    0
 }
 
 /// `kill(pid, sig)`: raise a signal in `pid` (any process may signal any
@@ -142,7 +341,7 @@ pub fn sys_kill(pid: u64, sig: u64) -> i64 {
             process::exit_current(process::Outcome::Signaled(SIGKILL));
         }
         return match with_current(|s| {
-            if sig != 0 && s.handlers[sig as usize] != 0 {
+            if sig != 0 && s.handler_of(sig) != 0 {
                 s.pending |= 1 << sig;
                 true
             } else {
@@ -182,30 +381,33 @@ pub fn sys_kill(pid: u64, sig: u64) -> i64 {
 
 // ---------------------------------------------------------------- sigreturn
 
-/// `sigreturn()`: restore the frame pushed at delivery.  At the trampoline
-/// the user stack holds, from `frame.rsp` up, the saved IsrFrame (the
-/// handler's `ret` popped the trampoline address right below it).  The
-/// frame is copied back wholesale -- registers, rip, rflags, rsp -- the
-/// delivery-time auto-mask is cleared, and the syscall itself "never
-/// returns" a value: the rewritten trap frame is what `sysretq` consumes.
+/// `sigreturn()`: restore what delivery pushed.  At the restorer /
+/// trampoline the user stack holds, from `frame.rsp` up: the interrupted
+/// mask word, then the saved IsrFrame (the handler's `ret` popped the
+/// return address right below them).  The frame is copied back wholesale --
+/// registers, rip, rflags, rsp -- the saved mask is reinstalled minus
+/// SIGKILL's bit, and the syscall itself "never returns" a value: the
+/// rewritten trap frame is what `sysretq` consumes.
 pub fn sys_sigreturn(frame: &mut IsrFrame) {
     let Some(cur) = process::current() else { return };
     let Some(aspace) = cur.aspace.as_ref() else { return };
 
-    let mut buf = [0u8; core::mem::size_of::<IsrFrame>()];
+    let mut buf = [0u8; 8 + core::mem::size_of::<IsrFrame>()];
     if !aspace.read(frame.rsp, &mut buf) {
         bad_sigreturn(frame);
     }
-    let mut words = [0u64; 23];
-    for i in 0..23 {
+    let mut words = [0u64; 1 + 23];
+    for i in 0..words.len() {
         words[i] = u64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap());
     }
-    let mut saved = frame_from_words(&words);
+    let saved_mask = words[0] as u32;
+    let frame_words: [u64; 23] = words[1..24].try_into().unwrap();
+    let mut saved = frame_from_words(&frame_words);
     if !sanitize_user_frame(&mut saved) {
         // The handler smashed its own context (or crafted one): over.
         bad_sigreturn(frame);
     }
-    with_current(|s| s.blocked = 0);
+    with_current(|s| s.blocked = saved_mask & !(1 << SIGKILL));
     *frame = saved;
 }
 
@@ -243,7 +445,7 @@ fn sanitize_user_frame(f: &mut IsrFrame) -> bool {
 /// installed, in which case the signal goes pending for the syscall return
 /// -- the caller reports -EPIPE and carries on.
 pub fn pipe_sigpipe() -> i64 {
-    let handler = with_current(|s| s.handlers[SIGPIPE as usize]);
+    let handler = with_current(|s| s.handler_of(SIGPIPE));
     match handler {
         Some(SIG_IGN) => -EPIPE,
         Some(h) if h != 0 => {
@@ -256,9 +458,10 @@ pub fn pipe_sigpipe() -> i64 {
 
 /// Deliver one pending signal to the running process by rewriting its trap
 /// frame: the current user context is pushed on the user stack (below the
-/// red zone), the handler becomes the new return target, and the return
-/// address planted for it is the `sigreturn` trampoline.  Called from the
-/// syscall dispatch, just before `sysretq`.
+/// red zone) with the interrupted mask in front of it, the handler becomes
+/// the new return target, and the return address planted for it is the
+/// action's restorer (SA_RESTORER) or the `sigreturn` trampoline.  Called
+/// from the syscall dispatch, just before `sysretq`.
 pub fn deliver(frame: &mut IsrFrame) {
     // Pick a signal: lowest number first, handlers only (SIG_IGN counts as
     // "installed" -- its pending bit is simply dropped), nothing blocked.
@@ -269,26 +472,34 @@ pub fn deliver(frame: &mut IsrFrame) {
             if s.pending & bit == 0 || s.blocked & bit != 0 {
                 continue;
             }
-            if s.handlers[sig as usize] == SIG_IGN {
+            let a = s.actions[sig as usize];
+            if a.handler == SIG_IGN {
                 s.pending &= !bit; // ignored: consume and move on
                 continue;
             }
-            if s.handlers[sig as usize] != 0 {
-                pick = Some((sig, s.handlers[sig as usize], bit));
+            if a.handler != 0 {
+                pick = Some((sig, a, bit));
                 break;
             }
         }
         pick
     });
-    let Some(Some((sig, handler, bit))) = pick else { return };
+    let Some(Some((sig, action, bit))) = pick else { return };
     let Some(cur) = process::current() else { return };
     let Some(aspace) = cur.aspace.as_ref() else { return };
+    // The interrupted mask, saved on the stack and restored by sigreturn.
+    let saved_mask = cur.signals.blocked;
 
-    // Build the handler's stack, below the interrupted one.  The saved frame
-    // block is 16-byte aligned; the handler entry rsp ends 8 below it, so
-    // rsp % 16 == 8 at entry -- exactly the state after a `call`.
-    let Some(frame_sp) = frame.rsp.checked_sub(128 + core::mem::size_of::<IsrFrame>() as u64)
-    else { return };
+    // Where the handler returns into: the libc restorer (SA_RESTORER) or
+    // the kernel trampoline page.
+    let ret_addr = if action.flags & SA_RESTORER != 0 { action.restorer } else { USER_SIGCODE };
+
+    // Build the handler's stack, below the interrupted one.  The saved
+    // block is 24 words (mask + IsrFrame), 16-byte aligned; the handler
+    // entry rsp ends 8 below it, so rsp % 16 == 8 at entry -- exactly the
+    // state after a `call`.
+    let block = 8 + core::mem::size_of::<IsrFrame>() as u64;
+    let Some(frame_sp) = frame.rsp.checked_sub(128 + block) else { return };
     let frame_sp = frame_sp & !0xF;
     let sp = frame_sp - 8;
 
@@ -296,11 +507,13 @@ pub fn deliver(frame: &mut IsrFrame) {
     // then write (a failure leaves the signal pending, not fatal -- unless
     // the stack itself is gone, which ends the process).  The block can
     // straddle a page boundary, so both ends are resolved.
-    let bytes = frame_bytes(frame);
-    let mut ok = aspace.ensure_writable(sp) && aspace.ensure_writable(frame_sp + bytes.len() as u64 - 1);
+    let mut bytes = [0u8; 8 + core::mem::size_of::<IsrFrame>()];
+    bytes[0..8].copy_from_slice(&saved_mask.to_le_bytes());
+    bytes[8..].copy_from_slice(&frame_bytes(frame));
+    let mut ok = aspace.ensure_writable(sp) && aspace.ensure_writable(frame_sp + block - 1);
     ok &= aspace.write(frame_sp, &bytes, false);
     let mut ret_slot = [0u8; 8];
-    ret_slot.copy_from_slice(&USER_SIGCODE.to_le_bytes());
+    ret_slot.copy_from_slice(&ret_addr.to_le_bytes());
     ok &= aspace.write(sp, &ret_slot, false);
     if !ok {
         process::exit_current(process::Outcome::Fault {
@@ -311,17 +524,27 @@ pub fn deliver(frame: &mut IsrFrame) {
         });
     }
 
-    // Consume the pending bit and auto-block the signal until sigreturn.
+    // Consume the pending bit, run the POSIX mask rules: the interrupted
+    // mask | sa_mask | the signal itself (unless SA_NODEFER), SIGKILL
+    // never blocked.  SA_RESETHAND puts the default disposition back.
     with_current(|s| {
         s.pending &= !bit;
-        s.blocked |= bit;
+        if action.flags & SA_RESETHAND != 0 {
+            s.actions[sig as usize] = SigAction::new();
+        }
+        let mut m = saved_mask | action.mask as u32 | bit;
+        if action.flags & SA_NODEFER != 0 {
+            m &= !bit;
+        }
+        m &= !(1 << SIGKILL);
+        s.blocked = m;
     });
 
     // Enter the handler like a call: rdi = signal, rax = 0 (clobbered by
-    // design), return address = sigreturn trampoline.
+    // design), return address = restorer / sigreturn trampoline.
     frame.rdi = sig;
     frame.rax = 0;
-    frame.rip = handler;
+    frame.rip = action.handler;
     frame.rsp = sp;
 }
 

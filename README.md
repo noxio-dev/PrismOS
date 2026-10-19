@@ -32,6 +32,22 @@ syscalls (`stat`, `fstat`, `brk`, `mmap`, `munmap`, `chdir`, `getcwd`, `dup2`,
 POSIX SIGPIPE rule and the `isatty` ioctl pair -- the ABI the
 [mlibc](https://github.com/managarm/mlibc) port and the `x86_64-prismos`
 toolchain (phase 3.2) will build against.
+Phase 3.2 has started: its first step -- the kernel prerequisites an mlibc
+port needs beyond 3.1 -- is in.  `arch_prctl` gives a thread its FS/GS base
+(TLS: the MSRs are switched with the process, `fork` copies them, `execve`
+clears them); `futex` parks and wakes on a user word (WAIT / WAKE / the
+REQUEUE pair / the BITSET pair, timespec timeouts against the uptime clock,
+the bounded-blocking house rule); `sigaction` / `sigprocmask` make the signal
+state a real POSIX one (per-handler masks, `SA_RESTORER` / `SA_NODEFER` /
+`SA_RESETHAND` honoured, the interrupted mask saved on the delivery stack and
+restored by `sigreturn`, SIGKILL unblockable, the mask kept across `fork` and
+`execve`); `mprotect` re-protects mapped pages (W^X, COW-aware: a shared
+read-only page is copied before it becomes writable, so a fork sibling never
+sees the change); `poll` / `select` watch the descriptor table (readiness of
+files, console input, pipes -- `POLLERR` / `POLLHUP` / `POLLNVAL` included);
+and `clock_gettime` serves the uptime clock as `CLOCK_MONOTONIC`, the
+RTC-anchored realtime as `CLOCK_REALTIME` and the charged ticks as the two
+CPUTIME clocks -- millisecond precision, eight new numbers (36..43).
 
 | Area                     | State   | Notes                                                                 |
 |--------------------------|---------|-----------------------------------------------------------------------|
@@ -49,6 +65,7 @@ toolchain (phase 3.2) will build against.
 | fork / wait / signals     | done    | `fork` clones the address space copy-on-write (refcounted shared pages, fault-time copies), `wait` reaps zombies (blocking, WNOHANG, by pid, Linux status word), SIGKILL/SIGTERM/SIGINT/SIGCHLD/SIGUSR1 with per-process handlers delivered at the syscall boundary and restored register-for-register by a sigreturn trampoline (2.5) |
 | Descriptors / pipes / /dev | done   | a fd table per process (0/1/2 on the console), open file descriptions shared by fork / dup (shared offsets, POSIX), pipes with bounded blocking and EOF / EPIPE, devfs on /dev with `console` / `null` / `zero` served by the descriptor layer, syscalls read / open / close / lseek / dup / pipe (2.6) |
 | POSIX syscalls (libc set) | done | 17 new syscalls (stat / fstat / brk / mmap / munmap / chdir / getcwd / dup2 / fcntl / getdents / ioctl / unlink / mkdir / rmdir / rename / link / uname), `O_NONBLOCK` / `O_CLOEXEC`, per-process cwd, the SIGPIPE rule, `uname` / the isatty ioctl pair; x86-64 Linux `struct stat` and `linux_dirent64` layouts (3.1) |
+| mlibc prerequisites (3.2, first step) | done | `arch_prctl` (TLS: FS/GS base per process, switched with it), `futex` (WAIT / WAKE / REQUEUE / BITSET, bounded parking, per-address-space queues), `sigaction` / `sigprocmask` (per-handler masks, SA_RESTORER / SA_NODEFER / SA_RESETHAND, mask saved and restored by sigreturn, kept across fork / execve), `mprotect` (W^X, COW-aware), `poll` / `select` (readiness probe over files / console / pipes), `clock_gettime` (MONOTONIC from the tick, REALTIME anchored at the RTC, CPUTIME from the charged ticks) |
 | Networking, USB, SMP     | todo    | not started                                                            |
 
 **Testing.** `make fstest` (11 scenarios against `mke2fs` images, each validated
@@ -117,7 +134,7 @@ Phase 2 — ring 3 and processes
 Phase 3 — POSIX userspace
 - [x] Phase 3.1 — syscall set for a C library: `open/read/write/lseek/close/stat/dup/pipe/mmap/brk/getcwd/...`
 - [ ] Phase 3.2 — mlibc port and a `x86_64-prismos` toolchain target
-  - [ ] kernel prerequisites mlibc needs beyond 3.1: TLS (`FS` base through `arch_prctl`), `futex`, `sigprocmask` / `sigaction`, `mprotect`, `poll` / `select`, `clock_gettime` (pulled forward from 3.5)
+  - [x] kernel prerequisites mlibc needs beyond 3.1: TLS (`FS` base through `arch_prctl`), `futex`, `sigprocmask` / `sigaction`, `mprotect`, `poll` / `select`, `clock_gettime` (pulled forward from 3.5) — syscalls 36..43
   - [ ] `sysdeps/prismos` in mlibc (`sys_open`, `sys_read`, `sys_vm_map`, `sys_fork`, `sys_execve`, `sys_waitpid`, ...); sysdeps the kernel lacks stay `ENOSYS`
   - [ ] build mlibc with Meson against a cross C/C++ compiler (headers first, then the compiler, then the library), install it into a sysroot
   - [ ] port `/bin/hello`, `/bin/fork`, `/bin/fd` and `/bin/posix` from the mini libc (`usr/lib`) to mlibc
@@ -298,20 +315,100 @@ arguments now -- `mmap` needs r10 / r8 / r9, the Linux order.
   (`-EEXIST`, `-ENOTEMPTY`, `-EISDIR` through unlink, `-ENOTDIR`,
   `-EXDEV` across mounts, `-EMLINK` at the link limit).  `mkdir`'s mode
   bits reach the inode (nothing checks them yet -- phase 3.5).
-- **uname** fills the six 65-byte fields (`PrismOS` / `prismos` / `3.1` /
+- **uname** fills the six 65-byte fields (`PrismOS` / `prismos` / `3.2` /
 build string / `x86_64` / `(none)`).
 
-Not here (yet): `select` / `poll`, `mprotect`, `MAP_SHARED` of a file,
-`PROT_NONE`, `fchmod` / `chmod` and anything permission-shaped (phase
-3.5), `clock_gettime` and friends (needed by mlibc, so pulled forward into
-phase 3.2), TLS / `futex` / `sigprocmask` (phase 3.2, same reason),
-`wait4`-style rusage, and
+Not here (yet): `MAP_SHARED` of a file, `PROT_NONE`, `fchmod` / `chmod`
+and anything permission-shaped (phase 3.5), `wait4`-style rusage, and
 `getdents` `d_type` for file systems that do not know one (ext4 and devfs
-always do).
+always do).  The former 3.1 gaps a library cares about -- `select` / `poll`,
+`mprotect`, `clock_gettime`, TLS / `futex` / `sigprocmask` -- are phase 3.2's
+first step, below.
 
 Shell: `exec posix` runs the ten phase 3.1 scenarios and prints
 `posix: all 10 passed` -- also part of `make test` (the re-`execve`d
 child reports `postexec: O_CLOEXEC fd closed, dupfd alive, stdout ok`).
+
+## The mlibc prerequisites (phase 3.2, first step)
+
+Eight syscalls (36..43) that close, kernel-side, the distance between the
+3.1 ABI and what an [mlibc](https://github.com/managarm/mlibc) `sysdeps`
+port needs before anything links: a thread pointer, a sleep/wake primitive,
+real signal masks and dispositions, page re-protection, readiness
+multiplexing and a clock.  They live where their phase-3.1 cousins do:
+`user/sysc.rs` (`arch_prctl`, `mprotect`, `clock_gettime`), `user/futex.rs`
+(the waiter table), `user/signal.rs` (the POSIX half) and `user/fd.rs`
+(`poll` / `select` on a readiness probe).
+
+- **arch_prctl** (36) is TLS: `ARCH_SET_FS` parks the thread pointer in the
+  FS base MSR (live at once -- the caller is running), `ARCH_GET_FS` reads
+  it back through a user word, and the GS pair goes through the swapgs
+  shadow slot (`IA32_KERNEL_GS_BASE`).  The bases are PCB fields
+  (`fs_base` / `gs_base`) published by the scheduler on every switch
+  (`usermode::set_user_thread`, zeroed when the kernel context runs),
+  copied by `fork` and cleared by `execve` -- a fresh image installs its own
+  with the syscall, exactly what a mlibc `set_thread_area` does.  Bases must
+  live in user space.
+- **futex** (37, six arguments like `mmap`): `FUTEX_WAIT` quotes the 32-bit
+  word (-`EAGAIN` on a mismatch, the lost-wakeup check) and parks; the waiter
+  table is keyed by (address space, word address) -- the PML4's physical
+  address, so after a `fork` parent and child wait on their own COW copies,
+  Linux's per-mm rule.  Parking follows the bounded-blocking house rule
+  (~20 ms naps, 10 s ceiling, then -`ETIMEDOUT`): the shell is blocked while
+  its children run, so nothing may wait forever -- a library treats the
+  timeout like a spurious wakeup and retries.  `FUTEX_WAKE` flips up to `val`
+  matching waiters to ready; the BITSET pair narrows the match with `val3`'s
+  bits; the REQUEUE pair wakes `val` waiters and moves up to `val2` more
+  onto a second word (a condvar broadcast's second half),
+  `FUTEX_CMP_REQUEUE` checking the word first.  A dying process drops its
+  waiter entry on the way out.  Not here: `FUTEX_FD`, the PI variants, and
+  cross-process shared mappings (no `MAP_SHARED` files yet).
+- **sigaction / sigprocmask** (38 / 39) make the signal state POSIX.  An
+  action is four u64 words -- handler, flags, restorer, mask -- the x86-64
+  kernel layout a mlibc port copies into.  `SA_RESTORER` swaps the kernel
+  trampoline for the caller's own return address (the restorer that makes
+  the `sigreturn` syscall); `SA_NODEFER` and `SA_RESETHAND` are honoured at
+  delivery; `SA_NOCLDSTOP` / `SA_NOCLDWAIT` / `SA_RESTART` are accepted and
+  ignored (no stop/continue, no restart); `SA_SIGINFO` and `SA_ONSTACK` are
+  refused -- no siginfo, no alternate stack (yet).  Delivery pushes the
+  interrupted mask in front of the saved frame on the user stack and
+  `sigreturn` restores it; the handler wears `blocked | sa_mask | sig`
+  (minus SIGKILL, never blockable).  `sigprocmask` exchanges the 8-byte mask
+  (`SIG_BLOCK` / `SIG_UNBLOCK` / `SIG_SETMASK`, a NULL set queries).  The
+  mask survives `fork` and `execve` (POSIX); caught handlers reset on exec,
+  `SIG_IGN` survives; the old `signal` syscall is now the plain wrapper.
+- **mprotect** (40) re-protects the pages of a range: W^X applies
+  (`-EACCES`), `PROT_NONE` and unknown bits are `-EINVAL`, a hole in the
+  range is `-ENOMEM` (Linux), and the signal trampoline page is locked r-x
+  forever.  The walk (vmm.rs) is COW-aware in both directions: making a COW
+  page writable resolves the copy first, and making a *shared* read-only
+  page writable (a code page a fork sibling also maps, refcount > 1) copies
+  it, so the sibling never sees the write; clearing write just clears RW.
+  This is what a libc's RELRO pass needs.
+- **poll / select** (41 / 42) watch the descriptor table through one
+  readiness probe: files, `/dev/null` and `/dev/zero` are always ready in
+  the directions they were opened for (EOF is readiness -- a read answers
+  0), the console is readable exactly when a decoded byte is pending (the
+  keyboard and serial rings, peeked non-destructively), a pipe read end is
+  readable with buffered bytes or at EOF (`POLLHUP`), a pipe write end
+  writable with buffer space or `POLLERR` when nobody reads.
+  `poll` is the Linux pollfd array (8-byte entries, `POLLNVAL` for closed
+  numbers, negative fds skipped, `POLLERR` / `POLLHUP` / `POLLNVAL` always
+  reported); `select` is the three fd_sets plus a timeval (`-EBADF` for a
+  watched closed number, exceptfds accepted and always empty).  Both park
+  the bounded way until something is ready or the timeout (negative / NULL =
+  forever, house-capped) expires.
+- **clock_gettime** (43): `CLOCK_MONOTONIC` (and raw / coarse / boottime)
+  from the tick counter, `CLOCK_REALTIME` (and coarse) anchored at the
+  RTC's read of boot -- a lazy once, the first caller pays the CMOS reads --
+  and the two CPUTIME ids from the process's charged ticks.  Millisecond
+  precision, the x86-64 `struct timespec` (i64 sec, nsec) written back.
+
+Not here (yet): `SA_SIGINFO` / `SA_ONSTACK`, robust / PI futexes,
+`FUTEX_CLOCK_REALTIME` (every clock is the uptime one), `sigtimedwait`,
+`ppoll` / `pselect` (the signal-mask argument -- trivial once wanted), and
+`gettimeofday` (a wrapper away).  The mlibc port itself (`sysdeps/prismos`,
+the cross toolchain, the dynamic loader) is the next step of the phase.
 
 ## fork, wait and signals (phase 2.5)
 
@@ -354,9 +451,11 @@ signals (user/signal.rs); the demo / test program is `/bin/fork` (usr/fork).
   address space; when the handler returns, `sigreturn` restores the saved
   frame verbatim -- so the interrupted code keeps its registers *and* its
   syscall return value.  While a handler runs the signal is blocked; standard
-  signals coalesce.  Not here: `sigprocmask`, stop/continue, `SA_RESTART`,
+  signals coalesce.  Not here: stop/continue, `SA_RESTART`,
   altstacks, real-time queues, and fault-signal delivery (a #PF kills even
   with a SIGSEGV handler: resuming the instruction would just fault again).
+  The POSIX half -- `sigaction` masks and restorers, `sigprocmask`, the
+  delivery-time mask save / restore -- is phase 3.2's first step, above.
 
 Limits worth knowing: `wait` only looks at the process table snapshot (a pid
 reused later is a different process), the wait-deadlock guard kills *all*
