@@ -47,7 +47,12 @@ sees the change); `poll` / `select` watch the descriptor table (readiness of
 files, console input, pipes -- `POLLERR` / `POLLHUP` / `POLLNVAL` included);
 and `clock_gettime` serves the uptime clock as `CLOCK_MONOTONIC`, the
 RTC-anchored realtime as `CLOCK_REALTIME` and the charged ticks as the two
-CPUTIME clocks -- millisecond precision, eight new numbers (36..43).
+CPUTIME clocks -- millisecond precision, eight new numbers (36..43).  Its
+second step is the port itself: `sysdeps/prismos` (ports/mlibc), the
+mlibc layer that speaks those 44 syscalls -- one directory to drop into
+an mlibc checkout, one patch to register it, verified against mlibc 7.0.0
+(the whole `ansi` + `posix` build, and a hello world that links as the
+static PIE the loader expects).
 
 | Area                     | State   | Notes                                                                 |
 |--------------------------|---------|-----------------------------------------------------------------------|
@@ -66,6 +71,7 @@ CPUTIME clocks -- millisecond precision, eight new numbers (36..43).
 | Descriptors / pipes / /dev | done   | a fd table per process (0/1/2 on the console), open file descriptions shared by fork / dup (shared offsets, POSIX), pipes with bounded blocking and EOF / EPIPE, devfs on /dev with `console` / `null` / `zero` served by the descriptor layer, syscalls read / open / close / lseek / dup / pipe (2.6) |
 | POSIX syscalls (libc set) | done | 17 new syscalls (stat / fstat / brk / mmap / munmap / chdir / getcwd / dup2 / fcntl / getdents / ioctl / unlink / mkdir / rmdir / rename / link / uname), `O_NONBLOCK` / `O_CLOEXEC`, per-process cwd, the SIGPIPE rule, `uname` / the isatty ioctl pair; x86-64 Linux `struct stat` and `linux_dirent64` layouts (3.1) |
 | mlibc prerequisites (3.2, first step) | done | `arch_prctl` (TLS: FS/GS base per process, switched with it), `futex` (WAIT / WAKE / REQUEUE / BITSET, bounded parking, per-address-space queues), `sigaction` / `sigprocmask` (per-handler masks, SA_RESTORER / SA_NODEFER / SA_RESETHAND, mask saved and restored by sigreturn, kept across fork / execve), `mprotect` (W^X, COW-aware), `poll` / `select` (readiness probe over files / console / pipes), `clock_gettime` (MONOTONIC from the tick, REALTIME anchored at the RTC, CPUTIME from the charged ticks) |
+| mlibc sysdeps port (3.2, second step) | done | `ports/mlibc/sysdeps/prismos`: the tag layer over syscalls 0..43 (mlIBC 7.0.0's interface -- `Open`/`Read`/`Write`/`Stat`/`VmMap`/`FutexWait`/`Sigaction`/`Poll`/`ClockGet`/...), the raw `syscall` stubs (rax = nr, rdi/rsi/rdx/r10/r8/r9, -errno in rax), the x86-64 ABI headers (Linux layouts the kernel deliberately speaks, except the kernel's own O_* values in fcntl.h), the crt objects and the SA_RESTORER restorer; what the kernel lacks stays ENOSYS (threads / clone, sockets, *at() past AT_FDCWD, rusage) |
 | Networking, USB, SMP     | todo    | not started                                                            |
 
 **Testing.** `make fstest` (11 scenarios against `mke2fs` images, each validated
@@ -135,7 +141,7 @@ Phase 3 — POSIX userspace
 - [x] Phase 3.1 — syscall set for a C library: `open/read/write/lseek/close/stat/dup/pipe/mmap/brk/getcwd/...`
 - [ ] Phase 3.2 — mlibc port and a `x86_64-prismos` toolchain target
   - [x] kernel prerequisites mlibc needs beyond 3.1: TLS (`FS` base through `arch_prctl`), `futex`, `sigprocmask` / `sigaction`, `mprotect`, `poll` / `select`, `clock_gettime` (pulled forward from 3.5) — syscalls 36..43
-  - [ ] `sysdeps/prismos` in mlibc (`sys_open`, `sys_read`, `sys_vm_map`, `sys_fork`, `sys_execve`, `sys_waitpid`, ...); sysdeps the kernel lacks stay `ENOSYS`
+  - [x] `sysdeps/prismos` in mlibc (`sys_open`, `sys_read`, `sys_vm_map`, `sys_fork`, `sys_execve`, `sys_waitpid`, ...); sysdeps the kernel lacks stay `ENOSYS` — `ports/mlibc`, verified against mlibc 7.0.0
   - [ ] build mlibc with Meson against a cross C/C++ compiler (headers first, then the compiler, then the library), install it into a sysroot
   - [ ] port `/bin/hello`, `/bin/fork`, `/bin/fd` and `/bin/posix` from the mini libc (`usr/lib`) to mlibc
   - [ ] ELF loader: dynamic linking, a requirement and not an option. Honour `PT_INTERP` (load the interpreter, mlibc's `ld.so`, at its own base and start it with `AT_BASE` plus `AT_PHDR` / `AT_PHNUM` / `AT_ENTRY` describing the main program); `DT_NEEDED` resolution stays in userspace (`ld.so` finds libraries in `/lib` and `/usr/lib` and maps them with file `mmap`); add `mprotect` for RELRO and relocation fix-ups; shared libraries are `ET_DYN` with their own `PT_LOAD` / `PT_TLS` / `PT_GNU_RELRO` handling
@@ -407,8 +413,72 @@ multiplexing and a clock.  They live where their phase-3.1 cousins do:
 Not here (yet): `SA_SIGINFO` / `SA_ONSTACK`, robust / PI futexes,
 `FUTEX_CLOCK_REALTIME` (every clock is the uptime one), `sigtimedwait`,
 `ppoll` / `pselect` (the signal-mask argument -- trivial once wanted), and
-`gettimeofday` (a wrapper away).  The mlibc port itself (`sysdeps/prismos`,
-the cross toolchain, the dynamic loader) is the next step of the phase.
+`gettimeofday` (a wrapper away).  The mlibc port that leans on all of it
+is the phase's second step, below.
+
+## The mlibc sysdeps port (phase 3.2, second step)
+
+`ports/mlibc` -- `sysdeps/prismos`, a directory to drop into an
+[mlibc](https://github.com/managarm/mlibc) checkout, plus the
+seven-line `meson.build` patch that registers the `prismos` system.
+mlibc's generic code calls *tags* (`Open`, `Read`, `Write`, `Stat`,
+`VmMap`, `FutexWait`, `Sigaction`, `Poll`, `ClockGet`, ...); the port is
+one implementation per tag, and every implementation is one syscall --
+nothing in between (generic/sysdeps.cpp).  The raw convention lives in
+generic/syscall.cpp: `rax` = number, `rdi` / `rsi` / `rdx` / `r10` / `r8` /
+`r9` = arguments 1..6, the answer in `rax` with `[-4096, -1]` meaning
+`-errno` -- the x86-64 Linux register order the kernel's dispatcher has
+read since phase 2.1, which is why the stubs look like every other
+Linux-ABI port's.
+
+- **What the kernel has, the port speaks**: all 44 syscalls.  The
+  layouts cross unchanged because the kernel made them Linux-shaped on
+  purpose (3.1's decision): `struct stat` is the x86-64 Linux one, the
+  sigaction exchanged with the kernel is the four-u64 (handler / flags /
+  restorer / 8-byte mask) rt_sigaction shape, `sigprocmask` trades the
+  low 8 bytes of a sigset_t, `poll` speaks the Linux pollfd, and the
+  SA_* / CLOCK_* / errno values are the classic ones.  `TcbSet` parks
+  the TCB in the FS base through `arch_prctl` (the x86-64 way); the
+  SA_RESTORER half of the signal contract is x86_64/signal.S, a
+  three-instruction restorer that makes the `sigreturn` syscall (12)
+  when a handler returns.
+- **What the kernel lacks stays ENOSYS** -- the rule of the phase.  Tags
+  the kernel cannot serve are absent from the tag list
+  (include/mlibc/sysdeps.hpp), and mlibc's generic layer answers
+  `ENOSYS` on its own: `pthread_create` (no clone), sockets, `*at()`
+  past `AT_FDCWD`, rusage accounting (wait4 gets honest zeroes),
+  `fchmod` and the permission family (phase 3.5).  A few corners are
+  emulated where the emulation is exact: `pipe2`'s flags ride `fcntl`
+  (`O_CLOEXEC` -> `F_SETFD`, `O_NONBLOCK` -> `F_SETFL`), `opendir`
+  checks `S_ISDIR` itself (the kernel has no `O_DIRECTORY` bit), and
+  `pselect` refuses a signal mask rather than pretend -- plain
+  `select` works.
+- **The one ABI that is *not* Linux's**: the O_* flags.  The kernel's
+  own values (`O_READ` 1, `O_WRITE` 2, `O_CREATE` 4, `O_TRUNC` 8,
+  `O_APPEND` 16, `O_EXCL` 32, `O_NONBLOCK` 64, `O_CLOEXEC` 128 --
+  fs/vfs.rs) are what the port's abi-bits/fcntl.h defines, and the
+  Linux-only names (`O_DIRECTORY`, `O_TMPFILE`, ...) are reference
+  constants so generic library code compiles -- the kernel answers
+  `-EINVAL` if one is actually passed (it refuses unknown bits).  The
+  rest of abi-bits/ is carried over from mlibc's own linux port (see
+  PROVENANCE.txt): those headers *are* the ABI the kernel speaks.
+- **Verified against mlibc 7.0.0** (meson 1.12, gcc 14): the whole
+  `ansi` + `posix` options build, the headers and the four crt objects
+  (crt1 / Scrt1 / crti / crtn -- a static-PIE-safe `_start`, `main`
+  taken RIP-relative) install into a sysroot, and a `write()`-based
+  hello world links as the static PIE the kernel's loader expects
+  (`-pie --no-dynamic-linker -z separate-code -z max-page-size=4096`),
+  `write` reaching `syscall 1` and the restorer reaching `syscall 12`
+  under disassembly.  What cannot be tested off-target is the run
+  itself: that is step 3's business (the cross compiler, `/bin/hello`
+  rebuilt against mlibc, `make test`).
+
+Next (the rest of the phase): build mlibc with Meson against a cross
+C/C++ compiler and install it into a sysroot; port `/bin/hello`,
+`/bin/fork`, `/bin/fd` and `/bin/posix` off the mini libc onto it; teach
+the ELF loader dynamic linking (`PT_INTERP`, mlibc's `ld.so`, RELRO
+through `mprotect`).  See ports/mlibc/README.md for how to apply and
+build the port today.
 
 ## fork, wait and signals (phase 2.5)
 

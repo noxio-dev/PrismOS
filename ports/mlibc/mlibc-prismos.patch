@@ -1,0 +1,18 @@
+diff --git a/meson.build b/meson.build
+index ce5a195..ca785e1 100644
+--- a/meson.build
++++ b/meson.build
+@@ -326,6 +326,13 @@ elif host_machine.system() == 'ethereal'
+ elif host_machine.system() == 'demo'
+ 	subdir('sysdeps/demo')
+ # ANCHOR_END: demo-sysdeps
++elif host_machine.system() == 'prismos'
++	rtld_include_dirs += include_directories('sysdeps/prismos/include')
++	libc_include_dirs += include_directories('sysdeps/prismos/include')
++	internal_conf.set10('MLIBC_MAP_DSO_SEGMENTS', true)
++	internal_conf.set10('MLIBC_MMAP_ALLOCATE_DSO', true)
++	internal_conf.set10('MLIBC_MAP_FILE_WINDOWS', true)
++	subdir('sysdeps/prismos')
+ else
+ 	error('No sysdeps defined for OS: ' + host_machine.system())
+ endif

@@ -1,0 +1,19 @@
+The headers in this directory are carried over from mlibc's own
+sysdeps/linux/include/abi-bits (https://github.com/managarm/mlibc), with
+PrismOS as the target ABI.  They are kept verbatim because phase 3.1 and
+phase 3.2's first step deliberately made the kernel speak the x86-64 Linux
+layouts -- struct stat (144 bytes), struct sigaction (handler / flags /
+restorer / 8-byte mask), sigset_t words, the errno numbering, the poll /
+clockid / signal constants -- so the Linux ABI headers are, with two
+exceptions, *the ABI the PrismOS kernel implements*.
+
+The exceptions, rewritten for PrismOS:
+
+  * fcntl.h  -- open() flags are the kernel's own O_* values
+                (fs/vfs.rs: O_READ 1, O_WRITE 2, O_CREATE 4, O_TRUNC 8,
+                O_APPEND 16, O_EXCL 32, O_NONBLOCK 64, O_CLOEXEC 128),
+                not Linux's octal encodings; the kernel refuses unknown
+                bits, so the Linux-only flags are absent on purpose.
+  * ioctls.h -- only the TCGETS / TIOCGWINSZ pair the kernel answers.
+
+mlibc is MIT-licensed; see the mlibc tree for its license text.
