@@ -63,6 +63,15 @@ pub const USER_SIGCODE: u64 = USER_BASE + (256 << 20);
 /// trampoline sits at +256 MiB) and far below the stack, with the `brk`
 /// heap growing below it.  First-fit, page-granular, upward.
 pub const USER_MMAP_BASE: u64 = USER_BASE + (4 << 30);
+/// Where the ELF loader (phase 3.2, last step) maps the program interpreter
+/// (`PT_INTERP` -- mlibc's `ld.so`) when the executable is dynamically
+/// linked: 2 GiB above the mmap region so the first-fit allocator simply
+/// routes around the image, while the `brk` heap, capped below
+/// USER_MMAP_BASE, can never grow into it.  The interpreter is an `ET_DYN`
+/// mapped at this base and left unrelocated: it relocates itself (its
+/// `_start` runs `relocateSelf`) and then relocates the main program from
+/// the `AT_PHDR` / `AT_PHNUM` / `AT_ENTRY` / `AT_BASE` auxv entries.
+pub const USER_INTERP_BASE: u64 = USER_MMAP_BASE + (2 << 30);
 
 // PTE bits
 const P: u64 = 1;
@@ -715,6 +724,62 @@ impl AddressSpace {
                 f |= NX;
             }
             tw_live(pt, i1, phys | f);
+        }
+        true
+    }
+
+    /// Allocate pages covering `[virt, virt + len)` and map them `PROT_NONE`:
+    /// present but supervisor-only (U/S clear, NX set), so any user access
+    /// faults into the SIGSEGV path.  This is the loader / allocator
+    /// reservation idiom -- mlibc's `ld.so` reserves the span a shared object
+    /// will occupy with an anonymous `mmap(NULL, len, PROT_NONE, ...)` before
+    /// mapping its segments `MAP_FIXED` over the reservation, and the libc's
+    /// own allocator guards its arenas the same way.  Real frames back the
+    /// entries (nothing else records that the range is taken: the first-fit
+    /// `mmap`, `munmap` and `fork` all read the PTEs), and `mprotect` can
+    /// upgrade them later because the entries are present.
+    pub fn alloc_map_none(&mut self, virt: u64, len: u64) -> bool {
+        let start = virt & !(PAGE - 1);
+        let Some(end) = virt.checked_add(len).and_then(|e| e.checked_add(PAGE - 1)) else {
+            return false;
+        };
+        let end = end & !(PAGE - 1);
+        let mut v = start;
+        while v < end {
+            let Some(phys) = crate::mem::pmm::alloc_page() else { return false };
+            if !self.map_page_none(v, phys) {
+                crate::mem::pmm::free_page(phys);
+                return false;
+            }
+            v += PAGE;
+        }
+        true
+    }
+
+    /// `alloc_map`'s `PROT_NONE` sibling: same placement rules, but the entry
+    /// carries no U/S -- the page belongs to the address space and no ring-3
+    /// code may touch it.
+    fn map_page_none(&mut self, virt: u64, phys: u64) -> bool {
+        if virt & (PAGE - 1) != 0 || phys & (PAGE - 1) != 0 || !user_range_ok(virt, PAGE as usize) {
+            return false;
+        }
+        let i4 = ((virt >> 39) & 0x1FF) as usize;
+        if slot_is_kernel(i4) {
+            return false;
+        }
+        let i3 = ((virt >> 30) & 0x1FF) as usize;
+        let i2 = ((virt >> 21) & 0x1FF) as usize;
+        let i1 = ((virt >> 12) & 0x1FF) as usize;
+        // SAFETY: table walks through the direct map on tables we own.
+        unsafe {
+            let Some(pdpt) = walk_user(self.pml4, i4) else { return false };
+            let Some(pd) = walk_user(pdpt, i3) else { return false };
+            let Some(pt) = walk_user(pd, i2) else { return false };
+            if tr_live(pt, i1) & P != 0 {
+                return false;
+            }
+            // P | NX, no RW, no US: present, not writable, not even user.
+            tw_live(pt, i1, phys | P | NX);
         }
         true
     }

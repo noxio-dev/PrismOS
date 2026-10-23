@@ -1,6 +1,6 @@
 [package]
 name = "kernel"
-version = "0.3.2-beta2"
+version = "0.3.2"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "PrismOS kernel"

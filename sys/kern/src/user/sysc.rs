@@ -34,13 +34,17 @@
 //   just memory) and MAP_PRIVATE file mappings (filled eagerly through
 //   the VFS `pread` -- the description's offset is never touched; bytes
 //   past EOF read as zero instead of the POSIX SIGBUS).  W^X is enforced
-//   like everywhere (PROT_WRITE | PROT_EXEC is refused), PROT_NONE too
-//   (nothing maps nothing here).  Without MAP_FIXED the address is a hint
-//   we ignore: the first fit above USER_MMAP_BASE wins.  MAP_SHARED file
-//   mappings are -ENOSYS -- there is no page cache to write back through
-//   yet.  Free ranges are found by probing the page tables (`range_free`),
-//   so there is no VMA list; munmap unmasks whatever is there (absent
-//   pages are skipped, like on Linux).
+//   like everywhere (PROT_WRITE | PROT_EXEC is refused).  PROT_NONE is
+//   honoured for anonymous mappings (phase 3.2's last step: the loader's
+//   reservation idiom -- pages present but supervisor-only, any user
+//   access SIGSEGVs; mprotect can upgrade them later) and refused for
+//   files: a page nobody may touch has nothing to be filled with.
+//   Without MAP_FIXED the address is a hint we ignore: the first fit
+//   above USER_MMAP_BASE wins.  MAP_SHARED file mappings are -ENOSYS --
+//   there is no page cache to write back through yet.  Free ranges are
+//   found by probing the page tables (`range_free`), so there is no VMA
+//   list; munmap unmasks whatever is there (absent pages are skipped,
+//   like on Linux).
 // * `chdir` / `getcwd`: the cwd is a plain String in the PCB (fork copies
 //   it, execve keeps it; the shell's own cwd is a different one in
 //   fsys.rs).  `getcwd` returns the length including the NUL, -ERANGE
@@ -166,8 +170,8 @@ pub fn sys_mmap(a: [u64; 6]) -> i64 {
     {
         return -EINVAL; // exactly one of the two, POSIX says
     }
-    if prot == 0 {
-        return -EINVAL; // PROT_NONE: nothing maps nothing here
+    if prot == 0 && flags & MAP_ANONYMOUS == 0 {
+        return -EINVAL; // PROT_NONE of a file: nothing to fill the page with
     }
     if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
         return -EINVAL; // unknown protection bits: refuse rather than guess
@@ -177,6 +181,10 @@ pub fn sys_mmap(a: [u64; 6]) -> i64 {
     }
     let w = prot & PROT_WRITE != 0;
     let x = prot & PROT_EXEC != 0;
+    // The loader's reservation idiom: anonymous PROT_NONE, pages mapped
+    // present but supervisor-only (vmm.rs -- any user access SIGSEGVs,
+    // `mprotect` can upgrade them, `mmap` MAP_FIXED over them replaces them).
+    let none = prot == 0;
     let len = page_up(len);
 
     // ---- the fd side first (mmap of a file): resolve it before any
@@ -251,8 +259,15 @@ pub fn sys_mmap(a: [u64; 6]) -> i64 {
     }
     // A file mapping is filled through the kernel alias (write with
     // force), so the pages can carry the *asked* protection from the
-    // start -- no reprotect pass, no window of writable rodata.
-    if !aspace.alloc_map(start, len, w, x) {
+    // start -- no reprotect pass, no window of writable rodata.  A
+    // PROT_NONE reservation maps supervisor-only pages instead (never a
+    // file: that case never reaches here).
+    let mapped = if none {
+        aspace.alloc_map_none(start, len)
+    } else {
+        aspace.alloc_map(start, len, w, x)
+    };
+    if !mapped {
         // SAFETY: syscall context, our CR3 is live.
         unsafe { aspace.unmap(start, len) }; // partial map: undo
         return -ENOMEM;

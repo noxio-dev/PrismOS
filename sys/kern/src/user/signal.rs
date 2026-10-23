@@ -381,7 +381,7 @@ pub fn sys_kill(pid: u64, sig: u64) -> i64 {
 
 // ---------------------------------------------------------------- sigreturn
 
-/// `sigreturn()`: restore what delivery pushed.  At the restorer /
+/// `sigreturn()`: restore what delivery pushed.At the restorer /
 /// trampoline the user stack holds, from `frame.rsp` up: the interrupted
 /// mask word, then the saved IsrFrame (the handler's `ret` popped the
 /// return address right below them).  The frame is copied back wholesale --
@@ -462,6 +462,9 @@ pub fn pipe_sigpipe() -> i64 {
 /// the new return target, and the return address planted for it is the
 /// action's restorer (SA_RESTORER) or the `sigreturn` trampoline.  Called
 /// from the syscall dispatch, just before `sysretq`.
+/// Signal frame block written on the user stack: the interrupted mask
+/// (one u64 slot, sigset_t-sized like Linux) followed by the saved
+/// IsrFrame.  sigreturn reads this exact layout back -- keep both in sync.
 pub fn deliver(frame: &mut IsrFrame) {
     // Pick a signal: lowest number first, handlers only (SIG_IGN counts as
     // "installed" -- its pending bit is simply dropped), nothing blocked.
@@ -495,25 +498,38 @@ pub fn deliver(frame: &mut IsrFrame) {
     let ret_addr = if action.flags & SA_RESTORER != 0 { action.restorer } else { USER_SIGCODE };
 
     // Build the handler's stack, below the interrupted one.  The saved
-    // block is 24 words (mask + IsrFrame), 16-byte aligned; the handler
+    // block is one mask word (8 bytes, what sigreturn reads as the
+    // sigset_t) followed by the IsrFrame, 16-byte aligned; the handler
     // entry rsp ends 8 below it, so rsp % 16 == 8 at entry -- exactly the
-    // state after a `call`.
+    // state after a `call`.  128 = red zone, below the interrupted rsp.
     let block = 8 + core::mem::size_of::<IsrFrame>() as u64;
     let Some(frame_sp) = frame.rsp.checked_sub(128 + block) else { return };
     let frame_sp = frame_sp & !0xF;
     let sp = frame_sp - 8;
 
-    // The pages we touch may be copy-on-write after a fork: resolve first,
-    // then write (a failure leaves the signal pending, not fatal -- unless
-    // the stack itself is gone, which ends the process).  The block can
-    // straddle a page boundary, so both ends are resolved.
+    // The pages we touch may be copy-on-write after a fork: resolve EVERY
+    // page of [sp, frame_sp + block) first, then write (a failure leaves
+    // the signal pending, not fatal -- unless the stack itself is gone,
+    // which ends the process).  The region can straddle up to three pages,
+    // so the loop covers the middle page too, not just the two ends.
+    let lo = sp;
+    let hi = frame_sp + block - 1;
+    let mut ok = true;
+    let mut page = lo & !0xFFF;
+    while page <= hi {
+        ok &= aspace.ensure_writable(page);
+        page += 0x1000;
+    }
+
+    // The mask goes out as one u64 word (the fix: a u32 mask into an
+    // 8-byte slot, no more copy_from_slice length mismatch), then the
+    // frame through the same layout-safe serialization sigreturn decodes
+    // on the way back -- no repr(C) assumption on either side.
     let mut bytes = [0u8; 8 + core::mem::size_of::<IsrFrame>()];
-    bytes[0..8].copy_from_slice(&saved_mask.to_le_bytes());
+    bytes[0..8].copy_from_slice(&u64::from(saved_mask).to_le_bytes());
     bytes[8..].copy_from_slice(&frame_bytes(frame));
-    let mut ok = aspace.ensure_writable(sp) && aspace.ensure_writable(frame_sp + block - 1);
     ok &= aspace.write(frame_sp, &bytes, false);
-    let mut ret_slot = [0u8; 8];
-    ret_slot.copy_from_slice(&ret_addr.to_le_bytes());
+    let ret_slot = ret_addr.to_le_bytes();
     ok &= aspace.write(sp, &ret_slot, false);
     if !ok {
         process::exit_current(process::Outcome::Fault {

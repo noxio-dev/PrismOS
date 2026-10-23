@@ -1,0 +1,139 @@
+--- a/config.sub	2024-08-01 08:17:13.000000000 +0000
++++ b/config.sub	2026-10-20 06:44:55.695425345 +0000
+@@ -1735,7 +1735,7 @@
+ 	     | bosx* | nextstep* | cxux* | aout* | elf* | oabi* \
+ 	     | ptx* | coff* | ecoff* | winnt* | domain* | vsta* \
+ 	     | udi* | lites* | ieee* | go32* | aux* | hcos* \
+-	     | chorusrdb* | cegcc* | glidix* | serenity* \
++	     | chorusrdb* | cegcc* | glidix* | serenity* | prismos* \
+ 	     | cygwin* | msys* | pe* | moss* | proelf* | rtems* \
+ 	     | midipix* | mingw32* | mingw64* | mint* \
+ 	     | uxpv* | beos* | mpeix* | udk* | moxiebox* \
+--- a/gcc/config.gcc	2024-08-01 08:17:14.000000000 +0000
++++ b/gcc/config.gcc	2026-10-20 08:24:13.427802326 +0000
+@@ -1932,8 +1932,20 @@
+ i[34567]86-*-elf*)
+ 	tm_file="${tm_file} i386/unix.h i386/att.h elfos.h newlib-stdint.h i386/i386elf.h"
+ 	;;
++x86_64-*-prismos*)
++	tm_file="${tm_file} i386/unix.h i386/att.h elfos.h gnu-user.h glibc-stdint.h \
++		i386/x86-64.h i386/gnu-user-common.h i386/gnu-user64.h i386/prismos.h"
++	# An x86-64 ELF system with a deliberately Linux-shaped ABI: the stdint
++	# layout mlibc asserts (glibc-stdint.h), the GNU userspace crt sandwich
++	# and LINK_SPEC (gnu-user.h + i386/gnu-user64.h, x86_64-*-linux*'s
++	# order in config.gcc -- the generic-elf order of the first version
++	# silently dropped -shared from driver links, which no static link
++	# ever noticed until the dynamic library step), mlibc's ld.so as the
++	# dynamic linker (i386/prismos.h), and __cxa_atexit registration.
++	default_use_cxa_atexit=yes
++	;;
+ x86_64-*-elf*)
+-	tm_file="${tm_file} i386/unix.h i386/att.h elfos.h newlib-stdint.h i386/i386elf.h i386/x86-64.h"
++	tm_file="${tm_file} i386/unix.h i386/att.h elfos.h glibc-stdint.h i386/i386elf.h i386/x86-64.h gnu-user.h"
+ 	;;
+ x86_64-*-rtems*)
+ 	tm_file="${tm_file} i386/unix.h i386/att.h elfos.h newlib-stdint.h i386/i386elf.h i386/x86-64.h i386/rtemself.h rtems.h"
+--- a/libgcc/config.host	2024-08-01 08:17:17.000000000 +0000
++++ b/libgcc/config.host	2026-10-20 08:22:32.972379302 +0000
+@@ -741,12 +741,15 @@
+ i[34567]86-*-elf*)
+ 	tmake_file="$tmake_file i386/t-crtstuff t-crtstuff-pic t-libgcc-pic"
+ 	;;
+-x86_64-*-elf* | x86_64-*-rtems*)
++x86_64-*-elf* | x86_64-*-rtems* | x86_64-*-prismos*)
+ 	tmake_file="$tmake_file i386/t-crtstuff t-crtstuff-pic t-libgcc-pic"
+ 	case ${host} in
+ 	  x86_64-*-rtems*)
+ 	    extra_parts="$extra_parts crti.o crtn.o"
+ 	    ;;
++	  x86_64-*-prismos*)
++	    extra_parts="$extra_parts crtbegin.o crtend.o crtbeginS.o crtendS.o crtbeginT.o"
++	    ;;
+ 	esac
+ 	;;
+ x86_64-*-fuchsia*)
+--- a/libgcc/libgcov.h	2024-08-01 08:17:17.000000000 +0000
++++ b/libgcc/libgcov.h	2026-10-20 07:28:22.458423324 +0000
+@@ -45,7 +45,7 @@
+ #include "libgcc_tm.h"
+ #include "gcov.h"
+ 
+-#if HAVE_SYS_MMAN_H
++#if HAVE_SYS_MMAN_H && !defined (inhibit_libc)
+ #include <sys/mman.h>
+ #endif
+ 
+@@ -178,7 +178,7 @@
+ #define ATTRIBUTE_HIDDEN
+ #endif
+ 
+-#if HAVE_SYS_MMAN_H
++#if HAVE_SYS_MMAN_H && !defined (inhibit_libc)
+ #ifndef MAP_FAILED
+ #define MAP_FAILED ((void *)-1)
+ #endif
+@@ -420,7 +420,7 @@
+     *counter += value;
+ }
+ 
+-#if HAVE_SYS_MMAN_H
++#if HAVE_SYS_MMAN_H && !defined (inhibit_libc)
+ 
+ /* Allocate LENGTH with mmap function.  */
+ 
+--- /dev/null	2026-10-20 00:00:00.000000000 +0000
++++ b/gcc/config/i386/prismos.h	2026-10-20 00:00:00.000000000 +0000
+@@ -0,0 +1,53 @@
++/* Definitions for x86-64 PrismOS -- an x86-64 ELF system with a
++   Linux-shaped GNU userspace ABI whose C library is mlibc.
++   Copyright (C) 2026 noxio-dev.
++
++This file is part of GCC.
++
++GCC is free software; you can redistribute it and/or modify
++it under the terms of the GNU General Public License as published by
++the Free Software Foundation; either version 3, or (at your option)
++any later version.
++
++GCC is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with GCC; see the file COPYING3.  If not see
++<http://www.gnu.org/licenses/>.  */
++
++/* The target macros c-family/c-cppbuiltin.cc feeds the preprocessor: an
++   ELF Unix whose userspace speaks the GNU/Linux ABI shape (i386/gnu-user64.h
++   asks for this through i386/gnu-user-common.h, the way config/linux.h
++   answers for Linux and config/gnu.h for the Hurd).  */
++#undef GNU_USER_TARGET_OS_CPP_BUILTINS
++#define GNU_USER_TARGET_OS_CPP_BUILTINS()\
++    do {\
++        builtin_define ("__prismos__");\
++        builtin_define_std ("unix");\
++        builtin_assert ("system=prismos");\
++        builtin_assert ("system=unix");\
++        builtin_assert ("system=posix");\
++    } while (0)
++
++/* The link emulations and the dynamic linker that i386/gnu-user64.h's
++   LINK_SPEC pastes into every driver link.  The dynamic linker is mlibc's
++   rtld, ld.so, at /lib/ld.so -- the path the kernel's PT_INTERP handling
++   reads from the VFS at execve (ports/toolchain/build.sh's dyn stage asks
++   for it explicitly too: a program is only as dynamic as its PT_INTERP
++   says).  */
++
++#define GNU_USER_LINK_EMULATION32 "elf_i386"
++#define GNU_USER_LINK_EMULATION64 "elf_x86_64"
++#define GNU_USER_LINK_EMULATIONX32 "elf32_x86_64"
++
++#undef GNU_USER_DYNAMIC_LINKER
++#undef GNU_USER_DYNAMIC_LINKER32
++#undef GNU_USER_DYNAMIC_LINKER64
++#undef GNU_USER_DYNAMIC_LINKERX32
++#define GNU_USER_DYNAMIC_LINKER "/lib/ld.so"
++#define GNU_USER_DYNAMIC_LINKER32 "/lib/ld.so"
++#define GNU_USER_DYNAMIC_LINKER64 "/lib/ld.so"
++#define GNU_USER_DYNAMIC_LINKERX32 "/lib/ld.so"

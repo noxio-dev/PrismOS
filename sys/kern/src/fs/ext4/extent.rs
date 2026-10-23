@@ -303,7 +303,18 @@ impl Ext4 {
             let n = (out.len() / bs) as u64;
             let any_cached = (0..n).any(|k| self.cache.map.contains_key(&(pblk + k)));
             if !any_cached {
-                return self.read_raw(pblk, out);
+                // Bounded transfers: one raw read per MAX_RAW bytes instead of the
+                // whole run (a big file is one long contiguous extent).
+                const MAX_RAW: usize = 32 * 1024;
+                let step = core::cmp::max(MAX_RAW / bs, 1) * bs;
+                let (mut off, mut p) = (0usize, pblk);
+                while off < out.len() {
+                    let len = core::cmp::min(step, out.len() - off);
+                    self.read_raw(p, &mut out[off..off + len])?;
+                    off += len;
+                    p += (len / bs) as u64;
+                }
+                return Ok(());
             }
         }
         let (mut src, mut skip, mut done) = (pblk, in_blk, 0usize);

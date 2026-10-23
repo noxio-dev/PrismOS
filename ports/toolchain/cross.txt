@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 noxio-dev
+#
+# The meson cross file that makes an mlibc build *PrismOS* rather than the
+# host system (phase 3.2, step 3).  The compilers are the ones the step
+# provides under build/toolchain/usr/bin -- either the bootstrap wrappers of
+# ports/toolchain/bootstrap.sh or the real x86_64-prismos cross tools of
+# ports/toolchain/build.sh; both answer to the same names, so this file never
+# changes.  Put build/toolchain/usr/bin first on your PATH (both scripts do
+# it for you), or edit the paths below.
+#
+# The bootstrap wrappers are pass-through: any x86-64 host compiler that
+# speaks C23/C++23 works behind them, because mlibc isolates its own includes
+# (-nostdinc for the C++ sources, -ffreestanding, its internal include dirs
+# first) -- the arrangement the port's step-2 verification used.  The real
+# cross tools bring the sysroot with them (--with-sysroot) and nothing else
+# changes.
+
+[binaries]
+c = 'x86_64-prismos-gcc'
+cpp = 'x86_64-prismos-g++'
+ar = 'x86_64-prismos-ar'
+ranlib = 'x86_64-prismos-ranlib'
+strip = 'x86_64-prismos-strip'
+
+[host_machine]
+system = 'prismos'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'

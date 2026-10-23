@@ -52,7 +52,23 @@ second step is the port itself: `sysdeps/prismos` (ports/mlibc), the
 mlibc layer that speaks those 44 syscalls -- one directory to drop into
 an mlibc checkout, one patch to register it, verified against mlibc 7.0.0
 (the whole `ansi` + `posix` build, and a hello world that links as the
-static PIE the loader expects).
+static PIE the loader expects).  Its third step builds the real thing
+(ports/toolchain): a `x86_64-prismos` cross toolchain (binutils 2.44 +
+gcc 14.2.0, patched for the triplet, the ABI deliberately Linux-shaped),
+mlibc built with Meson against it -- headers first, then the compiler,
+then the library -- installed into a sysroot, and `/bin/hello` rebuilt
+against it, passing the loader's own checks under `verify.sh`.  Its
+fourth step ports the userspace itself (usr/mlibc): `/bin/hello`,
+`/bin/fork`, `/bin/fd` and `/bin/posix` off the mini libc onto mlibc --
+same scenarios, same checks, the C library's vocabulary -- each passing
+`verify.sh`'s loader-contract checks with its own syscall set.  Its fifth
+and last step completes the loader: `PT_INTERP` is honoured (the kernel
+maps mlibc's `ld.so` at its own base, unrelocated, and starts it with
+`AT_BASE` plus the program's `AT_PHDR` / `AT_PHNUM` / `AT_ENTRY`),
+anonymous `PROT_NONE` mappings exist (the loader's reservation idiom),
+the sysroot grows the shared half (`libc.so` + `ld.so`, cross-built with
+`-Ddefault_library=both`), and a dynamically linked `/bin/hello-dyn`
+joins the boot image with `/lib/ld.so` and `/lib/libc.so` beside it.
 
 | Area                     | State   | Notes                                                                 |
 |--------------------------|---------|-----------------------------------------------------------------------|
@@ -66,12 +82,15 @@ static PIE the loader expects).
 | ext4                     | partial | R/W, extents, checksums written; no journal, see limits below          |
 | Ring 3                   | done    | user page tables per process, `syscall`/`sysret`, TSS stacks, fault containment (phase 2.1) |
 | Processes / scheduler    | done    | PCB, kernel stacks, context switch, kernel threads (2.2); preemptive round-robin on the timer tick, 4 priority levels, `sleep`/`setprio` syscalls, CPU-time watchdog (2.3); FXSAVE state per process (2.4); parent/child links, `fork` + copy-on-write, blocking `wait`, wait-deadlock guard (2.5) |
-| ELF loader / `execve`    | done    | static ELF64 (`ET_EXEC` / static PIE with RELATIVE relocations), W^X segments, System V initial stack with argv / envp / auxv, `execve` syscall, `/bin/hello` demo built from `usr/` (2.4) |
+| ELF loader / `execve`    | done    | static ELF64 (`ET_EXEC` / static PIE with RELATIVE relocations) and, since 3.2's last step, dynamically linked programs (`PT_INTERP`: the interpreter mapped unrelocated at its own base and started with `AT_BASE` / `AT_PHDR` / `AT_PHNUM` / `AT_ENTRY`), W^X segments, System V initial stack with argv / envp / auxv, `execve` syscall, `/bin/hello` demo built from `usr/` (2.4) |
 | fork / wait / signals     | done    | `fork` clones the address space copy-on-write (refcounted shared pages, fault-time copies), `wait` reaps zombies (blocking, WNOHANG, by pid, Linux status word), SIGKILL/SIGTERM/SIGINT/SIGCHLD/SIGUSR1 with per-process handlers delivered at the syscall boundary and restored register-for-register by a sigreturn trampoline (2.5) |
 | Descriptors / pipes / /dev | done   | a fd table per process (0/1/2 on the console), open file descriptions shared by fork / dup (shared offsets, POSIX), pipes with bounded blocking and EOF / EPIPE, devfs on /dev with `console` / `null` / `zero` served by the descriptor layer, syscalls read / open / close / lseek / dup / pipe (2.6) |
 | POSIX syscalls (libc set) | done | 17 new syscalls (stat / fstat / brk / mmap / munmap / chdir / getcwd / dup2 / fcntl / getdents / ioctl / unlink / mkdir / rmdir / rename / link / uname), `O_NONBLOCK` / `O_CLOEXEC`, per-process cwd, the SIGPIPE rule, `uname` / the isatty ioctl pair; x86-64 Linux `struct stat` and `linux_dirent64` layouts (3.1) |
 | mlibc prerequisites (3.2, first step) | done | `arch_prctl` (TLS: FS/GS base per process, switched with it), `futex` (WAIT / WAKE / REQUEUE / BITSET, bounded parking, per-address-space queues), `sigaction` / `sigprocmask` (per-handler masks, SA_RESTORER / SA_NODEFER / SA_RESETHAND, mask saved and restored by sigreturn, kept across fork / execve), `mprotect` (W^X, COW-aware), `poll` / `select` (readiness probe over files / console / pipes), `clock_gettime` (MONOTONIC from the tick, REALTIME anchored at the RTC, CPUTIME from the charged ticks) |
 | mlibc sysdeps port (3.2, second step) | done | `ports/mlibc/sysdeps/prismos`: the tag layer over syscalls 0..43 (mlIBC 7.0.0's interface -- `Open`/`Read`/`Write`/`Stat`/`VmMap`/`FutexWait`/`Sigaction`/`Poll`/`ClockGet`/...), the raw `syscall` stubs (rax = nr, rdi/rsi/rdx/r10/r8/r9, -errno in rax), the x86-64 ABI headers (Linux layouts the kernel deliberately speaks, except the kernel's own O_* values in fcntl.h), the crt objects and the SA_RESTORER restorer; what the kernel lacks stays ENOSYS (threads / clone, sockets, *at() past AT_FDCWD, rusage) |
+| x86_64-prismos toolchain + mlibc sysroot (3.2, third step) | done | `ports/toolchain`: binutils 2.44 + gcc 14.2.0 cross tools for the `x86_64-prismos` triplet (the two patches in `patches/` teach them the OS the way every new OS does), the ABI deliberately Linux-shaped (`glibc-stdint.h` fast types, `gnu-user.h`'s C++ feature-test cascade, `__cxa_atexit`, the crtbegin/crtend sandwich); mlibc built with Meson against it — headers first, then the compiler, then the library — installed into `build/toolchain/usr/x86_64-prismos` (libc.a + the four crt objects + 209 headers); `/bin/hello` rebuilt against it links as the static PIE the loader expects and passes `verify.sh`'s twenty loader-contract checks; the cross build also flushed out and fixed three latent port bugs (see ports/mlibc/README.md) |
+| the four /bin programs on mlibc (3.2, fourth step) | done | `usr/mlibc`: `/bin/hello`, `/bin/fork`, `/bin/fd` and `/bin/posix` ported off the mini libc — same scenarios, same checks, the C library's vocabulary (stdio on the descriptor table, `fork` / `waitpid` / `kill` / `signal`, `opendir` / `readdir`, `tcgetattr`, `uname`, `errno`), the four PrismOS-only calls raw through `prism_raw.h` (`uptime_ms`, `yield`, the millisecond `sleep`, `brk`); each binary passes `verify.sh`'s loader-contract checks with its own syscall and symbol set — 130 checks across the four — via `make usr-mlibc` (`bootstrap.sh stage progs`; `stage hello` keeps the step-3 proof as a regression) |
+| dynamic linking (3.2, fifth step) | done | the loader honours `PT_INTERP` (the interpreter read from the VFS with the program's own rules, mapped unrelocated at `USER_INTERP_BASE`, the process started at *its* entry with `AT_BASE` plus the program's `AT_PHDR` / `AT_PHNUM` / `AT_ENTRY`; the kernel relocates neither image — that is `ld.so`'s job now); anonymous `PROT_NONE` mappings (supervisor-only pages: the DSO-reservation idiom, upgradable by `mprotect`, replaceable by `MAP_FIXED`); mlibc rebuilt `-Ddefault_library=both` — `libc.so` + `ld.so` in the sysroot (two port fixes the shared build forced: `__do_syscall_ret` out of the rtld, the restorer hidden so its address is not GOT-shaped); the gcc patch now carries a Linux-shaped `LINK_SPEC` (the first version silently dropped `-shared`); `make usr-mlibc-dyn` builds the dynamically linked hello and `verify.sh`'s dyn mode checks the whole chain (47 checks); the boot image grows `/lib/ld.so` + `/lib/libc.so` + `/bin/hello-dyn` |
 | Networking, USB, SMP     | todo    | not started                                                            |
 
 **Testing.** `make fstest` (11 scenarios against `mke2fs` images, each validated
@@ -139,12 +158,12 @@ Phase 2 — ring 3 and processes
 
 Phase 3 — POSIX userspace
 - [x] Phase 3.1 — syscall set for a C library: `open/read/write/lseek/close/stat/dup/pipe/mmap/brk/getcwd/...`
-- [ ] Phase 3.2 — mlibc port and a `x86_64-prismos` toolchain target
+- [x] Phase 3.2 — mlibc port and a `x86_64-prismos` toolchain target
   - [x] kernel prerequisites mlibc needs beyond 3.1: TLS (`FS` base through `arch_prctl`), `futex`, `sigprocmask` / `sigaction`, `mprotect`, `poll` / `select`, `clock_gettime` (pulled forward from 3.5) — syscalls 36..43
   - [x] `sysdeps/prismos` in mlibc (`sys_open`, `sys_read`, `sys_vm_map`, `sys_fork`, `sys_execve`, `sys_waitpid`, ...); sysdeps the kernel lacks stay `ENOSYS` — `ports/mlibc`, verified against mlibc 7.0.0
-  - [ ] build mlibc with Meson against a cross C/C++ compiler (headers first, then the compiler, then the library), install it into a sysroot
-  - [ ] port `/bin/hello`, `/bin/fork`, `/bin/fd` and `/bin/posix` from the mini libc (`usr/lib`) to mlibc
-  - [ ] ELF loader: dynamic linking, a requirement and not an option. Honour `PT_INTERP` (load the interpreter, mlibc's `ld.so`, at its own base and start it with `AT_BASE` plus `AT_PHDR` / `AT_PHNUM` / `AT_ENTRY` describing the main program); `DT_NEEDED` resolution stays in userspace (`ld.so` finds libraries in `/lib` and `/usr/lib` and maps them with file `mmap`); add `mprotect` for RELRO and relocation fix-ups; shared libraries are `ET_DYN` with their own `PT_LOAD` / `PT_TLS` / `PT_GNU_RELRO` handling
+  - [x] build mlibc with Meson against a cross C/C++ compiler (headers first, then the compiler, then the library), install it into a sysroot — `ports/toolchain`: the bootstrap pipeline (wrappers → headers → library → `/bin/hello` + `verify.sh`), and the real `x86_64-prismos` cross tools (binutils 2.44 + gcc 14.2.0, patched for the triplet, the ABI deliberately Linux-shaped: `glibc-stdint.h`, `gnu-user.h`, `__cxa_atexit`, the crtbegin/crtend sandwich) — `make mlibc`, `make usr-mlibc`
+  - [x] port `/bin/hello`, `/bin/fork`, `/bin/fd` and `/bin/posix` from the mini libc (`usr/lib`) to mlibc — `usr/mlibc`: same scenarios, same summary lines, the C library's vocabulary (`fork` / `waitpid` / the `W*` macros, `signal` with its `SIG_ERR` refusals, `opendir` / `readdir`, `tcgetattr`, `uname`, stdio buffered on the descriptor table, `-1` + `errno` folded back for the error tables); the four PrismOS-only calls stay raw through `prism_raw.h` (`uptime_ms`, `yield`, the millisecond `sleep`, `brk`); `verify.sh` grew a per-program mode — every syscall each program makes and the symbols those paths live in, 130 checks across the four — `make usr-mlibc`
+  - [x] ELF loader: dynamic linking, a requirement and not an option. Honour `PT_INTERP` (load the interpreter, mlibc's `ld.so`, at its own base and start it with `AT_BASE` plus `AT_PHDR` / `AT_PHNUM` / `AT_ENTRY` describing the main program); `DT_NEEDED` resolution stays in userspace (`ld.so` finds libraries in `/lib` and `/usr/lib` and maps them with file `mmap`); add `mprotect` for RELRO and relocation fix-ups; shared libraries are `ET_DYN` with their own `PT_LOAD` / `PT_TLS` / `PT_GNU_RELRO` handling — the loader's `PT_INTERP` path (sys/kern/src/user/elf.rs) + anonymous `PROT_NONE` mmap (sysc.rs / vmm.rs, the reservation idiom) on the kernel side; `-Ddefault_library=both` putting `libc.so` + `ld.so` in the sysroot on the library side; the proof is a dynamically linked `/bin/hello-dyn` (PT_INTERP `/lib/ld.so`, `DT_NEEDED libc.so`, BIND_NOW) with `/lib/ld.so` + `/lib/libc.so` in the boot image — `make usr-mlibc-dyn`, `verify.sh`'s dyn mode
 - [ ] Phase 3.3 — `init`, TTY layer with line discipline, `/proc` and `/tmp` (tmpfs)
 - [ ] Phase 3.4 — BusyBox and a userspace shell
 - [ ] Phase 3.5 — precise time (HPET/TSC behind the 3.2 `clock_gettime`), `/dev/random`, users and permissions
@@ -278,7 +297,11 @@ arguments now -- `mmap` needs r10 / r8 / r9, the Linux order.
   VFS `pread` (the description's offset never moves, bytes past EOF read
   as zero instead of the POSIX SIGBUS); `MAP_FIXED` first unmaps whatever
   was there.  W^X is enforced (`PROT_WRITE | PROT_EXEC` is `-EACCES`, the
-  loader's rule), `PROT_NONE` and unknown bits are `-EINVAL`, mappings
+  loader's rule); an anonymous `PROT_NONE` mapping is honoured since
+  3.2's last step (pages present but supervisor-only, any ring-3 access
+  SIGSEGVs, `mprotect` can upgrade them, `MAP_FIXED` replaces them -- the
+  loader's reservation idiom), while `PROT_NONE` of a *file* and unknown
+  bits are `-EINVAL`; mappings
   over the signal trampoline page are refused, and `MAP_SHARED` of a file
   is `-ENOSYS` (no page cache to write back through).  `munmap` releases
   pages through the COW table, so a fork sibling keeps its copy.
@@ -324,12 +347,13 @@ arguments now -- `mmap` needs r10 / r8 / r9, the Linux order.
 - **uname** fills the six 65-byte fields (`PrismOS` / `prismos` / `3.2` /
 build string / `x86_64` / `(none)`).
 
-Not here (yet): `MAP_SHARED` of a file, `PROT_NONE`, `fchmod` / `chmod`
+Not here (yet): `MAP_SHARED` of a file, `fchmod` / `chmod`
 and anything permission-shaped (phase 3.5), `wait4`-style rusage, and
 `getdents` `d_type` for file systems that do not know one (ext4 and devfs
 always do).  The former 3.1 gaps a library cares about -- `select` / `poll`,
 `mprotect`, `clock_gettime`, TLS / `futex` / `sigprocmask` -- are phase 3.2's
-first step, below.
+first step, below; the `PROT_NONE` of the loader's reservations is 3.2's
+last step, below that.
 
 Shell: `exec posix` runs the ten phase 3.1 scenarios and prints
 `posix: all 10 passed` -- also part of `make test` (the re-`execve`d
@@ -473,12 +497,228 @@ Linux-ABI port's.
   itself: that is step 3's business (the cross compiler, `/bin/hello`
   rebuilt against mlibc, `make test`).
 
-Next (the rest of the phase): build mlibc with Meson against a cross
-C/C++ compiler and install it into a sysroot; port `/bin/hello`,
-`/bin/fork`, `/bin/fd` and `/bin/posix` off the mini libc onto it; teach
-the ELF loader dynamic linking (`PT_INTERP`, mlibc's `ld.so`, RELRO
-through `mprotect`).  See ports/mlibc/README.md for how to apply and
-build the port today.
+Next: phase 3.3 -- `init`, a TTY layer with line discipline, `/proc` and
+`/tmp` (tmpfs).  Everything the phase set out to do is in: the sysdeps
+port, the cross toolchain and sysroot, the four ports, and (the last
+step, below) the ELF loader's dynamic linking.  What still waits for a
+full dev box is the *run* of the dynamic chain -- QEMU booting the image,
+`exec hello-dyn`, the summaries printed from the far side of `ld.so`.
+
+## The cross toolchain and the mlibc sysroot (phase 3.2, third step)
+
+`ports/toolchain` -- the phase's todo, verbatim: *build mlibc with Meson
+against a cross C/C++ compiler (headers first, then the compiler, then the
+library), install it into a sysroot*.  Two scripts drive the same pipeline
+at two speeds.  `bootstrap.sh` (minutes): the cross compiler is a prefixed
+pass-through around any C23/C++23 host compiler -- the arrangement the
+step-2 verification used, because mlibc isolates its own includes and the
+meson cross file is what makes the build *PrismOS*.  `build.sh` (the real
+thing): binutils 2.44 and gcc 14.2.0 built for the `x86_64-prismos`
+triplet, installed into the same prefix under the same names, and mlibc
+rebuilt with them.  Neither toolchain knows a `prismos` OS out of the box,
+so the two patches in `ports/toolchain/patches/` teach them the way every
+new OS does (config.sub's OS list, the ELF target cases of bfd / ld / gas,
+gcc's config.gcc and libgcc's config.host -- SerenityOS's recipe for
+`x86_64-pc-serenity` being the family precedent).
+
+- **The order is the todo's parenthetical.**  *Headers first*: mlibc's
+  headers alone (`-Dheaders_only=true`) install into
+  `build/toolchain/usr/x86_64-prismos/usr/include` -- the sysroot a cross
+  compiler is built against (`--with-sysroot`).  *Then the compiler*:
+  binutils, then gcc (`--without-headers` + `--with-newlib`: the
+  compilers and libgcc, `inhibit_libc` set so libgcc includes no libc
+  header -- mlibc proper does not exist yet at that point; no target
+  runtime is built, because mlibc *is* the target runtime).  *Then the
+  library*: the whole `ansi` + `posix` surface the kernel serves, static,
+  plus the four crt objects, built with the real cross tools under the
+  same cross file.  It lands as `libc.a` in the sysroot.
+- **The cross gcc's ABI is deliberately Linux-shaped** -- the kernel made
+  its layouts Linux-shaped on purpose (3.1's decision), and mlibc's x86_64
+  headers assert the compiler agrees: `glibc-stdint.h` (not newlib's)
+  gives the LP64 fast types those assertions check; `gnu-user.h` brings
+  the GNU C++ feature-test cascade (`-D_GNU_SOURCE`, without which
+  mlibc-config.h resolves `_DEFAULT_SOURCE` off and half the abi-bits,
+  starting with `struct rusage`, never define); `default_use_cxa_atexit`
+  gives mlibc's exit path its `__dso_handle` (it lives in `crtbeginS.o`
+  only when that is on); and libgcc's `extra_parts` install the four
+  crtbegin/crtend objects a static-PIE link sandwiches around the program.
+  One more guard rides in the patch: libgcov's `mmap` include now respects
+  `inhibit_libc` (the gcov runtime is meaningless without a libc, and the
+  target libgcc configure -- with the sysroot visible -- had decided
+  `HAVE_SYS_MMAN_H` while the build had no headers to serve it).
+- **The proof, and what the proof caught.**  `/bin/hello` rebuilt against
+  mlibc (ports/toolchain/hello.c: `write` through the Write tag, `printf`
+  through stdio, auxv, a caught signal round-tripped through the
+  SA_RESTORER restorer, `clock_gettime`) compiles with the cross gcc and
+  links as the static PIE the loader expects -- the same crt sandwich a
+  `-static-pie` driver assembles.  `verify.sh` then runs the loader's own
+  checks, statically: ET_DYN, no `PT_INTERP`, a `PT_DYNAMIC` carrying
+  `DT_RELA` (401 `R_X86_64_RELATIVE` relocations) and never `DT_NEEDED` /
+  `DT_JMPREL` / IRELATIVE, no two segments sharing a page, and under
+  disassembly `write` reaching syscall 1, the restorer reaching syscall 12,
+  `clock_gettime` reaching syscall 43.  All twenty pass.  Building the
+  library with a real cross compiler also flushed out three latent port
+  bugs the step-2 host build had masked -- the missing abi-bits installs,
+  mlibc's IFUNC strcmp (its `R_X86_64_IRELATIVE` lands in `DT_JMPREL`,
+  which the kernel's loader refuses outright), and an incomplete
+  `struct rusage` behind a feature-test cascade a linux-target g++
+  satisfies implicitly; all three are fixed in the port (see
+  ports/mlibc/README.md).
+- **What still waits for a full dev box:** the *run*.  `verify.sh` checks
+  everything the loader checks without booting; `make test` (QEMU, the
+  image, the mlibc-built `/bin` in the ext4 root) is the remaining steps'
+  business -- the fourth step's ports (below), then dynamic linking.
+  The sandbox this step ran in has no QEMU, no clang, no cargo
+  (the boot chain needs all three); `make mlibc` and `make usr-mlibc`
+  carry the step's deliverables into any checkout.
+
+See ports/toolchain/README.md for the scripts, the stages, and the ABI
+decisions spelled out.
+
+## The four /bin programs on mlibc (phase 3.2, fourth step)
+
+`usr/mlibc` -- the phase's todo, verbatim: *port `/bin/hello`, `/bin/fork`,
+`/bin/fd` and `/bin/posix` from the mini libc (`usr/lib`) to mlibc*.  The
+scenarios are the phases' own, unchanged -- every check the mini-libc
+originals printed, the same summary lines (`fork: all 10 passed`,
+`fd: all 10 passed`, `posix: all 10 passed`) -- but the vocabulary is the
+C library's now: what the originals asked the raw syscall interface for
+through `usr/include/prism.h`, the ports ask `fork` / `waitpid` / `kill` /
+`signal` / `opendir` / `tcgetattr` / `uname` / stdio, and mlibc's
+sysdeps turn those into the same 44 syscalls through the tag layer.
+
+- **A translation, not a rewrite.**  Each program keeps its phase's shape:
+  `hello` (2.4) still runs `info` / `fpu` / `chain` / `errors` / `exit` /
+  `fault` -- `printf` on stdio, `getpid` / `execve` from `<unistd.h>`,
+  `getauxval` from `<sys/auxv.h>`, `strerror(errno)` for the failures;
+  `fork` (2.5) still runs its ten scenarios with `fork` / `waitpid` / the
+  `W*` macros of `<sys/wait.h>` and `signal`'s `SIG_ERR` refusals
+  (`catching SIGKILL -> EINVAL` is now a matter of `errno`, not a raw
+  word); `fd` (2.6) still runs its ten on `read` / `open` / `close` /
+  `lseek` / `dup` / `pipe` with `O_*` flags out of `<fcntl.h>`; `posix`
+  (3.1) still runs its ten on `stat` / `fstat`, `opendir` / `readdir`,
+  `tcgetattr`, `uname`, the `mmap` / `munmap` of `<sys/mman.h>` and the
+  directory calls (`mkdir` / `unlink` / `rename` / `link`).
+- **The error convention, folded.**  The mini libc returned the kernel's
+  negative errnos in one word; POSIX returns `-1` and sets `errno`.  Each
+  port carries a two-line `ec()` that folds the POSIX rule back into the
+  single word the error tables compare, so the scenario tables
+  (`-ENOENT`, `-EFAULT`, `-ECHILD`, ...) read exactly as they did.
+- **What stays raw, and why.**  Four calls are the kernel's own
+  vocabulary, things POSIX simply has no word for, and they stay raw
+  through `usr/mlibc/prism_raw.h` -- `uptime_ms` (3, the tick counter
+  behind `CLOCK_MONOTONIC`), `yield` (4), the millisecond `sleep` (5,
+  neither `sleep(3)`'s seconds nor `nanosleep`'s timespec) and `brk` (21,
+  exact-return, which mlibc's mmap-based allocator never wraps).  The
+  header is the only place the `syscall` instruction appears outside
+  `libc.a`, and it speaks the same convention the dispatcher has read
+  since phase 2.1 (rax = number, rdi / rsi / rdx = arguments).
+- **The build is the proof's build, four times.**  `bootstrap.sh stage
+  progs` (`make usr-mlibc`; `build.sh stage progs` on the real tools)
+  compiles each program with the cross gcc against the sysroot and links
+  the same crt sandwich the step-3 proof linked (`Scrt1 crti crtbeginS
+  prog.o libc.a crtendS crtn`, `-pie --no-dynamic-linker -z
+  separate-code -z max-page-size=4096`).  `verify.sh` then runs the
+  loader's own checks per program: the ELF contract (ET_DYN, no
+  `PT_INTERP`, `DT_RELA`, never `DT_NEEDED` / `DT_JMPREL` / IRELATIVE,
+  one protection per page) plus *that program's* syscall set under
+  disassembly -- every call it makes reaching its number through either
+  the tag layer (`mov $nr,%edi ... call __do_syscallN`) or the raw shim
+  (`mov $nr,%eax ... syscall`) -- and the symbols those paths live in
+  (`fork`, `waitpid`, `opendir`, `tcgetattr`, `uname`, ...).  21 checks
+  for hello, 27 for fork, 32 for fd, 50 for posix: 130 across the four.
+- **What still waits for a full dev box:** the *run*, as in step 3.  The
+  four ports land in `build/usr/bin-mlibc/` and the boot image keeps the
+  mini-libc `/bin` -- but since the fifth step the image also carries the
+  dynamic trio (`/lib/ld.so`, `/lib/libc.so`, `/bin/hello-dyn`), so a dev
+  box with QEMU can `exec hello-dyn` and watch the whole chain go.
+
+## The ELF loader's dynamic linking (phase 3.2, fifth step)
+
+The phase's todo, verbatim: *ELF loader: dynamic linking, a requirement
+and not an option.  Honour `PT_INTERP` ... `DT_NEEDED` resolution stays
+in userspace ... shared libraries are `ET_DYN`.*  Three halves had to
+move together: the kernel's loader, the library's shared build, and the
+link that joins them.
+
+- **The kernel's half** (sys/kern/src/user/elf.rs, refactored into a
+  `parse` + `map_image` pair the program and the interpreter now share).
+  A `PT_INTERP` is no longer refused: its path is read from the image
+  (NUL-terminated, size-capped) and the interpreter file goes through
+  the *same* checks as the program -- regular, executable, under the 4
+  MiB cap -- before any address-space work, so a bad one fails the
+  `execve` cleanly.  It is mapped at `USER_INTERP_BASE` (vmm.rs: 2 GiB
+  above the mmap region -- the first-fit allocator simply routes around
+  the image, and the `brk`, capped below the mmap region, can never grow
+  into it), with the same placement rules as any image (W^X, one
+  protection per page, span cap, the trampoline page untouched).  The
+  kernel then relocates *neither* image: the interpreter relocates
+  itself from its own `_DYNAMIC` (its `_start` runs `relocateSelf`
+  first), and the program is the interpreter's to relocate from the
+  phdrs the auxv hands it.  The process starts at the *interpreter's*
+  entry, with `AT_BASE` (its load bias) joining the auxv -- and
+  `AT_PHDR` / `AT_PHNUM` / `AT_ENTRY` still describing the *program*.
+  The static-PIE relocation rules (RELATIVE-only, never `DT_NEEDED` /
+  `DT_JMPREL`) now apply only when there is no interpreter, exactly as
+  they always did.
+- **The reservation idiom** (sysc.rs + vmm.rs): an anonymous `PROT_NONE`
+  mapping is honoured -- pages present but supervisor-only (U/S clear,
+  NX set), so any ring-3 access SIGSEGVs through the usual fault path,
+  `mprotect` can upgrade the range later, and `MAP_FIXED` over it
+  replaces it.  That is the loader's idiom: mlibc's `ld.so` reserves the
+  span each shared object will occupy with an anonymous `PROT_NONE`
+  `mmap` before mapping its segments `MAP_FIXED` over the reservation,
+  and the libc's own allocator guards its arenas the same way (which the
+  *static* programs' `malloc` needed all along -- a latent runtime bug
+  no static check could see).  `PROT_NONE` of a file stays `-EINVAL`:
+  a page nobody may touch has nothing to be filled with.
+- **The library's half**: a second meson build of the same patched tree
+  with `-Ddefault_library=both` (`build.sh stage dynlib`) -- the static
+  `libc.a` and the four programs never notice, and the sysroot gains
+  `libc.so` (the C library as an `ET_DYN` with its own `PT_LOAD` /
+  `PT_TLS` / `PT_GNU_RELRO`) and `ld.so` (the rtld: linked `-nostdlib`,
+  self-relocating, `SONAME ld.so`).  The shared build forced two port
+  fixes the static one never asked for.  `__do_syscall_ret` compiled out
+  of the rtld (linux's own rule): its `errno` store drags the libc's TLS
+  symbol into a link against nothing, and nothing in the rtld calls it.
+  And the restorer's address is hidden now (`.hidden` in signal.S, the
+  attribute on the declaration): taken as data it would go through the
+  GOT, and a `GLOB_DAT` is a symbol relocation -- `relocateSelf` accepts
+  `R_X86_64_RELATIVE` and traps on anything else.  The linux alternative
+  (compiling the whole `Sigaction` wrapper out of the rtld) breaks the
+  static archive's member pull -- the libc's own twin member would come
+  in for it and collide -- so the port keeps the wrapper everywhere and
+  hides the reference instead.
+- **The toolchain's half**: the first dynamic link failed on the *driver*,
+  not the linker -- gcc's generic-elf `tm_file` carries no `LINK_SPEC`,
+  so `x86_64-prismos-g++ -shared` silently dropped the flag (no static
+  link ever noticed; the four programs link through `$LD` directly).
+  The gcc patch now uses `x86_64-*-linux*`'s order (`gnu-user.h` +
+  `i386/gnu-user-common.h` + `i386/gnu-user64.h`, plus the new
+  `i386/prismos.h`: the link emulations, the `/lib/ld.so` dynamic
+  linker, the `__prismos__` / unix / posix builtins) and libgcc grows
+  `crtbeginT.o` -- the `-static` half of the sandwich.
+- **The proof and the image.**  `build.sh stage dyn` (`make usr-mlibc-dyn`)
+  links the same `usr/mlibc/hello/hello.c` against the sysroot's
+  `libc.so`: `PT_INTERP /lib/ld.so`, `DT_NEEDED libc.so`, `DT_JMPREL`
+  for the PLT the rtld resolves, and BIND NOW (`-z now`) because
+  mlibc's rtld zeroes `GOT[1]/GOT[2]` -- lazy binding is not an option.
+  `verify.sh`'s dyn mode then checks the whole chain, still statically:
+  the executable's shape (the interpreter path, the `DT_NEEDED`, the
+  JUMP_SLOT relocations, `__mlibc_entry` left undefined for `libc.so` to
+  answer, the raw shim still raw in the binary), `ld.so`'s
+  self-containment (an `ET_DYN` with no `PT_INTERP` of its own,
+  `RELATIVE`-only relocations, no undefined symbols) and its exact
+  syscall diet under disassembly -- `open` / `read` / `close` / `lseek` /
+  `fstat` / `getpid` for the library files, `mmap` / `munmap` /
+  `mprotect` for the reservations and the segment protections,
+  `arch_prctl` for the FS base the TLS lives on -- and `libc.so`'s
+  exports (`__mlibc_entry`, `printf`, `malloc`, `__do_syscall6`) with
+  hello's library calls now living in it: 47 checks.  The boot image
+  carries the trio (a stripped `/lib/ld.so` and `/lib/libc.so` beside
+  `/bin/hello-dyn`; `make root`) -- the kernel reads whole files and the
+  debug sections buy it nothing.  The run itself, as through the whole
+  phase, is a dev-box matter.
 
 ## fork, wait and signals (phase 2.5)
 
@@ -769,7 +1009,7 @@ contrib/lua              Lua 5.4.8 (MIT)
 include/                 prism.inc (shared constants), prism/boot.h
 sys/kern                 Rust kernel (no_std, x86_64-unknown-none)
 tools/mkimage.py         GPT disk image builder (ESP + BIOS boot + ext4 root)
-usr/                     user space: crt0 + mini libc (usr/lib), headers, programs (usr/hello, usr/fork, usr/fd, usr/posix)
+usr/                     user space: crt0 + mini libc (usr/lib), headers, programs (usr/hello, usr/fork, usr/fd, usr/posix); the mlibc ports of the four (usr/mlibc)
 tests/boot_test.py       QEMU boot tests (incl. ext4 root, layout assertion)
 tests/fs_test.py         host VFS/ext4 tests (tests/fstest is the harness)
 ```

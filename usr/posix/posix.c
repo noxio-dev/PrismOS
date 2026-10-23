@@ -41,7 +41,7 @@
  *             rmdir (ENOTEMPTY with a file inside, EISDIR through
  *             unlink), rename (old name gone, new one there), link
  *             (nlink 2, back to 1 after the unlink), the ENOENT paths
- *   uname     uname fills the six fields (PrismOS / x86_64 / 3.1) and
+ *   uname     uname fills the six fields (PrismOS / x86_64 / 3.2) and
  *             ioctl(1, TCGETS) succeeds on the console while a regular
  *             file fd answers -ENOTTY (the isatty pair)
  */
@@ -541,7 +541,7 @@ static int sc_uname(void)
         bad += !expect(sys_uname(&u), 0);
         bad += !expect(strcmp(u.sysname, "PrismOS"), 0);
         bad += !expect(strcmp(u.machine, "x86_64"), 0);
-        bad += !expect(strcmp(u.release, "3.1"), 0);
+        bad += !expect(strcmp(u.release, "3.2"), 0);
         bad += !expect(u.nodename[0] != 0, 1);
 
         /* The isatty pair: the console answers, a file does not. */
@@ -553,7 +553,7 @@ static int sc_uname(void)
         bad += !expect(sys_ioctl(f, PRISM_TCGETS, termios), -PRISM_ENOTTY);
         sys_close(f);
 
-        fmt(d, sizeof d, "PrismOS x86_64 3.1, TCGETS/WINSZ, ENOTTY, %d checks", 9 - bad);
+        fmt(d, sizeof d, "PrismOS x86_64 3.2, TCGETS/WINSZ, ENOTTY, %d checks", 9 - bad);
         check("uname", bad == 0, d);
         return bad;
 }

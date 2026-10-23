@@ -450,27 +450,45 @@ fn read_zero(buf: u64, len: usize) -> i64 {
     done as i64
 }
 
+/// Deliver a completed console read to user memory.
+fn console_deliver(buf: u64, chunk: &[u8], got: usize) -> i64 {
+    if copy_out(buf, 0, &chunk[..got]) {
+        got as i64
+    } else {
+        -EFAULT
+    }
+}
+
 fn read_console(desc: &Rc<FileDesc>, buf: u64, len: usize) -> i64 {
     let nonblock = desc.flags() & O_NONBLOCK != 0;
     let start = uptime_ms();
+    let want = len.min(CHUNK);
     let mut chunk = [0u8; CHUNK];
     let mut got = 0usize;
     loop {
-        // Take whatever is pending right now, at most one chunk: a short
-        // count is a valid read, so the caller loops for the rest.
-        while got < len.min(CHUNK) {
+        // Take whatever is pending right now.  Unlike a pipe, the console
+        // does not hand back a partial count as soon as one key arrives:
+        // the read completes on the requested count or on a line end,
+        // whichever comes first (read(fd, buf, 1) keeps its old behaviour).
+        while got < want {
             let Some(b) = get_input_byte() else { break };
             chunk[got] = b;
             got += 1;
+            if b == b'\n' || b == b'\r' {
+                return console_deliver(buf, &chunk, got); // line end: complete even if short
+            }
         }
-        if got > 0 {
-            return if copy_out(buf, 0, &chunk[..got]) { got as i64 } else { -EFAULT };
+        if got == want {
+            return console_deliver(buf, &chunk, got); // count satisfied
         }
         if nonblock {
-            return -EAGAIN; // nothing typed and the caller asked not to wait
+            // must not wait: hand back what is pending, EAGAIN if dry
+            return if got > 0 { console_deliver(buf, &chunk, got) } else { -EAGAIN };
         }
         if uptime_ms() - start >= WAIT_MAX_MS {
-            return -EAGAIN; // nothing typed: a way out, not a wedge
+            // a way out, not a wedge: a partial line typed then abandoned
+            // is still worth delivering; a fully silent read stays EAGAIN
+            return if got > 0 { console_deliver(buf, &chunk, got) } else { -EAGAIN };
         }
         park_once();
     }

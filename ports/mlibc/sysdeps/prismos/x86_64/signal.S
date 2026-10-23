@@ -10,6 +10,7 @@
 
 	.section .text
 	.global __mlibc_signal_restore
+	.hidden __mlibc_signal_restore
 	.type __mlibc_signal_restore, @function
 __mlibc_signal_restore:
 	mov $12, %rax             # SYS_sigreturn

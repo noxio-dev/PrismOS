@@ -148,7 +148,7 @@ def main():
           ("pid 5 hello -- exited with status 0", "exec hello fault\r"),
           ("pid 6 hello -- killed by exception 14", "exec hello exit 42\r"),
           ("pid 7 hello -- exited with status 42", "exec notelf\r")],
-         ['argv[2] = "alpha"', "env: PRISMOS=3.1", "main() runs at 0x80", "AT_PAGESZ = 4096",
+         ['argv[2] = "alpha"', "env: PRISMOS=0.3.2", "main() runs at 0x80", "AT_PAGESZ = 4096",
           "float check: ok",
           "hello chain: pid 2 calls execve()", 'argv[2] = "(after execve)"', 'argv[4] = "y"',
           "execve(/nonexistent)         -> -2", "execve(/boot/loader.conf)    -> -13",
@@ -186,7 +186,7 @@ def main():
         # `mount` steps check the namespace side (devfs, the mount table).
         ("BIOS shell: descriptors, pipes, /dev (phase 2.6)", bios_cmd,
          [("prism# ", "exec fd\r"),
-          ("type 4 bytes:", "wxyz\r"),
+          ("type 4 bytes (EXACTLY wxyz):", "wxyz\r"),
           ("prism# ", "ps\r"),
           ("prism# ", "ls /dev\r"),
           ("prism# ", "mount\r"),

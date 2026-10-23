@@ -1,0 +1,318 @@
+#!/bin/sh
+#-
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 noxio-dev
+#
+# Phase 3.2, steps 3 + 4 -- the real cross toolchain: binutils + GCC for
+# x86_64-prismos, then mlibc rebuilt with it, then the four /bin programs
+# ported to it.  The phase's todo, verbatim: "build mlibc with Meson against
+# a cross C/C++ compiler (headers first, then the compiler, then the
+# library), install it into a sysroot" (step 3) and "port /bin/hello,
+# /bin/fork, /bin/fd and /bin/posix from the mini libc (usr/lib) to mlibc"
+# (step 4).
+#
+# The order this script drives:
+#
+#   1. headers   (bootstrap.sh stage headers) -- mlibc's headers land in the
+#                 sysroot first, because that is what a cross compiler is
+#                 built against (--with-sysroot).
+#   2. compiler  binutils (as / ld / ar for the target) and GCC (c + c++,
+#                 --without-headers: the compilers and libgcc -- no target
+#                 runtime, because mlibc *is* the target runtime) -- both
+#                 taught the x86_64-prismos triplet by the two patches in
+#                 patches/ (config.sub's OS list + the generic ELF target
+#                 cases; the same three-line surgery every new OS does to
+#                 gcc and binutils, SerenityOS's x86_64-pc-serenity being
+#                 the family recipe).
+#   3. library   mlibc proper, rebuilt with the real cross compiler under the
+#                 same meson cross file -- the bootstrap wrappers of
+#                 bootstrap.sh are simply answered by real binaries now.
+#   4. progs     the four /bin programs ported to mlibc (usr/mlibc),
+#                 compiled and linked through the finished toolchain
+#                 (bootstrap.sh stage progs: the compiler it finds in
+#                 build/toolchain/usr/bin is the cross gcc by then), and
+#                 the same static verification, per program -- `stage
+#                 hello` (the step-3 proof) remains runnable on its own.
+#   5. dynlib     the dynamic half of the library, phase 3.2's last step:
+#                 mlibc rebuilt with -Ddefault_library=both under the same
+#                 cross file -- the sysroot gains libc.so (the C library as
+#                 an ET_DYN with its own PT_LOAD / PT_TLS / PT_GNU_RELRO)
+#                 and ld.so (the rtld, an ET_DYN linked -nostdlib that
+#                 relocates itself from its own _DYNAMIC and then the
+#                 program it is the PT_INTERP of).
+#   6. dyn        the proof executable: usr/mlibc/hello/hello.c again, but
+#                 linked dynamically -- PT_INTERP /lib/ld.so, DT_NEEDED
+#                 libc.so, -z now (mlibc's rtld fills GOT[1]/GOT[2] with
+#                 NULL: lazy binding is not an option, BIND_NOW is),
+#                 everything else the same sandwich of crt objects.
+#
+# Usage:
+#   sh ports/toolchain/build.sh                # every stage, in order
+#   sh ports/toolchain/build.sh stage <name>   # one stage
+#   sh ports/toolchain/build.sh list
+#
+# Environment / flags:
+#   --prefix <dir>    toolchain prefix (default build/toolchain/usr)
+#   --src <dir>       sources directory (default build/toolchain-src)
+#   --jobs <n>        parallel jobs (default nproc, capped at 8)
+#   BINUTILS_VER      default 2.44
+#   GCC_VER           default 14.2.0
+#   MIRROR            default https://mirrors.kernel.org/gnu
+#
+# Requirements: a C/C++ compiler and make for the host (it builds the cross
+# tools), meson + ninja (for the mlibc stages), and the network for the
+# tarballs (stage fetch).  Everything lands under build/toolchain/usr:
+# the bin/x86_64-prismos-* tools and the x86_64-prismos/ sysroot.
+set -e
+
+REPO=$(cd "$(dirname "$0")/../.." && pwd)
+PREFIX=$REPO/build/toolchain/usr
+SRC=$REPO/build/toolchain-src
+SYSROOT=$PREFIX/x86_64-prismos
+JOBS=$(nproc 2>/dev/null || echo 2)
+[ "$JOBS" -gt 8 ] && JOBS=8
+BINUTILS_VER=${BINUTILS_VER:-2.44}
+GCC_VER=${GCC_VER:-14.2.0}
+MIRROR=${MIRROR:-https://mirrors.kernel.org/gnu}
+GMP_VER=${GMP_VER:-6.3.0}
+MPFR_VER=${MPFR_VER:-4.2.1}
+MPC_VER=${MPC_VER:-1.3.1}
+STAGE=all
+
+while [ $# -gt 0 ]; do
+        case "$1" in
+        --prefix) PREFIX=$2; SYSROOT=$2/x86_64-prismos; shift 2 ;;
+        --src)    SRC=$2; shift 2 ;;
+        --jobs)   JOBS=$2; shift 2 ;;
+        stage)    STAGE=$2; shift 2 ;;
+        list)     echo "fetch binutils gcc mlibc progs hello verify dynlib dyn dynverify"; exit 0 ;;
+        *) echo "usage: $0 [--prefix dir] [--src dir] [--jobs n] [stage <name>|list]" >&2; exit 2 ;;
+        esac
+done
+
+PATCHES=$REPO/ports/toolchain/patches
+say() { printf '[build/%s] %s\n' "$1" "$2"; }
+
+# ---- stage: fetch ------------------------------------------------------------
+# The tarballs, the prerequisites (gmp / mpfr / mpc, linked into gcc's tree
+# so its build builds them), and the two triplet patches.
+do_fetch() {
+        mkdir -p "$SRC"
+        cd "$SRC"
+        for a in binutils/binutils-$BINUTILS_VER.tar.xz \
+                 gcc/gcc-$GCC_VER/gcc-$GCC_VER.tar.xz \
+                 gmp/gmp-$GMP_VER.tar.xz \
+                 mpfr/mpfr-$MPFR_VER.tar.xz \
+                 mpc/mpc-$MPC_VER.tar.gz; do
+                f=$(basename "$a")
+                if [ ! -f "$f" ]; then
+                        say fetch "$f"
+                        curl -sS --retry 3 -C - -o "$f.part" "$MIRROR/$a" && mv "$f.part" "$f"
+                fi
+        done
+        for a in binutils-$BINUTILS_VER.tar.xz gcc-$GCC_VER.tar.xz \
+                 gmp-$GMP_VER.tar.xz mpfr-$MPFR_VER.tar.xz mpc-$MPC_VER.tar.gz; do
+                d=${a%.tar.*}
+                if [ ! -d "$d" ]; then
+                        say fetch "extracting $a"
+                        case $a in
+                        *.tar.xz) tar xf "$a" ;;
+                        *.tar.gz) tar xzf "$a" ;;
+                        esac
+                fi
+        done
+        # gcc builds the three prerequisites in-tree when they are symlinks here
+        ln -sfn "$SRC/gmp-$GMP_VER" "$SRC/gcc-$GCC_VER/gmp"
+        ln -sfn "$SRC/mpfr-$MPFR_VER" "$SRC/gcc-$GCC_VER/mpfr"
+        ln -sfn "$SRC/mpc-$MPC_VER" "$SRC/gcc-$GCC_VER/mpc"
+        # Teach both trees the triplet: config.sub's OS list, bfd's / ld's / gas's
+        # ELF cases, gcc's config.gcc and libgcc's config.host.
+        patch -d "$SRC/binutils-$BINUTILS_VER" -p1 -N --no-backup-if-mismatch \
+                < "$PATCHES/binutils-$BINUTILS_VER-prismos.patch" \
+                || [ $? -eq 1 ]   # already applied
+        patch -d "$SRC/gcc-$GCC_VER" -p1 -N --no-backup-if-mismatch \
+                < "$PATCHES/gcc-$GCC_VER-prismos.patch" \
+                || [ $? -eq 1 ]
+        say fetch "sources ready in $SRC (patched for x86_64-prismos)"
+}
+
+# ---- stage: binutils ---------------------------------------------------------
+do_binutils() {
+        [ -d "$SRC/binutils-$BINUTILS_VER" ] || do_fetch
+        rm -rf "$REPO/build/binutils-obj"
+        mkdir -p "$REPO/build/binutils-obj"
+        cd "$REPO/build/binutils-obj"
+        [ -x "$PREFIX/bin/x86_64-prismos-ld" ] && { say binutils "already installed"; return 0; }
+        say binutils "configure --target=x86_64-prismos"
+        "$SRC/binutils-$BINUTILS_VER/configure" \
+                --target=x86_64-prismos --prefix="$PREFIX" --with-sysroot="$SYSROOT" \
+                --disable-nls --disable-werror --enable-deterministic-archives \
+                --disable-gdb --disable-gprof --disable-libctf \
+                > "$SRC/binutils-configure.log" 2>&1 || { tail -20 "$SRC/binutils-configure.log"; exit 1; }
+        say binutils "make -j$JOBS (as, ld, ar, ranlib, strip, objcopy...)"
+        make -j"$JOBS" > "$SRC/binutils-build.log" 2>&1 || { tail -20 "$SRC/binutils-build.log"; exit 1; }
+        make install > "$SRC/binutils-install.log" 2>&1
+        say binutils "$PREFIX/bin/x86_64-prismos-{as,ld,ar,...}"
+}
+
+# ---- stage: gcc --------------------------------------------------------------
+# The bootstrap compiler: c + c++, --without-headers (no target runtime --
+# libgcc only, which needs nothing from a libc), built against the sysroot
+# the headers stage filled.  This is the "then the compiler" of the phase's
+# todo; it replaces bootstrap.sh's wrappers under the same names.
+do_gcc() {
+        [ -d "$SRC/gcc-$GCC_VER" ] || do_fetch
+        [ -x "$PREFIX/bin/x86_64-prismos-gcc" ] && ! head -1 "$PREFIX/bin/x86_64-prismos-gcc" | grep -q 'bootstrap wrapper' \
+                && { say gcc "already installed"; return 0; }
+        mkdir -p "$REPO/build/gcc-obj"
+        cd "$REPO/build/gcc-obj"
+        if [ ! -f Makefile ]; then
+                say gcc "configure --target=x86_64-prismos --without-headers"
+                # --with-newlib + --without-headers is what sets inhibit_libc: the
+                # cross compiler being built before mlibc proper exists, libgcc must
+                # not include any libc header (tsystem.h guards them all behind
+                # #ifdef inhibit_libc).  --disable-fixincludes keeps fixincludes from
+                # copying a partial shadow of the sysroot's mlibc headers into
+                # gcc/include-fixed -- headers whose <abi-bits/...> includes would
+                # then dangle; mlibc's headers need no fixing anyway.  --with-sysroot
+                # stays: the installed driver finds the sysroot this build filled.
+                "$SRC/gcc-$GCC_VER/configure" \
+                        --target=x86_64-prismos --prefix="$PREFIX" --with-sysroot="$SYSROOT" \
+                        --without-headers --with-newlib --disable-fixincludes \
+                        --enable-languages=c,c++ \
+                        --disable-bootstrap --disable-nls --disable-werror \
+                        --disable-shared --enable-checking=no \
+                        > "$SRC/gcc-configure.log" 2>&1 || { tail -20 "$SRC/gcc-configure.log"; exit 1; }
+        fi
+        say gcc "make -j$JOBS all-gcc all-target-libgcc (the long one)"
+        make -j"$JOBS" all-gcc all-target-libgcc > "$SRC/gcc-build.log" 2>&1 \
+                || { tail -20 "$SRC/gcc-build.log"; exit 1; }
+        make install-gcc install-target-libgcc > "$SRC/gcc-install.log" 2>&1
+        say gcc "$PREFIX/bin/x86_64-prismos-{gcc,g++} + libgcc + the crt stuff"
+}
+
+# ---- stage: mlibc ------------------------------------------------------------
+# "Then the library": mlibc rebuilt with the real cross compiler.  Same cross
+# file as bootstrap.sh used -- the names it asks for are now real tools.
+do_mlibc() {
+        MLIBC=$REPO/build/mlibc
+        [ -d "$MLIBC" ] || sh "$REPO/ports/toolchain/bootstrap.sh" stage mlibc
+        export PATH="$PREFIX/bin:$PATH"
+        rm -rf "$REPO/build/mlibc-cross"
+        say mlibc "meson setup against the cross gcc"
+        meson setup "$REPO/build/mlibc-cross" "$MLIBC" \
+                --cross-file "$REPO/ports/toolchain/cross.txt" \
+                --prefix=/usr \
+                -Ddefault_library=static -Dbuild_tests=false \
+                >/dev/null
+        ninja -C "$REPO/build/mlibc-cross" -j "$JOBS"
+        meson install -C "$REPO/build/mlibc-cross" --destdir "$SYSROOT" >/dev/null
+        say mlibc "libc.a + crt objects (cross-built) in $SYSROOT/usr/lib"
+}
+
+# ---- stages: progs + verify (bootstrap.sh's, now on the real tools) ----------
+do_progs()  { sh "$REPO/ports/toolchain/bootstrap.sh" stage progs; }
+do_hello()  { sh "$REPO/ports/toolchain/bootstrap.sh" stage hello; }
+do_verify() { sh "$REPO/ports/toolchain/bootstrap.sh" stage verify; }
+
+# ---- stage: dynlib -----------------------------------------------------------
+# The dynamic half of the library (phase 3.2's last step).  A second meson
+# build of the same patched tree: -Ddefault_library=both builds the static
+# libc.a AND the shared libc.so + ld.so, from the same sources with the same
+# cross file -- the four /bin programs' static links never notice.  ld.so is
+# mlibc's rtld (options/rtld): linked -nostdlib, an ET_DYN whose _start runs
+# relocateSelf on its own _DYNAMIC before anything else; the kernel maps it
+# unrelocated at USER_INTERP_BASE and hands it AT_BASE / AT_PHDR / AT_PHNUM /
+# AT_ENTRY (sys/kern/src/user/elf.rs).  The flags in the patch that matter
+# here: MLIBC_MAP_DSO_SEGMENTS (ld.so maps library segments with file mmap
+# through sys_vm_map -- exactly what the kernel's MAP_PRIVATE file mmap is
+# for) and MLIBC_MMAP_ALLOCATE_DSO (each DSO's span is reserved with an
+# anonymous PROT_NONE mmap first -- the kernel's supervisor-only pages).
+do_dynlib() {
+        MLIBC=$REPO/build/mlibc
+        [ -d "$MLIBC" ] || sh "$REPO/ports/toolchain/bootstrap.sh" stage mlibc
+        export PATH="$PREFIX/bin:$PATH"
+        rm -rf "$REPO/build/mlibc-shared"
+        say dynlib "meson setup against the cross gcc (default_library=both)"
+        meson setup "$REPO/build/mlibc-shared" "$MLIBC" \
+                --cross-file "$REPO/ports/toolchain/cross.txt" \
+                --prefix=/usr \
+                -Ddefault_library=both -Dbuild_tests=false \
+                >/dev/null
+        ninja -C "$REPO/build/mlibc-shared" -j "$JOBS"
+        meson install -C "$REPO/build/mlibc-shared" --destdir "$SYSROOT" >/dev/null
+        say dynlib "libc.so + ld.so (cross-built) in $SYSROOT/usr/lib"
+}
+
+# ---- stage: dyn ---------------------------------------------------------------
+# The proof executable of phase 3.2's last step: hello, dynamically linked.
+# The same source and the same compile flags as `stage prog hello` -- only
+# the link changes: no --no-dynamic-linker, --dynamic-linker /lib/ld.so (the
+# path the kernel's PT_INTERP handling reads from the VFS at execve), -lc
+# resolved against the sysroot's libc.so (ld records DT_NEEDED libc.so, the
+# basename ld.so will look for in /lib and /usr/lib at run time), and -z now
+# -- BIND_NOW, because mlibc's rtld zeroes GOT[1]/GOT[2] and cannot lazy-bind.
+# The crt sandwich is the dynamic one: Scrt1 (the PIE _start) + crti/crtn +
+# crtbeginS/crtendS (gcc's -shared halves).
+do_dyn() {
+        [ -f "$SYSROOT/usr/lib/ld.so" ] || do_dynlib
+        CC=$PREFIX/bin/x86_64-prismos-gcc
+        LD=$PREFIX/bin/x86_64-prismos-ld
+        GCCINC=$($CC -print-file-name=include)
+        OUTDIR=$REPO/build/usr/bin-mlibc-dyn
+        mkdir -p "$OUTDIR"
+
+        say dyn "compiling usr/mlibc/hello/hello.c (same flags as the static port)"
+        $CC -c "$REPO/usr/mlibc/hello/hello.c" -o "$OUTDIR/hello.o" \
+                -O2 -Wall -Wextra -ffreestanding -fPIE \
+                -fno-stack-protector -fno-asynchronous-unwind-tables -fno-math-errno \
+                -nostdinc -isystem "$GCCINC" -isystem "$SYSROOT/usr/include"
+
+        say dyn "linking the dynamic PIE (PT_INTERP /lib/ld.so, DT_NEEDED libc.so, -z now)"
+        CRTBEGIN=$($CC -print-file-name=crtbeginS.o)
+        CRTEND=$($CC -print-file-name=crtendS.o)
+        if ! $LD -m elf_x86_64 -pie \
+              --dynamic-linker /lib/ld.so -z now -z separate-code \
+              -z max-page-size=4096 -z noexecstack -z norelro -e _start \
+              -o "$OUTDIR/hello" \
+              "$SYSROOT/usr/lib/Scrt1.o" "$SYSROOT/usr/lib/crti.o" \
+              "$CRTBEGIN" "$OUTDIR/hello.o" \
+              -L"$SYSROOT/usr/lib" -lc \
+              "$CRTEND" "$SYSROOT/usr/lib/crtn.o" 2>/dev/null; then
+                say dyn "retrying with libgcc (compiler intrinsics)"
+                LIBGCC=$($CC -print-libgcc-file-name)
+                $LD -m elf_x86_64 -pie \
+                      --dynamic-linker /lib/ld.so -z now -z separate-code \
+                      -z max-page-size=4096 -z noexecstack -z norelro -e _start \
+                      -o "$OUTDIR/hello" \
+                      "$SYSROOT/usr/lib/Scrt1.o" "$SYSROOT/usr/lib/crti.o" \
+                      "$CRTBEGIN" "$OUTDIR/hello.o" \
+                      -L"$SYSROOT/usr/lib" -lc "$LIBGCC" \
+                      "$CRTEND" "$SYSROOT/usr/lib/crtn.o"
+        fi
+        say dyn "build/usr/bin-mlibc-dyn/hello"
+}
+
+# ---- stage: dynverify ---------------------------------------------------------
+# The dynamic-linking verification (verify.sh's dyn mode): the loader's own
+# checks on the executable (PT_INTERP, DT_NEEDED, BIND_NOW, the PLT), the
+# rtld's shape (self-contained ET_DYN, RELATIVE-only relocations) and its
+# syscall diet under disassembly, and libc.so's exports.
+do_dynverify() {
+        sh "$REPO/ports/toolchain/verify.sh" "$REPO/build/usr/bin-mlibc-dyn/hello" "$SYSROOT" dyn
+}
+
+case "$STAGE" in
+        all)    do_fetch; do_binutils; do_gcc; do_mlibc; do_progs; do_verify; do_dyn; do_dynverify ;;
+        fetch)    do_fetch ;;
+        binutils) do_binutils ;;
+        gcc)      do_gcc ;;
+        mlibc)    do_mlibc ;;
+        progs)    do_progs ;;
+        hello)    do_hello ;;
+        verify)   do_verify ;;
+        dynlib)   do_dynlib ;;
+        dyn)      do_dyn ;;
+        dynverify) do_dynverify ;;
+        *) echo "unknown stage: $STAGE (try: list)" >&2; exit 2 ;;
+esac

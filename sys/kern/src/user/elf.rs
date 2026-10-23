@@ -2,7 +2,8 @@
 // Copyright (c) 2026 noxio-dev
 //
 // ELF64 loader (phase 2.4): turns an executable file of the VFS into a ready
-// to run address space.
+// to run address space.  Phase 3.2's last step completes the picture: a
+// `PT_INTERP` is honoured -- dynamic linking.
 //
 // What is accepted
 //   * ELF64, little endian, x86-64, `ET_EXEC` or `ET_DYN`.  A static PIE
@@ -14,16 +15,27 @@
 //   * `PT_LOAD` segments, mapped page by page with their own protection
 //     (W^X: a segment that is both writable and executable is refused), the
 //     file part copied, the rest (`.bss`) left zero.
-//   * No `PT_INTERP`, no `DT_NEEDED`: programs are fully static.
+//   * A `PT_INTERP` names the program interpreter (mlibc's `ld.so`, itself
+//     an `ET_DYN`): it is read from the same VFS and mapped unrelocated at
+//     USER_INTERP_BASE, the main image is mapped unrelocated too (the
+//     interpreter relocates itself from its own `_DYNAMIC`, then the
+//     program from the phdrs the auxv hands it), and the process starts
+//     at the interpreter's entry with `AT_BASE` (its load bias) plus
+//     `AT_PHDR` / `AT_PHNUM` / `AT_ENTRY` describing the main program.
+//     `DT_NEEDED` and `DT_JMPREL` are then the interpreter's business: it
+//     finds the libraries in /lib and /usr/lib and maps them with file
+//     `mmap` -- the static-PIE relocation rules below apply only when
+//     there is no interpreter.
 //
 // The initial stack follows the System V x86-64 process entry convention
-// (what `_start` of any libc expects): at the entry `rsp` is 16-byte aligned
-// and points at `argc`, followed by the `argv` pointers, a NULL, the `envp`
-// pointers, a NULL and the auxiliary vector (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`,
-// `AT_PAGESZ`, `AT_ENTRY`, `AT_RANDOM`, `AT_EXECFN`, ... terminated by
-// `AT_NULL`); the strings themselves sit above, at the top of the stack.
+// (what `_start` of any libc -- or of any dynamic linker -- expects): at the
+// entry `rsp` is 16-byte aligned and points at `argc`, followed by the
+// `argv` pointers, a NULL, the `envp` pointers, a NULL and the auxiliary
+// vector (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_BASE`,
+// `AT_ENTRY`, `AT_RANDOM`, `AT_EXECFN`, ... terminated by `AT_NULL`); the
+// strings themselves sit above, at the top of the stack.
 
-use crate::mem::vmm::{AddressSpace, PAGE, USER_BASE, USER_CODE_BASE, USER_END, USER_SIGCODE, USER_STACK_TOP};
+use crate::mem::vmm::{AddressSpace, PAGE, USER_BASE, USER_CODE_BASE, USER_END, USER_INTERP_BASE, USER_SIGCODE, USER_STACK_TOP};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -153,6 +165,13 @@ fn page_up(x: u64) -> Option<u64> {
 
 /// Read an executable from the VFS and load it (the `execve` front end).
 pub fn load_path(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Loaded, ExecError> {
+    let image = read_program(path)?;
+    load(&image, path.as_bytes(), argv, envp)
+}
+
+/// Read `path` and check it is an executable regular file: what both the
+/// main program and its `PT_INTERP` interpreter go through.
+fn read_program(path: &str) -> Result<Vec<u8>, ExecError> {
     use crate::fs::vfs::{FileType, FsError};
     let vfs = crate::fs::fsys::vfs();
     let errno = |e: FsError| -> ExecError {
@@ -178,13 +197,24 @@ pub fn load_path(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Loade
     if st.mode & 0o111 == 0 {
         return Err(ExecError::File("permission denied (not executable)", 13)); // EACCES
     }
-    let image = vfs.read_file(path, MAX_ELF_FILE).map_err(errno)?;
-    load(&image, path.as_bytes(), argv, envp)
+    vfs.read_file(path, MAX_ELF_FILE).map_err(errno)
 }
 
-/// Build the address space of the ELF `image`.  `execfn` is the path shown
-/// to the program (`AT_EXECFN`).
-pub fn load(image: &[u8], execfn: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Loaded, ExecError> {
+/// One image after the header walk: the segments, the dynamic section and,
+/// for the main program, a `PT_INTERP`.
+struct Parsed {
+    e_type: u16,
+    e_entry: u64,
+    e_phoff: u64,
+    e_phnum: usize,
+    segs: Vec<Seg>,
+    dynamic: Option<Seg>,
+    interp: Option<Seg>,
+}
+
+/// Walk the ELF header and the program headers: the shared front end of
+/// the static and the interpreter paths.
+fn parse(image: &[u8]) -> Result<Parsed, ExecError> {
     // ---- ELF header
     if image.len() < 64 || &image[..4] != b"\x7fELF" {
         return Err(ExecError::NotElf("not an ELF file"));
@@ -216,6 +246,7 @@ pub fn load(image: &[u8], execfn: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>]) -> 
     // ---- program headers
     let mut segs: Vec<Seg> = Vec::new();
     let mut dynamic: Option<Seg> = None;
+    let mut interp: Option<Seg> = None;
     for i in 0..e_phnum {
         let o = e_phoff as usize + i * 56;
         let p_type = rd32(image, o).unwrap();
@@ -227,7 +258,16 @@ pub fn load(image: &[u8], execfn: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>]) -> 
             memsz: rd64(image, o + 40).unwrap(),
         };
         match p_type {
-            PT_INTERP => return Err(ExecError::Unsupported("dynamically linked (PT_INTERP): no dynamic linker")),
+            PT_INTERP => {
+                if s.filesz == 0 || s.filesz > MAX_STRING as u64 {
+                    return Err(ExecError::Corrupt("bad PT_INTERP size"));
+                }
+                match s.off.checked_add(s.filesz) {
+                    Some(e) if e as usize <= image.len() => {}
+                    _ => return Err(ExecError::Corrupt("PT_INTERP past the end of the file")),
+                }
+                interp = Some(s);
+            }
             PT_DYNAMIC => dynamic = Some(s),
             PT_LOAD => {
                 if s.memsz == 0 {
@@ -252,11 +292,60 @@ pub fn load(image: &[u8], execfn: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>]) -> 
         return Err(ExecError::Corrupt("no loadable segment"));
     }
     segs.sort_by_key(|s| s.vaddr);
+    Ok(Parsed { e_type, e_entry, e_phoff, e_phnum, segs, dynamic, interp })
+}
+
+/// The `PT_INTERP` payload: one NUL-terminated path.
+fn interp_string(image: &[u8], s: Seg) -> Result<String, ExecError> {
+    let bytes = &image[s.off as usize..(s.off + s.filesz) as usize];
+    let nul = bytes
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or(ExecError::Corrupt("unterminated PT_INTERP path"))?;
+    if nul + 1 != bytes.len() {
+        return Err(ExecError::Corrupt("bytes past the PT_INTERP path's NUL"));
+    }
+    if nul == 0 {
+        return Err(ExecError::Corrupt("empty PT_INTERP path"));
+    }
+    core::str::from_utf8(&bytes[..nul])
+        .map(String::from)
+        .map_err(|_| ExecError::NotElf("non-UTF-8 PT_INTERP path"))
+}
+
+/// One image mapped into an address space.
+struct Mapped {
+    /// The image's entry point, biased to where it landed.
+    entry: u64,
+    /// Where the program header table ended up (the `AT_PHDR` source).
+    phdr_addr: Option<u64>,
+    /// Lowest mapped address (biased, page aligned).
+    load_lo: u64,
+    /// Highest mapped address (biased, page aligned).
+    load_hi: u64,
+    /// The bias the image was placed with (`AT_BASE` for an interpreter).
+    bias: u64,
+}
+
+/// Place and map `p`'s segments into `aspace` around `anchor` (an `ET_DYN`
+/// lands there, an `ET_EXEC` keeps its link-time addresses) and, when
+/// `relocate`, apply the static-PIE relocations.  The interpreter path
+/// passes `relocate == false`: a dynamic linker relocates itself from its
+/// own `_DYNAMIC` (`relocateSelf`), and the kernel never applies twice
+/// what `ld.so` is about to do to the program it loads.
+fn map_image(
+    aspace: &mut AddressSpace,
+    image: &[u8],
+    p: &Parsed,
+    anchor: u64,
+    relocate: bool,
+) -> Result<Mapped, ExecError> {
+    let segs = &p.segs;
 
     // ---- placement
     let lo = page_down(segs[0].vaddr);
     let mut hi_raw = 0u64;
-    for s in &segs {
+    for s in segs {
         let end = s.vaddr.checked_add(s.memsz).ok_or(ExecError::Corrupt("segment wraps around"))?;
         hi_raw = hi_raw.max(end);
     }
@@ -264,8 +353,8 @@ pub fn load(image: &[u8], execfn: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>]) -> 
     if hi - lo > MAX_IMAGE_SPAN {
         return Err(ExecError::Unsupported("image too large"));
     }
-    let bias: u64 = if e_type == ET_DYN {
-        USER_CODE_BASE.wrapping_sub(lo)
+    let bias: u64 = if p.e_type == ET_DYN {
+        anchor.wrapping_sub(lo)
     } else {
         0
     };
@@ -287,16 +376,15 @@ pub fn load(image: &[u8], execfn: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>]) -> 
             return Err(ExecError::Unsupported("segments share a page (link with -z max-page-size=4096)"));
         }
     }
-    let entry = e_entry.wrapping_add(bias);
+    let entry = p.e_entry.wrapping_add(bias);
     if !segs.iter().any(|s| {
-        s.flags & PF_X != 0 && e_entry >= s.vaddr && e_entry < s.vaddr + s.memsz
+        s.flags & PF_X != 0 && p.e_entry >= s.vaddr && p.e_entry < s.vaddr + s.memsz
     }) {
         return Err(ExecError::Corrupt("entry point outside an executable segment"));
     }
 
-    // ---- build the address space
-    let mut aspace = AddressSpace::new().ok_or(ExecError::NoMemory)?;
-    for s in &segs {
+    // ---- map the segments
+    for s in segs {
         let start = page_down(s.vaddr).wrapping_add(bias);
         let len = page_up(s.vaddr + s.memsz).unwrap() - page_down(s.vaddr);
         if !aspace.alloc_map(start, len, s.flags & PF_W != 0, s.flags & PF_X != 0) {
@@ -308,32 +396,90 @@ pub fn load(image: &[u8], execfn: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>]) -> 
         }
     }
 
-    // ---- relocations (static PIE)
-    if let Some(d) = dynamic {
-        apply_relocs(&mut aspace, d, bias)?;
+    // ---- relocations (static PIE; see the header comment)
+    if relocate {
+        if let Some(d) = p.dynamic {
+            apply_relocs(aspace, d, bias)?;
+        }
     }
 
     // ---- AT_PHDR: where the program header table ended up in memory
     let phdr_addr = segs.iter().find_map(|s| {
-        if e_phoff >= s.off && e_phoff + (e_phnum as u64) * 56 <= s.off + s.filesz {
-            Some(s.vaddr.wrapping_add(bias) + (e_phoff - s.off))
+        if p.e_phoff >= s.off && p.e_phoff + (p.e_phnum as u64) * 56 <= s.off + s.filesz {
+            Some(s.vaddr.wrapping_add(bias) + (p.e_phoff - s.off))
         } else {
             None
         }
     });
+    Ok(Mapped { entry, phdr_addr, load_lo, load_hi, bias })
+}
+
+/// Build the address space of the ELF `image`.  `execfn` is the path shown
+/// to the program (`AT_EXECFN`).
+pub fn load(image: &[u8], execfn: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Loaded, ExecError> {
+    let p = parse(image)?;
+
+    // ---- the interpreter, when the program asks for one: read it before
+    // any address-space work, so a bad PT_INTERP fails the execve cleanly
+    // (the interpreter is loaded with the same rules as the program:
+    // regular file, executable bit, size cap).
+    let interp: Option<Vec<u8>> = match p.interp {
+        Some(s) => {
+            let path = interp_string(image, s)?;
+            Some(read_program(&path)?)
+        }
+        None => None,
+    };
+
+    // ---- the main image, mapped as always but left unrelocated when an
+    // interpreter will do the honors: its DT_NEEDED / DT_JMPREL are then
+    // the interpreter's to resolve, in user space.
+    let mut aspace = AddressSpace::new().ok_or(ExecError::NoMemory)?;
+    let main = map_image(&mut aspace, image, &p, USER_CODE_BASE, interp.is_none())?;
+
+    // ---- the interpreter itself: an ET_DYN mapped unrelocated at its own
+    // base.  The process starts at ITS entry; AT_BASE tells it where it
+    // landed, AT_PHDR / AT_PHNUM / AT_ENTRY describe the main program.
+    let (mut entry, mut at_base) = (main.entry, 0u64);
+    if let Some(iimage) = &interp {
+        let ip = parse(iimage)?;
+        if ip.interp.is_some() {
+            return Err(ExecError::Unsupported("the interpreter itself needs an interpreter"));
+        }
+        let im = map_image(&mut aspace, iimage, &ip, USER_INTERP_BASE, false)?;
+        // Belts and braces: program at USER_CODE_BASE, interpreter at
+        // USER_INTERP_BASE -- 2 GiB apart, 64 MiB spans at most, they cannot
+        // meet.  Check anyway: an overlap would be silent corruption.
+        if !(main.load_hi < im.load_lo || im.load_hi < main.load_lo) {
+            return Err(ExecError::Unsupported("the program and its interpreter overlap"));
+        }
+        entry = im.entry;
+        at_base = im.bias;
+    }
 
     // ---- stack
+    let stack_bottom = USER_STACK_TOP - ELF_STACK_SIZE;
     if !aspace.alloc_map(stack_bottom, ELF_STACK_SIZE, true, false) {
         return Err(ExecError::NoMemory);
     }
-    let rsp = build_stack(&aspace, stack_bottom, argv, envp, execfn, entry, phdr_addr, e_phnum)?;
+    let rsp = build_stack(
+        &aspace,
+        stack_bottom,
+        argv,
+        envp,
+        execfn,
+        main.entry,
+        at_base,
+        main.phdr_addr,
+        p.e_phnum,
+    )?;
     // ---- signal-return trampoline (phase 2.5): one r-x page holding the
     // `sigreturn` code a handler returns into.  A fork child inherits it
     // shared through the copy-on-write clone.
     if !aspace.map_sigcode() {
         return Err(ExecError::NoMemory);
     }
-    Ok(Loaded { aspace, entry, rsp, argc: argv.len(), image_end: load_hi })
+    Ok(Loaded { aspace, entry, rsp, argc: argv.len(), image_end: main.load_hi })
 }
 
 /// The trampoline address as a plain value (import gymnastics-free).
@@ -341,7 +487,9 @@ fn vmm_sigcode() -> u64 {
     USER_SIGCODE
 }
 
-/// Apply the `R_X86_64_RELATIVE` relocations listed by `DT_RELA`.
+/// Apply the `R_X86_64_RELATIVE` relocations listed by `DT_RELA` (static
+/// images only: a program with a `PT_INTERP` leaves every relocation to its
+/// dynamic linker, and the interpreter leaves its own to `relocateSelf`).
 fn apply_relocs(aspace: &mut AddressSpace, dynseg: Seg, bias: u64) -> Result<(), ExecError> {
     let base = dynseg.vaddr.wrapping_add(bias);
     let n = (dynseg.memsz / 16).min(512);
@@ -409,14 +557,18 @@ fn random16() -> [u8; 16] {
 }
 
 /// Lay out strings, auxv, envp, argv and argc on the new stack and return the
-/// initial `rsp`.
+/// initial `rsp`.  `at_entry` / `at_base` are the `AT_ENTRY` / `AT_BASE`
+/// values: the program's entry point and, when it is dynamically linked,
+/// the load bias of its interpreter (0 for a static image).
+#[allow(clippy::too_many_arguments)]
 fn build_stack(
     aspace: &AddressSpace,
     stack_bottom: u64,
     argv: &[Vec<u8>],
     envp: &[Vec<u8>],
     execfn: &[u8],
-    entry: u64,
+    at_entry: u64,
+    at_base: u64,
     phdr: Option<u64>,
     phnum: usize,
 ) -> Result<u64, ExecError> {
@@ -461,9 +613,9 @@ fn build_stack(
     aux.push((AT_PHENT, 56));
     aux.push((AT_PHNUM, phnum as u64));
     aux.push((AT_PAGESZ, PAGE));
-    aux.push((AT_BASE, 0));
+    aux.push((AT_BASE, at_base));
     aux.push((AT_FLAGS, 0));
-    aux.push((AT_ENTRY, entry));
+    aux.push((AT_ENTRY, at_entry));
     aux.push((AT_UID, 0));
     aux.push((AT_EUID, 0));
     aux.push((AT_GID, 0));

@@ -159,7 +159,8 @@ fn cmd_help(_args: &mut Args) {
 }
 
 fn cmd_version(_args: &mut Args) {
-    crate::kprintln!("PrismOS kernel {} (Rust, x86_64)", env!("CARGO_PKG_VERSION"));
+    crate::kprintln!("PrismOS kernel {} (build {}) (Rust, x86_64)",
+                 env!("CARGO_PKG_VERSION"), env!("BUILD_DATE"));
 }
 
 fn cmd_echo(args: &mut Args) {

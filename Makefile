@@ -173,6 +173,78 @@ $(foreach p,$(USR_PROGS),$(eval $(call USR_PROG_RULE,$(p))))
 
 usr: $(USR_BINS)
 
+# ---- mlibc toolchain + sysroot (phase 3.2, steps 3 + 4) ---------------------
+# ports/toolchain drives the phase's third and fourth steps: the
+# x86_64-prismos cross toolchain (binutils + gcc, patched for the triplet),
+# mlibc built with Meson against it -- headers first, then the compiler,
+# then the library -- and the four /bin programs ported off the mini libc
+# onto the result (usr/mlibc), each linked as the static PIE the loader
+# expects.
+#
+#   make mlibc        bootstrap.sh's pipeline into build/toolchain/usr: the
+#                     bootstrap wrappers, mlibc's headers + libc.a + the crt
+#                     objects in the x86_64-prismos sysroot (fast path; no
+#                     toolchain build -- ports/toolchain/build.sh replaces the
+#                     wrappers with the real cross tools under the same names)
+#   make usr-mlibc    build/usr/bin-mlibc/{hello,fork,fd,posix}, the step-4
+#                     ports, each one checked by verify.sh with its own
+#                     syscall and symbol set (the step-3 proof remains
+#                     `bootstrap.sh stage hello`)
+#   make usr-mlibc-dyn the phase's last step: build/usr/bin-mlibc-dyn/hello,
+#                     the same program linked dynamically -- PT_INTERP
+#                     /lib/ld.so, DT_NEEDED libc.so, BIND_NOW -- against
+#                     the sysroot's shared half (build.sh stage dyn,
+#                     verified by verify.sh's dyn mode)
+#
+# MLIBC_SRC points at a prepared mlibc checkout (clone + ports/mlibc applied);
+# bootstrap.sh clones and patches one into build/mlibc when absent.
+
+MLIBC_SRC ?= build/mlibc
+TOOLCHAIN  := $B/toolchain/usr
+SYSROOT    := $(TOOLCHAIN)/x86_64-prismos
+
+.PHONY: mlibc usr-mlibc usr-mlibc-dyn
+mlibc: $B/toolchain/usr/.stamp
+$B/toolchain/usr/.stamp: ports/toolchain/bootstrap.sh ports/toolchain/cross.txt ports/mlibc/README.md
+	@mkdir -p $(@D)
+	sh ports/toolchain/bootstrap.sh --mlibc $(MLIBC_SRC) --prefix $(abspath $(TOOLCHAIN))
+	@touch $@
+
+USR_MLIBC_PROGS := hello fork fd posix
+USR_MLIBC_BINS  := $(addprefix $B/usr/bin-mlibc/,$(USR_MLIBC_PROGS))
+
+usr-mlibc: $(USR_MLIBC_BINS)
+
+define USR_MLIBC_PROG_RULE
+$B/usr/bin-mlibc/$(1): usr/mlibc/$(1)/$(1).c usr/mlibc/prism_raw.h \
+                ports/toolchain/bootstrap.sh ports/toolchain/verify.sh \
+                $B/toolchain/usr/.stamp
+	@mkdir -p $$(@D)
+	sh ports/toolchain/bootstrap.sh --mlibc $(MLIBC_SRC) \
+                --prefix $(abspath $(TOOLCHAIN)) stage prog $(1)
+	sh ports/toolchain/verify.sh $$@ $(SYSROOT) $(1)
+endef
+$(foreach p,$(USR_MLIBC_PROGS),$(eval $(call USR_MLIBC_PROG_RULE,$(p))))
+
+# The dynamic half (phase 3.2's last step): the same hello, linked
+# against the sysroot's libc.so with PT_INTERP /lib/ld.so -- the kernel's
+# ELF loader maps the interpreter at USER_INTERP_BASE and starts it with
+# AT_BASE / AT_PHDR / AT_PHNUM / AT_ENTRY, and ld.so maps libc.so with
+# file mmap.  build.sh's dyn stage builds it (and the dynlib stage
+# before it, the mlibc rebuild with -Ddefault_library=both that puts
+# libc.so + ld.so in the sysroot); verify.sh's dyn mode checks the
+# whole chain.
+USR_MLIBC_DYN := $B/usr/bin-mlibc-dyn/hello
+
+usr-mlibc-dyn: $(USR_MLIBC_DYN)
+
+$(USR_MLIBC_DYN): usr/mlibc/hello/hello.c usr/mlibc/prism_raw.h \
+		ports/toolchain/build.sh ports/toolchain/verify.sh \
+		$B/toolchain/usr/.stamp
+	@mkdir -p $(@D)
+	sh ports/toolchain/build.sh stage dyn
+	sh ports/toolchain/verify.sh $@ $(SYSROOT) dyn
+
 # ---- P1 (ESP) and P3 (ext4 root) trees -------------------------------------------
 
 # P1: minimal FAT ESP - only the UEFI stub the firmware launches.
@@ -185,17 +257,30 @@ $B/esp.stamp: $B/loader.efi
 
 # P3: ext4 root, read by the loader (boot tree) and the kernel (root fs).
 root: $B/root.stamp
-$B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) $(USR_BINS)
+# The root carries the dynamic trio too (phase 3.2's last step): /lib's
+# ld.so -- the interpreter the kernel's PT_INTERP handling loads at
+# USER_INTERP_BASE -- and libc.so, the library ld.so maps with file mmap
+# from /lib (the first of its default search paths), plus the dynamically
+# linked hello as /bin/hello-dyn.  Stripped: the kernel reads whole files
+# (MAX_ELF_FILE is 4 MiB) and the debug sections buy it nothing.
+$B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
+	$(USR_BINS) $(USR_MLIBC_DYN)
 	rm -rf $B/root
 	mkdir -p $B/root/boot/lua $B/root/boot/defaults $B/root/boot/kernel \
-                 $B/root/bin $B/root/dev $B/root/etc $B/root/usr
+                 $B/root/bin $B/root/dev $B/root/etc $B/root/lib $B/root/usr
 	cp boot/lua/*.lua $B/root/boot/lua/
 	cp boot/conf/defaults-loader.conf $B/root/boot/defaults/loader.conf
 	cp boot/conf/loader.conf $B/root/boot/loader.conf
 	cp $B/kernel $B/root/boot/kernel/kernel
 	cp $(USR_BINS) $B/root/bin/
+	cp $(USR_MLIBC_DYN) $B/root/bin/hello-dyn
 	printf '#!/bin/sh\necho "not an ELF file"\n' > $B/root/bin/notelf
 	chmod 755 $B/root/bin/*
+	$(TOOLCHAIN)/bin/x86_64-prismos-strip --strip-all \
+		-o $B/root/lib/ld.so $(SYSROOT)/usr/lib/ld.so
+	$(TOOLCHAIN)/bin/x86_64-prismos-strip --strip-all \
+		-o $B/root/lib/libc.so $(SYSROOT)/usr/lib/libc.so
+	chmod 755 $B/root/lib/ld.so $B/root/lib/libc.so
 	touch $@
 
 $B/$(NAME).img: $B/boot0.bin $B/boot1.bin $B/loader.bin $B/esp.stamp $B/root.stamp tools/mkimage.py include/prism.inc

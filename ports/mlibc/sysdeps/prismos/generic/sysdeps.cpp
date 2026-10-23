@@ -6,6 +6,7 @@
 #include <abi-bits/fd_set.h>
 #include <abi-bits/fcntl.h>
 #include <abi-bits/ioctls.h>
+#include <abi-bits/resource.h>
 #include <abi-bits/stat.h>
 #include <abi-bits/vm-flags.h>
 
@@ -76,8 +77,15 @@ sc_word_t sys(long nr, T... args) {
 
 /* The SA_RESTORER half of the signal contract: the restorer mlibc plants
  * in every action (x86_64/signal.S) -- it makes the sigreturn syscall (12)
- * when a handler returns. */
-extern "C" void __mlibc_signal_restore(void);
+ * when a handler returns.  Hidden on purpose: the address is planted as
+ * data in the kernel's sigaction word, and a default-visibility reference
+ * would go through the GOT -- ld.so's self-relocator (relocateSelf)
+ * accepts R_X86_64_RELATIVE and nothing else, and a GLOB_DAT carries a
+ * symbol.  (The linux port instead compiles the whole Sigaction wrapper
+ * out of the rtld; that breaks the static archive's member pull -- the
+ * libc's own twin would come in for Sigaction and collide -- so the port
+ * keeps the wrapper everywhere and hides the reference instead.) */
+extern "C" void __mlibc_signal_restore(void) __attribute__((visibility("hidden")));
 
 /* The four-u64 sigaction the kernel copies in and out (user/signal.rs). */
 struct ksigaction {
@@ -565,6 +573,14 @@ int Sysdeps<Sigaction>::operator()(int signum, const struct sigaction *act,
          * plants our restorer so a handler's `ret` lands in x86_64/signal.S.
          * SA_SIGINFO / SA_ONSTACK the kernel refuses; those errors ride
          * through untouched. */
+#ifdef SIGCANCEL
+        /* Thread cancellation rides on SIGCANCEL with SA_SIGINFO and tgkill; the
+         * kernel has neither (user/signal.rs refuses SA_SIGINFO).  ENOSYS is the
+         * answer mlibc's PthreadSignalInstaller accepts as "cancellation not
+         * supported" -- any other error trips its __ensure at load time. */
+        if(signum == SIGCANCEL)
+        	return ENOSYS;
+#endif
         ksigaction kact = {}, kold = {};
         if(act) {
                 kact.handler = reinterpret_cast<uintptr_t>(act->sa_handler);

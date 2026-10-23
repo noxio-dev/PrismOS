@@ -85,7 +85,14 @@ sc_word_t __do_syscall6(long sc, sc_word_t arg1, sc_word_t arg2, sc_word_t arg3,
 	return ret;
 }
 
-/* The plain-syscall() convention: an error answer becomes errno + -1. */
+/* The plain-syscall() convention: an error answer becomes errno + -1.
+ * Not in the rtld: ld.so links -nostdlib against nothing, and this
+ * helper's errno store would drag the libc's TLS symbol (__mlibc_errno)
+ * into a link that cannot resolve it -- nothing in the rtld calls it
+ * (the sysdep wrappers read the raw answer through sc_error()).  The
+ * symbol stays dead code in the static archive: nothing pulls the
+ * libc's own twin member for it. */
+#ifndef MLIBC_BUILDING_RTLD
 extern "C" long __do_syscall_ret(unsigned long ret) {
 	if(ret > -4096UL) {
 		errno = static_cast<int>(-static_cast<long>(ret));
@@ -93,3 +100,4 @@ extern "C" long __do_syscall_ret(unsigned long ret) {
 	}
 	return static_cast<long>(ret);
 }
+#endif // !MLIBC_BUILDING_RTLD

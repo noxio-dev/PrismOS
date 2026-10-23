@@ -392,7 +392,7 @@ static int sc_stdin(void)
 
         /* A real read of fd 0: prints the prompt, parks on the console
          * (the test harness types the rest), and reports what it got. */
-        printf("type 4 bytes: ");
+        printf("type 4 bytes (EXACTLY wxyz): ");
         long r = sys_read(0, b, 4);
         b[4] = 0;
         if (r != 4)
