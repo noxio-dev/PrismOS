@@ -165,24 +165,49 @@ Phase 3 — POSIX userspace
   - [x] port `/bin/hello`, `/bin/fork`, `/bin/fd` and `/bin/posix` from the mini libc (`usr/lib`) to mlibc — `usr/mlibc`: same scenarios, same summary lines, the C library's vocabulary (`fork` / `waitpid` / the `W*` macros, `signal` with its `SIG_ERR` refusals, `opendir` / `readdir`, `tcgetattr`, `uname`, stdio buffered on the descriptor table, `-1` + `errno` folded back for the error tables); the four PrismOS-only calls stay raw through `prism_raw.h` (`uptime_ms`, `yield`, the millisecond `sleep`, `brk`); `verify.sh` grew a per-program mode — every syscall each program makes and the symbols those paths live in, 130 checks across the four — `make usr-mlibc`
   - [x] ELF loader: dynamic linking, a requirement and not an option. Honour `PT_INTERP` (load the interpreter, mlibc's `ld.so`, at its own base and start it with `AT_BASE` plus `AT_PHDR` / `AT_PHNUM` / `AT_ENTRY` describing the main program); `DT_NEEDED` resolution stays in userspace (`ld.so` finds libraries in `/lib` and `/usr/lib` and maps them with file `mmap`); add `mprotect` for RELRO and relocation fix-ups; shared libraries are `ET_DYN` with their own `PT_LOAD` / `PT_TLS` / `PT_GNU_RELRO` handling — the loader's `PT_INTERP` path (sys/kern/src/user/elf.rs) + anonymous `PROT_NONE` mmap (sysc.rs / vmm.rs, the reservation idiom) on the kernel side; `-Ddefault_library=both` putting `libc.so` + `ld.so` in the sysroot on the library side; the proof is a dynamically linked `/bin/hello-dyn` (PT_INTERP `/lib/ld.so`, `DT_NEEDED libc.so`, BIND_NOW) with `/lib/ld.so` + `/lib/libc.so` in the boot image — `make usr-mlibc-dyn`, `verify.sh`'s dyn mode
 - [ ] Phase 3.3 — `init`, TTY layer with line discipline, `/proc` and `/tmp` (tmpfs)
+  - [ ] 3.3.1 tmpfs: an in-memory `FileSystem` (create, unlink, rename, readdir, size quota) mounted on `/tmp` at boot; the `fstest` scenarios are reused against it
+  - [ ] 3.3.2 missing syscalls: `getppid`, `getuid` / `getgid` (fixed values for now), `umask`, `gettimeofday`, `nanosleep`, `ppoll` / `pselect`, `mount` / `umount`, `reboot`
+  - [ ] 3.3.3 TTY layer: a `tty` object with a line discipline (canonical mode, echo, erase, kill-line, `^C` / `^D` / `^\`), real `TCGETS` / `TCSETS` / `TCSETSW`, raw mode, `TIOCGWINSZ`; the console and the serial port sit on top of it
+  - [ ] 3.3.4 sessions and process groups: `setsid`, `setpgid`, `getpgrp`, controlling terminal, foreground group, `kill(-pgrp)`, `SIGINT` / `SIGHUP` sent to the group
+  - [ ] 3.3.5 devfs additions: `/dev/tty`, `/dev/tty0`, `/dev/ttyS0`, `/dev/full`
+  - [ ] 3.3.6 procfs: `/proc/self`, `/proc/<pid>/{stat,status,cmdline,cwd,fd}`, `/proc/{meminfo,uptime,mounts,version}`; read-only, generated on read
+  - [ ] 3.3.7 `init`: the kernel starts `/sbin/init` (pid 1) instead of the kernel shell; `init` reaps orphans (replacing adoption by pid 0), mounts file systems, respawns a shell on the console, handles clean shutdown; the kernel shell stays as a rescue mode (`init=` in `loader.conf`)
+  - [ ] 3.3.8 tests: a QEMU scenario booting to `init`, checking `/proc`, `/tmp` and `^C` on a child
 - [ ] Phase 3.4 — BusyBox and a userspace shell
-- [ ] Phase 3.5 — precise time (HPET/TSC behind the 3.2 `clock_gettime`), `/dev/random`, users and permissions
+  - [ ] 3.4.1 BusyBox port: minimal config (`ash`, `ls`, `cat`, `echo`, `mkdir`, `rm`, `cp`, `mv`), static build against the mlibc sysroot, `verify.sh` extended
+  - [ ] 3.4.2 fill the gaps the port reveals: `fchdir`, `fsync`, `chmod` / `fchmod` (stubs), `wait4` with rusage, `utimensat`, `readlink` / `symlink` from userspace, ...
+  - [ ] 3.4.3 interactive `ash`: pipes, redirections (`dup2`), job control (builds on 3.3.4), `PATH`, `/etc/profile`
+  - [ ] 3.4.4 more applets: `ps`, `mount`, `df`, `grep`, `sed`, `awk`, `tar`, `vi`
+  - [ ] 3.4.5 `init` spawns `ash`; the kernel shell becomes rescue only
+  - [ ] 3.4.6 tests: `sh` scripts run in QEMU (pipes, loops, redirections), checked by `make test`
+- [ ] Phase 3.5 — precise time, randomness, users and permissions
+  - [ ] 3.5.1 time: TSC (or HPET) calibration, nanosecond `clock_gettime`, accurate `nanosleep`, optionally a tickless timer
+  - [ ] 3.5.2 randomness: entropy (RDRAND / RDSEED, TSC jitter), ChaCha20 CSPRNG, `/dev/random`, `/dev/urandom`, `getrandom`, a real `AT_RANDOM`
+  - [ ] 3.5.3 identities: uid / gid / euid in the PCB, `setuid` / `setgid`, ext4 inode owners actually read and written
+  - [ ] 3.5.4 permissions: access checks in the VFS (rwx for owner / group / other), `chmod` / `chown`, `umask`, setuid bit at `execve`
+  - [ ] 3.5.5 accounts: `/etc/passwd`, `/etc/group`, `login`, `su`, `id`, `whoami`
+  - [ ] 3.5.6 tests: access denied to a non-root user, setuid, non-constant `getrandom`
 
-Phase 4 — toolchain
-- [ ] Phase 4.1 — cross-binutils for `x86_64-prismos`
-- [ ] Phase 4.2 — cross-gcc (C, then C++), libgcc, libstdc++
-- [ ] Phase 4.3 — build the userspace (BusyBox, make, core utilities) with it
+Phase 4 — toolchain (phase 3.2 already ships cross binutils 2.44 and gcc 14.2.0, so this phase is about completing and using them)
+- [ ] Phase 4.1 — complete binutils in the image: cross-built `ar`, `ranlib`, `strip`, `objdump`, `nm`, installed and used by the builds
+- [ ] Phase 4.2 — threads: `clone` (`CLONE_VM`, `CLONE_THREAD`, `set_tid_address`), per-thread TLS, `pthread_create` in the mlibc port (`futex` is already there)
+- [ ] Phase 4.3 — C++: cross-built libstdc++ (with threads), a `hello.cpp` test (iostream, exceptions, `std::thread`), shared libgcc
+- [ ] Phase 4.4 — build the userspace with the PrismOS toolchain: `make`, coreutils, diffutils, findutils, pkg-config
+- [ ] Phase 4.5 — a "dev" image: the sysroot embedded in the boot image, preparing phase 5
 
 Phase 5 — self-hosting
-- [ ] Phase 5.1 — native binutils + gcc running on PrismOS
-- [ ] Phase 5.2 — native `make`, `sh`, `tar`, `git`-less source tree on the ext4 disk
-- [ ] Phase 5.3 — rebuild the userspace natively, then the kernel's C parts (loader)
-- [ ] Phase 5.4 — bootstrap: PrismOS builds PrismOS
+- [ ] Phase 5.1 — native binutils: `as`, `ld`, `ar` cross-built, then run on PrismOS to assemble and link a program
+- [ ] Phase 5.2 — native gcc: `cc1`, `cc1plus`, `gcc`, `g++` running on PrismOS (needs plenty of RAM, a solid `mmap`, `fork` / `pipe`, a bearable build time)
+- [ ] Phase 5.3 — native build tools: `make`, `sh`, `tar`, `gzip`, a source tree on the ext4 disk (ideally with real `MAP_SHARED` and a page cache)
+- [ ] Phase 5.4 — rebuild the userspace natively, then the kernel's C parts (loader)
+- [ ] Phase 5.5 — the Rust kernel: native `rustc` / `cargo` (the hardest; keep for last or defer)
+- [ ] Phase 5.6 — full bootstrap: PrismOS builds PrismOS, with a test comparing the produced binaries
 
 Beyond (nice to have)
+- [ ] hidden kernel prerequisites that the phases above keep running into: file-backed `MAP_SHARED` with a page cache, Unix domain sockets, `epoll` -- move them before 4.2 / 5.2 when they block
 - [ ] networking: virtio-net or e1000, ARP/IP/UDP/TCP, a tiny `ping` and `wget`
 - [ ] USB (xHCI) keyboard and mass storage, NVMe
-- [ ] other file systems: FAT32 R/W in the kernel, tmpfs
+- [ ] other file systems: FAT32 R/W in the kernel
 - [ ] graphics: framebuffer userspace API, a minimal window system
 - [ ] desktop (Xorg, then KDE): mlibc is the entry ticket, not the whole price -- also Unix domain sockets, `epoll`, shared memory (`MAP_SHARED` of files, `shm`), a display / input device interface (KMS-style), and a lot of the Linux surface (`/proc`, `/sys`, `udev`-like discovery)
 - [ ] AArch64 port of the kernel and loader
