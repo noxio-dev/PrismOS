@@ -834,7 +834,7 @@ fn put_stat(buf: u64, ino: u64, mode_perm: u16, ftype: &FileType, size: u64, nli
         _ => 0o010000,                // fifo / other
     };
     let mode = ifmt | (mode_perm as u32 & 0o7777);
-    let mut w = Vec::with_capacity(STAT_SIZE / 8);
+    let mut w: Vec<u8> = Vec::with_capacity(STAT_SIZE);
     let mut push = |v: u64| w.extend_from_slice(&v.to_le_bytes());
     push(0);                       // st_dev
     push(ino);                     // st_ino
@@ -845,12 +845,16 @@ fn put_stat(buf: u64, ino: u64, mode_perm: u16, ftype: &FileType, size: u64, nli
     push(size);                    // st_size
     push(4096);                    // st_blksize
     push(blocks);                  // st_blocks (512-byte units)
-    push(times.0 as u64);          // st_atime
-    push(times.1 as u64);          // st_mtime
-    push(times.2 as u64);          // st_ctime
+    // struct timespec = { tv_sec: i64, tv_nsec: i64 } for each of the three times.
+    push(times.0 as u64);          // st_atim.tv_sec
+    push(0);                       // st_atim.tv_nsec
+    push(times.1 as u64);          // st_mtim.tv_sec
+    push(0);                       // st_mtim.tv_nsec
+    push(times.2 as u64);          // st_ctim.tv_sec
+    push(0);                       // st_ctim.tv_nsec
     push(0);
     push(0);
-    push(0);                       // __reserved[3]
+    push(0);                       // __unused[3]
     debug_assert_eq!(w.len(), STAT_SIZE);
     copy_out(buf, 0, &w)
 }

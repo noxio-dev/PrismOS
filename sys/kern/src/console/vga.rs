@@ -65,8 +65,10 @@ impl Vga {
             '\r' => self.x = 0,
             '\x08' => self.x = self.x.saturating_sub(1),
             '\t' => {
-                let next = (self.x / 8 + 1) * 8;
-                while self.x < next.min(COLS) {
+                // Fixed iteration count: the last space may wrap to column 0
+                // (newline), which would keep `x < target` true forever.
+                let target = ((self.x / 8 + 1) * 8).min(COLS);
+                for _ in 0..target.saturating_sub(self.x) {
                     self.put_char(' ');
                 }
             }

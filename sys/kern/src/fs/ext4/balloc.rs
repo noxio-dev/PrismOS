@@ -292,6 +292,10 @@ impl Ext4 {
         let goal = if goal < self.g.first_data as u64 || goal >= self.g.blocks { self.g.first_data as u64 } else { goal };
         let (g0, bit0) = self.blk_to_group(goal);
         let ng = self.g.groups;
+        // A group whose bitmap fails its checksum is skipped (like the Linux
+        // driver does) instead of failing the whole allocation; the
+        // corruption is still reported if no other group can serve us.
+        let mut bad = false;
         for k in 0..=ng {
             let g = (g0 + k) % ng;
             if self.gd_free_blocks(g) == 0 {
@@ -303,7 +307,14 @@ impl Ext4 {
             if start >= end {
                 continue;
             }
-            let mut bm = self.load_bbitmap(g)?;
+            let mut bm = match self.load_bbitmap(g) {
+                Ok(b) => b,
+                Err(FsError::Corrupt) => {
+                    bad = true;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let mut i = start;
             while i < end && bit(&bm, i) {
                 i += 1;
@@ -327,7 +338,7 @@ impl Ext4 {
             self.sb_dirty = true;
             return Ok((self.group_start(g) + i as u64, n));
         }
-        Err(FsError::NoSpace)
+        Err(if bad { FsError::Corrupt } else { FsError::NoSpace })
     }
 
     /// Give `len` blocks starting at `start` back.
@@ -376,12 +387,22 @@ impl Ext4 {
         }
         let ng = self.g.groups;
         let has_unused = self.g.metadata_csum || self.g.gdt_csum;
+        // Same policy as alloc_blocks: skip a group with a bad bitmap
+        // checksum, but report the corruption if nothing else works.
+        let mut bad = false;
         for k in 0..ng {
             let g = (pgroup + k) % ng;
             if self.gd_free_inodes(g) == 0 {
                 continue;
             }
-            let mut bm = self.load_ibitmap(g)?;
+            let mut bm = match self.load_ibitmap(g) {
+                Ok(b) => b,
+                Err(FsError::Corrupt) => {
+                    bad = true;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let ipg = self.g.ipg as usize;
             let mut i = 0;
             while i < ipg && bit(&bm, i) {
@@ -416,7 +437,7 @@ impl Ext4 {
             self.sb_dirty = true;
             return Ok(g * self.g.ipg + i as u32 + 1);
         }
-        Err(FsError::NoSpace)
+        Err(if bad { FsError::Corrupt } else { FsError::NoSpace })
     }
 
     /// Zero inode slots `[from, to)` of group `g`'s table.

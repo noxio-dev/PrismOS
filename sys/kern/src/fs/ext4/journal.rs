@@ -282,7 +282,8 @@ impl Journal {
     pub(super) fn checkpoint_done(&mut self, fs: &Ext4) -> FsResult<()> {
         self.start = 0;
         self.head = 1;
-        self.write_sb(fs)
+        self.write_sb(fs)?;
+        fs.dev.flush().map_err(FsError::from)
     }
 
     // ------------------------------------------------------------ writer

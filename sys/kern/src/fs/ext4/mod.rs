@@ -70,7 +70,22 @@ struct Cache {
     cap: usize,
 }
 
+/// Pre-image of the in-memory metadata at the start of one operation, so a
+/// failed operation can be rolled back instead of being journaled half done.
+struct Undo {
+    /// Block -> (content, kind, was dirty) before the first modification;
+    /// `None` when the block was not cached.
+    blocks: BTreeMap<u64, Option<(Vec<u8>, BlkKind, bool)>>,
+    gdt: Vec<u8>,
+    gdt_dirty: BTreeSet<usize>,
+    sb_raw: Vec<u8>,
+    sb_dirty: bool,
+    free_blocks: u64,
+    free_inodes: u32,
+}
+
 pub struct Ext4 {
+    undo: Option<Undo>,
     dev: Box<dyn BlockDev>,
     bs: usize,
     /// Sectors per filesystem block.
@@ -212,6 +227,7 @@ impl Ext4 {
 
         let cap = core::cmp::max(256, (6 << 20) / bs);
         let mut fs = Ext4 {
+            undo: None,
             dev,
             bs,
             spb,
@@ -292,10 +308,13 @@ impl Ext4 {
                     // the flag).  Afterwards the log is consumed: reset it
                     // so the next mount does not replay again (idempotent
                     // anyway, but this keeps s_start honest).
-                    match j.replay(&mut fs) {
-                        Ok(n) => {
-                            let _ = n;
-                            let _ = j.checkpoint_done(&mut fs);
+                    // The replayed blocks only sit dirty in the cache, and the
+                    // in-memory gdt / superblock / counters were loaded before
+                    // the replay.  finish_replay makes the blocks durable,
+                    // reloads that metadata and only then releases the log.
+                    let replayed = j.replay(&mut fs).and_then(|_| fs.finish_replay(&mut j));
+                    match replayed {
+                        Ok(()) => {
                             fs.jrn = Some(j);
                             fs.ro = false;
                             mark_fs_in_use(&mut fs, incompat);
@@ -377,6 +396,15 @@ impl Ext4 {
             }
         }
         let kind = if data_kind { BlkKind::Data } else { BlkKind::Meta };
+        if dirty {
+            if let Some(u) = self.undo.as_mut() {
+                if !u.blocks.contains_key(&blk) {
+                    let was_dirty = self.cache.dirty.contains(&blk);
+                    let pre = self.cache.map.get(&blk).map(|(d, k)| (d.clone(), *k, was_dirty));
+                    u.blocks.insert(blk, pre);
+                }
+            }
+        }
         self.cache.map.insert(blk, (data, kind));
         if dirty {
             self.cache.dirty.insert(blk);
@@ -602,6 +630,64 @@ impl Ext4 {
         Ok(())
     }
 
+    /// Second half of a journal recovery at mount time.
+    ///
+    /// 1. The replayed blocks are written to their final place and the device
+    ///    is flushed: only then may the log be marked consumed (otherwise a
+    ///    crash right now would lose the transactions for good).
+    /// 2. The group descriptors, the superblock and the free counters that
+    ///    were read before the replay are reloaded and verified, so the
+    ///    allocators see the recovered bitmaps and matching checksums.
+    /// 3. The log is released (s_start = 0) and flushed.
+    ///
+    /// On error the log is left untouched (replay is idempotent), and the
+    /// caller mounts read-only.
+    fn finish_replay(&mut self, j: &mut Journal) -> FsResult<()> {
+        // 1. durability of the replayed blocks
+        let dirty: Vec<u64> = self.cache.dirty.iter().copied().collect();
+        self.write_runs(&dirty)?;
+        self.dev.flush()?;
+        for b in dirty {
+            self.cache.dirty.remove(&b);
+        }
+
+        // 2. reload + verify the metadata cached before the replay
+        let gdt_blk = self.g.first_data as u64 + 1;
+        let mut gdt = vec![0u8; self.gdt.len()];
+        self.dev.read(gdt_blk * self.spb, &mut gdt)?;
+        let mut sb = vec![0u8; SB_SIZE];
+        self.dev.read(SB_OFFSET / SECTOR as u64, &mut sb)?;
+        if le16(&sb, 0x38) != MAGIC {
+            return Err(FsError::Corrupt);
+        }
+        if self.g.metadata_csum && le32(&sb, 0x3FC) != crc32c(!0, &sb[..0x3FC]) {
+            return Err(FsError::Corrupt);
+        }
+        let old_gdt = core::mem::replace(&mut self.gdt, gdt);
+        let old_sb = core::mem::replace(&mut self.sb_raw, sb);
+        let (mut fb, mut fi) = (0u64, 0u64);
+        for g in 0..self.g.groups {
+            if self.g.metadata_csum || self.g.gdt_csum {
+                let want = self.gd16(g, 0x1E);
+                if want != self.gd_csum(g) {
+                    self.gdt = old_gdt;
+                    self.sb_raw = old_sb;
+                    return Err(FsError::Corrupt);
+                }
+            }
+            fb += self.gd_free_blocks(g) as u64;
+            fi += self.gd_free_inodes(g) as u64;
+        }
+        self.gdt_dirty.clear();
+        self.sb_dirty = false;
+        self.free_blocks = fb;
+        self.free_inodes = fi as u32;
+        self.ext_cache = None;
+
+        // 3. release the log
+        j.checkpoint_done(self)
+    }
+
     /// Current superblock image with the live counters, time and checksum.
     fn sb_image(&mut self) -> Vec<u8> {
         let t = now();
@@ -657,13 +743,65 @@ impl Ext4 {
         }
     }
 
-    /// Commit, keeping the first error.
+    /// Start recording the pre-image of this operation (see `Undo`).
+    fn begin_op(&mut self) {
+        if self.ro {
+            self.undo = None;
+            return;
+        }
+        self.undo = Some(Undo {
+            blocks: BTreeMap::new(),
+            gdt: self.gdt.clone(),
+            gdt_dirty: self.gdt_dirty.clone(),
+            sb_raw: self.sb_raw.clone(),
+            sb_dirty: self.sb_dirty,
+            free_blocks: self.free_blocks,
+            free_inodes: self.free_inodes,
+        });
+    }
+
+    /// Undo every in-memory metadata change of the failed operation so it
+    /// never reaches the journal.
+    fn rollback(&mut self) {
+        let Some(u) = self.undo.take() else { return };
+        for (blk, pre) in u.blocks {
+            match pre {
+                Some((data, kind, was_dirty)) => {
+                    self.cache.map.insert(blk, (data, kind));
+                    if was_dirty {
+                        self.cache.dirty.insert(blk);
+                    } else {
+                        self.cache.dirty.remove(&blk);
+                    }
+                }
+                None => {
+                    self.cache.map.remove(&blk);
+                    self.cache.dirty.remove(&blk);
+                }
+            }
+        }
+        self.gdt = u.gdt;
+        self.gdt_dirty = u.gdt_dirty;
+        self.sb_raw = u.sb_raw;
+        self.sb_dirty = u.sb_dirty;
+        self.free_blocks = u.free_blocks;
+        self.free_inodes = u.free_inodes;
+        self.ext_cache = None;
+    }
+
+    /// End of an operation: commit on success, roll back on failure (a
+    /// failed operation must not leave partial writes in the journal).
     fn finish<T>(&mut self, r: FsResult<T>) -> FsResult<T> {
-        let c = self.commit();
-        match (r, c) {
-            (Ok(v), Ok(())) => Ok(v),
-            (Err(e), _) => Err(e),
-            (Ok(_), Err(e)) => Err(e),
+        match r {
+            Ok(v) => {
+                let c = self.commit();
+                self.undo = None;
+                c.map(|_| v)
+            }
+            Err(e) => {
+                self.rollback();
+                Err(e)
+            }
         }
     }
 
@@ -864,51 +1002,61 @@ impl FileSystem for Ext4 {
     }
 
     fn write(&mut self, ino: u64, off: u64, data: &[u8]) -> FsResult<usize> {
+        self.begin_op();
         let r = self.file_write(ino32(ino)?, off, data);
         self.finish(r)
     }
 
     fn truncate(&mut self, ino: u64, size: u64) -> FsResult<()> {
+        self.begin_op();
         let r = self.file_truncate(ino32(ino)?, size);
         self.finish(r)
     }
 
     fn create(&mut self, dir: u64, name: &str, mode: u16) -> FsResult<u64> {
+        self.begin_op();
         let r = self.op_create(ino32(dir)?, name, mode);
         self.finish(r).map(|i| i as u64)
     }
 
     fn mkdir(&mut self, dir: u64, name: &str, mode: u16) -> FsResult<u64> {
+        self.begin_op();
         let r = self.op_mkdir(ino32(dir)?, name, mode);
         self.finish(r).map(|i| i as u64)
     }
 
     fn symlink(&mut self, dir: u64, name: &str, target: &str) -> FsResult<u64> {
+        self.begin_op();
         let r = self.op_symlink(ino32(dir)?, name, target);
         self.finish(r).map(|i| i as u64)
     }
 
     fn link(&mut self, dir: u64, name: &str, ino: u64) -> FsResult<()> {
+        self.begin_op();
         let r = self.op_link(ino32(dir)?, name, ino32(ino)?);
         self.finish(r)
     }
 
     fn unlink(&mut self, dir: u64, name: &str) -> FsResult<()> {
+        self.begin_op();
         let r = self.op_unlink(ino32(dir)?, name);
         self.finish(r)
     }
 
     fn rmdir(&mut self, dir: u64, name: &str) -> FsResult<()> {
+        self.begin_op();
         let r = self.op_rmdir(ino32(dir)?, name);
         self.finish(r)
     }
 
     fn rename(&mut self, odir: u64, oname: &str, ndir: u64, nname: &str) -> FsResult<()> {
+        self.begin_op();
         let r = self.op_rename(ino32(odir)?, oname, ino32(ndir)?, nname);
         self.finish(r)
     }
 
     fn chmod(&mut self, ino: u64, mode: u16) -> FsResult<()> {
+        self.begin_op();
         let r = self.op_chmod(ino32(ino)?, mode);
         self.finish(r)
     }
@@ -916,6 +1064,7 @@ impl FileSystem for Ext4 {
     /// fallocate-style preallocation: unwritten extents covering
     /// [start, start+len); the size grows past EOF unless keep_size.
     fn fallocate(&mut self, ino: u64, start: u64, len: u64, keep_size: bool) -> FsResult<()> {
+        self.begin_op();
         let r = self.file_fallocate(ino32(ino)?, start, len, keep_size);
         self.finish(r)
     }
