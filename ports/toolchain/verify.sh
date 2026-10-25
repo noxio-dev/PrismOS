@@ -20,12 +20,15 @@ LC_ALL=C; export LC_ALL
 #     makes reaching its number -- the tag layer passes it as
 #     __do_syscallN's first argument (`mov $nr,%edi ... call
 #     <__do_syscallN>`), hand-written asm (the restorer, the raw shim of
-#     usr/mlibc/prism_raw.h) goes direct (`mov $nr,%eax ... syscall`) --
+#     apps/include/prism_raw.h) goes direct (`mov $nr,%eax ... syscall`) --
 #     plus the symbols those paths live in
 #
-# With a program name (hello | fork | fd | posix -- the phase 3.2, step 4
-# ports of usr/mlibc) the syscall and symbol set is that program's; without
-# one, the step-3 proof set applies (write / the restorer / clock_gettime).
+# With a program name (hello | fork | fd | posix | cube) the syscall and
+# symbol set is that program's; with `custom` the set comes from the
+# environment (PRISM_VERIFY_SYSCALLS / PRISM_VERIFY_SYMBOLS -- what an
+# apps/<name>/prism.toml [verify] section declares, passed by
+# tools/prism.py); without a program, the step-3 proof set applies
+# (write / the restorer / clock_gettime).
 #
 # The `dyn` mode (phase 3.2's last step) verifies the whole dynamic-linking
 # chain instead, still statically:
@@ -76,7 +79,7 @@ scname() {
 # The port's calling convention: the tag layer passes the syscall number as
 # the first argument (__do_syscallN's %edi: `mov $nr,%edi ... call
 # <__do_syscallN>`), while hand-written asm (the restorer, the raw shim of
-# usr/mlibc/prism_raw.h) goes direct (`mov $nr,%eax ... syscall`).  Track
+# apps/include/prism_raw.h) goes direct (`mov $nr,%eax ... syscall`).  Track
 # both, hex-compared, one register-copy hop deep: the optimizer hoists a
 # loop's syscall number into a callee-saved register (`mov $4,%r12d` before
 # the loop, `mov %r12,%rax; syscall` inside it), so an immediate loaded
@@ -240,7 +243,7 @@ EOF
 
         echo "== the executable under disassembly (the raw shim stays raw) =="
 
-        # The PrismOS-only calls of usr/mlibc/prism_raw.h are inlined into the
+        # The PrismOS-only calls of apps/include/prism_raw.h are inlined into the
         # program itself -- dynamic linking changes where the *library* calls
         # live, not these (uptime_ms / yield / the millisecond sleep: 3 4 5).
         for n in 3 4 5; do
@@ -413,7 +416,9 @@ cube)   SYSCALLS="1 3 5 13 14 15 22 44 45"
         SYMBOLS="write read open close mmap snprintf strlen" ;;
 "")     SYSCALLS="1 12 43"
         SYMBOLS="write __mlibc_signal_restore clock_gettime" ;;
-*)      echo "verify: unknown program '$PROG' (hello | fork | fd | posix | cube)" >&2; exit 2 ;;
+custom) SYSCALLS=${PRISM_VERIFY_SYSCALLS:-}
+	SYMBOLS=${PRISM_VERIFY_SYMBOLS:-} ;;
+*)      echo "verify: unknown program '$PROG' (hello | fork | fd | posix | cube | custom)" >&2; exit 2 ;;
 esac
 
 for n in $SYSCALLS; do

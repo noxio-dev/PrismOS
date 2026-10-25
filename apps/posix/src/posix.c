@@ -69,7 +69,7 @@
 #include <termios.h>
 #include <unistd.h>
 
-#include "../prism_raw.h"
+#include "prism_raw.h"
 
 int main(int argc, char **argv, char **envp);
 

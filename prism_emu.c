@@ -46,7 +46,8 @@
 enum {                                  /* prismos/syscall.h */
         P_EXIT = 0, P_WRITE = 1, P_GETPID = 2, P_UPTIME_MS = 3, P_YIELD = 4,
         P_SLEEP = 5, P_READ = 13, P_OPEN = 14, P_CLOSE = 15, P_BRK = 21,
-        P_MMAP = 22, P_ARCH_PRCTL = 36, P_FB_INFO = 44, P_FB_BLIT = 45,
+        P_MMAP = 22, P_IOCTL = 29, P_ARCH_PRCTL = 36, P_FB_INFO = 44,
+        P_FB_BLIT = 45, P_LSEEK = 16,
 };
 
 struct prism_fb_info {                  /* prism_raw.h, packed the same */
@@ -339,6 +340,12 @@ static void serve_entry(struct user_regs_struct *r)
         case P_YIELD:     pending_answer = 0;        neutralized = 1; r->orig_rax = 39; break;
         case P_SLEEP:     pending_answer = r->rdi;   neutralized = 1; r->orig_rax = 39; break;
         case P_BRK:       pending_answer = r->rdi;   neutralized = 1; r->orig_rax = 39; break;
+        case P_IOCTL:     /* isatty's TCGETS: "not a tty" is the honest answer,
+                             * and what makes mlibc's stdio go fully buffered */
+                          pending_answer = (uint64_t)-25; neutralized = 1; r->orig_rax = 39; break;
+        case P_LSEEK:     /* stdio's seekability probe: the offset asked for,
+                             * as if the console were a regular file */
+                          pending_answer = r->rsi;    neutralized = 1; r->orig_rax = 39; break;
         case P_FB_INFO:
                 wr_mem(r->rdi, &FB, sizeof FB);
                 pending_answer = 0; neutralized = 1; r->orig_rax = 39; break;

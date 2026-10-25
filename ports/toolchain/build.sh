@@ -27,12 +27,10 @@
 #   3. library   mlibc proper, rebuilt with the real cross compiler under the
 #                 same meson cross file -- the bootstrap wrappers of
 #                 bootstrap.sh are simply answered by real binaries now.
-#   4. progs     the four /bin programs ported to mlibc (usr/mlibc),
-#                 compiled and linked through the finished toolchain
-#                 (bootstrap.sh stage progs: the compiler it finds in
-#                 build/toolchain/usr/bin is the cross gcc by then), and
-#                 the same static verification, per program -- `stage
-#                 hello` (the step-3 proof) remains runnable on its own.
+#   4. (apps)    the /bin programs are apps/ packages now -- tools/prism.py
+#                builds them from the Makefile (`make apps`) on the finished
+#                toolchain; `stage hello` (the step-3 proof) remains
+#                runnable on its own.
 #   5. dynlib     the dynamic half of the library, phase 3.2's last step:
 #                 mlibc rebuilt with -Ddefault_library=both under the same
 #                 cross file -- the sysroot gains libc.so (the C library as
@@ -40,7 +38,7 @@
 #                 and ld.so (the rtld, an ET_DYN linked -nostdlib that
 #                 relocates itself from its own _DYNAMIC and then the
 #                 program it is the PT_INTERP of).
-#   6. dyn        the proof executable: usr/mlibc/hello/hello.c again, but
+#   6. dyn        the proof executable: apps/hello/src/hello.c again, but
 #                 linked dynamically -- PT_INTERP /lib/ld.so, DT_NEEDED
 #                 libc.so, -z now (mlibc's rtld fills GOT[1]/GOT[2] with
 #                 NULL: lazy binding is not an option, BIND_NOW is),
@@ -85,7 +83,7 @@ while [ $# -gt 0 ]; do
         --src)    SRC=$2; shift 2 ;;
         --jobs)   JOBS=$2; shift 2 ;;
         stage)    STAGE=$2; shift 2 ;;
-        list)     echo "fetch binutils gcc mlibc progs hello verify dynlib dyn dynverify"; exit 0 ;;
+        list)     echo "fetch binutils gcc mlibc hello verify dynlib dyn dynverify"; exit 0 ;;
         *) echo "usage: $0 [--prefix dir] [--src dir] [--jobs n] [stage <name>|list]" >&2; exit 2 ;;
         esac
 done
@@ -210,8 +208,7 @@ do_mlibc() {
         say mlibc "libc.a + crt objects (cross-built) in $SYSROOT/usr/lib"
 }
 
-# ---- stages: progs + verify (bootstrap.sh's, now on the real tools) ----------
-do_progs()  { sh "$REPO/ports/toolchain/bootstrap.sh" stage progs; }
+# ---- stages: hello + verify (bootstrap.sh's, now on the real tools) ----------
 do_hello()  { sh "$REPO/ports/toolchain/bootstrap.sh" stage hello; }
 do_verify() { sh "$REPO/ports/toolchain/bootstrap.sh" stage verify; }
 
@@ -246,7 +243,7 @@ do_dynlib() {
 
 # ---- stage: dyn ---------------------------------------------------------------
 # The proof executable of phase 3.2's last step: hello, dynamically linked.
-# The same source and the same compile flags as `stage prog hello` -- only
+# The same source and the same compile flags as the app (apps/hello) -- only
 # the link changes: no --no-dynamic-linker, --dynamic-linker /lib/ld.so (the
 # path the kernel's PT_INTERP handling reads from the VFS at execve), -lc
 # resolved against the sysroot's libc.so (ld records DT_NEEDED libc.so, the
@@ -262,11 +259,11 @@ do_dyn() {
         OUTDIR=$REPO/build/usr/bin-mlibc-dyn
         mkdir -p "$OUTDIR"
 
-        say dyn "compiling usr/mlibc/hello/hello.c (same flags as the static port)"
-        $CC -c "$REPO/usr/mlibc/hello/hello.c" -o "$OUTDIR/hello.o" \
+        say dyn "compiling apps/hello/src/hello.c (same flags as the static port)"
+        $CC -c "$REPO/apps/hello/src/hello.c" -o "$OUTDIR/hello.o" \
                 -O2 -Wall -Wextra -ffreestanding -fPIE \
                 -fno-stack-protector -fno-asynchronous-unwind-tables -fno-math-errno \
-                -nostdinc -isystem "$GCCINC" -isystem "$SYSROOT/usr/include"
+                -nostdinc -isystem "$GCCINC" -isystem "$SYSROOT/usr/include" -I "$REPO/apps/include"
 
         say dyn "linking the dynamic PIE (PT_INTERP /lib/ld.so, DT_NEEDED libc.so, -z now)"
         CRTBEGIN=$($CC -print-file-name=crtbeginS.o)
@@ -303,12 +300,11 @@ do_dynverify() {
 }
 
 case "$STAGE" in
-        all)    do_fetch; do_binutils; do_gcc; do_mlibc; do_progs; do_verify; do_dyn; do_dynverify ;;
+        all)    do_fetch; do_binutils; do_gcc; do_mlibc; do_verify; do_dyn; do_dynverify ;;
         fetch)    do_fetch ;;
         binutils) do_binutils ;;
         gcc)      do_gcc ;;
         mlibc)    do_mlibc ;;
-        progs)    do_progs ;;
         hello)    do_hello ;;
         verify)   do_verify ;;
         dynlib)   do_dynlib ;;

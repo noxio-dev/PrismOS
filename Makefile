@@ -23,7 +23,7 @@ QEMU_AHCI := -device ahci,id=ahci0
 QEMU_DATA := -drive id=data,file=$(DATA_IMG),format=raw,if=none -device ide-hd,drive=data,bus=ahci0.1
 # $(call qemu_boot_drive,image) - the bootable disk, AHCI port 0
 qemu_boot_drive = -drive id=boot,file=$(1),format=raw,if=none -device ide-hd,drive=boot,bus=ahci0.0
-QEMUFLAGS ?= -m 256M $(QEMU_AHCI) $(QEMU_DATA)
+QEMUFLAGS ?= -m 256M $(QEMU_AHCI) $(QEMU_DATA) -smp 4
 OVMF_CODE ?= $(firstword $(wildcard \
     /usr/share/OVMF/OVMF_CODE_4M.fd \
     /usr/share/OVMF/OVMF_CODE.fd \
@@ -69,7 +69,7 @@ EFI_OBJS  := $(patsubst %.c,$B/efi/%.o,$(COMMON_SRCS) boot/loader/ext4.c $(wildc
 
 # ---- default target ----------------------------------------------------
 
-.PHONY: all clean run run-uefi run-iso test kernel esp root iso run-kvm run-uefi-kvm data fstest usr
+.PHONY: all clean run run-uefi run-iso test kernel esp root iso run-kvm run-uefi-kvm data fstest apps
 all: $B/$(NAME).img
 
 # ---- compile rules -------------------------------------------------------
@@ -136,63 +136,52 @@ $B/kernel: FORCE
 	@cmp -s $(KERNEL_ELF) $@ || cp -f $(KERNEL_ELF) $@
 FORCE:
 
-# ---- user space (phases 2.4 + 2.5 + 2.6 + 3.1) -----------------------------------
-# Programs are static PIE ELF files (the kernel's loader applies the RELATIVE
-# relocations at USER_BASE), linked with page-aligned segments so each one
-# gets its own protection (W^X).  usr/lib = crt0 + mini libc, usr/<name>/<name>.c
-# = one program, installed as /bin/<name> in the ext4 root.
+# ---- apps: the userland packages (apps/<name>/prism.toml) ---------------------
+# A program is a package: a directory under apps/ with a prism.toml manifest,
+# built by tools/prism.py (the ./prism shim).  The mini libc (usr/) is gone --
+# mlibc is the only libc -- and the packages are the whole userland: prism
+# compiles each one against the mlibc sysroot, links the static PIE the
+# kernel's loader expects (the Scrt1 / crti / crtbeginS / libc.a / crtendS /
+# crtn sandwich, page-aligned segments so each one gets its own protection,
+# W^X, the RELATIVE relocations the loader applies at USER_BASE), runs
+# verify.sh's loader-contract checks with the manifest's syscall and symbol
+# diet, and stages the stripped binary into build/apps-out/<name> -- the
+# kernel reads whole files (MAX_ELF_FILE is 4 MiB) and the meson debug
+# sections buy the loader nothing.
+#
+#   make apps            build every package (tools/prism.py build --all)
+#   prism init <name>    scaffold a new one -- the next `make` picks it up,
+#                        no wiring anywhere else: the manifest is the program
 
-LLD       ?= ld.lld
-USR_PROGS := hello fork fd posix
-USR_CFLAGS := -target x86_64-unknown-none-elf -ffreestanding -fPIE -fno-stack-protector \
-              -fno-asynchronous-unwind-tables -fno-math-errno -O2 -Wall -Wextra \
-              -nostdinc -isystem $(CCRES) -I usr/include
-USR_LDFLAGS := -pie --no-dynamic-linker -z separate-code -z max-page-size=4096 \
-               -z noexecstack -z norelro -e _start
-USR_LIB_OBJS := $B/usr/lib/crt0.o $B/usr/lib/prism.o
-USR_BINS  := $(addprefix $B/usr/bin/,$(USR_PROGS))
+APP_DEPS := $(shell find apps -type f \
+	\( -name '*.c' -o -name '*.h' -o -name '*.toml' \) 2>/dev/null)
 
-$B/usr/lib/%.o: usr/lib/%.c usr/include/prism.h
+apps: $B/apps.stamp
+$B/apps.stamp: $B/toolchain/usr/.stamp $(APP_DEPS) tools/prism.py \
+			ports/toolchain/verify.sh
 	@mkdir -p $(@D)
-	$(CC) $(USR_CFLAGS) -c -o $@ $<
-
-$B/usr/lib/%.o: usr/lib/%.S
-	@mkdir -p $(@D)
-	$(CC) $(USR_CFLAGS) -c -o $@ $<
-
-$B/usr/%.o: usr/%.c usr/include/prism.h
-	@mkdir -p $(@D)
-	$(CC) $(USR_CFLAGS) -c -o $@ $<
-
-define USR_PROG_RULE
-$B/usr/bin/$(1): $B/usr/$(1)/$(1).o $(USR_LIB_OBJS)
-	@mkdir -p $$(@D)
-	$(LLD) $(USR_LDFLAGS) -o $$@ $(USR_LIB_OBJS) $$<
-endef
-$(foreach p,$(USR_PROGS),$(eval $(call USR_PROG_RULE,$(p))))
-
-usr: $(USR_BINS)
+	$(PYTHON) tools/prism.py build --all
+	@touch $@
 
 # ---- mlibc toolchain + sysroot (phase 3.2, steps 3 + 4) ---------------------
 # ports/toolchain drives the phase's third and fourth steps: the
 # x86_64-prismos cross toolchain (binutils + gcc, patched for the triplet),
 # mlibc built with Meson against it -- headers first, then the compiler,
-# then the library -- and the four /bin programs ported off the mini libc
-# onto the result (usr/mlibc), each linked as the static PIE the loader
-# expects.
+# then the library.  The /bin programs are packages now (apps/, one
+# prism.toml each, built by tools/prism.py), each linked as the static
+# PIE the loader expects.
 #
 #   make mlibc        bootstrap.sh's pipeline into build/toolchain/usr: the
 #                     bootstrap wrappers, mlibc's headers + libc.a + the crt
 #                     objects in the x86_64-prismos sysroot (fast path; no
 #                     toolchain build -- ports/toolchain/build.sh replaces the
 #                     wrappers with the real cross tools under the same names)
-#   make usr-mlibc    build/usr/bin-mlibc/{hello,fork,fd,posix,cube}, the
-#                     step-4 ports, each one checked by verify.sh with its own
-#                     syscall and symbol set (the step-3 proof remains
-#                     `bootstrap.sh stage hello`); cube (phase 3.3) is the
+#   make apps         every apps/<name>/prism.toml package, built + checked
+#                     + staged by tools/prism.py; the step-3 proof remains
+#                     `bootstrap.sh stage hello`; cube (phase 3.3) is the
 #                     kernel's spinning cube as a process -- the framebuffer
 #                     pair (fb_info 44 / fb_blit 45) it draws through
-#   make usr-mlibc-dyn the phase's last step: build/usr/bin-mlibc-dyn/hello,
+#   make hello-dyn the phase's last step: build/usr/bin-mlibc-dyn/hello,
 #                     the same program linked dynamically -- PT_INTERP
 #                     /lib/ld.so, DT_NEEDED libc.so, BIND_NOW -- against
 #                     the sysroot's shared half (build.sh stage dyn,
@@ -205,28 +194,12 @@ MLIBC_SRC ?= build/mlibc
 TOOLCHAIN  := $B/toolchain/usr
 SYSROOT    := $(TOOLCHAIN)/x86_64-prismos
 
-.PHONY: mlibc usr-mlibc usr-mlibc-dyn
+.PHONY: mlibc apps hello-dyn
 mlibc: $B/toolchain/usr/.stamp
 $B/toolchain/usr/.stamp: ports/toolchain/bootstrap.sh ports/toolchain/cross.txt ports/mlibc/README.md ports/mlibc/mlibc-prismos.patch
 	@mkdir -p $(@D)
 	sh ports/toolchain/bootstrap.sh --mlibc $(MLIBC_SRC) --prefix $(abspath $(TOOLCHAIN))
 	@touch $@
-
-USR_MLIBC_PROGS := hello fork fd posix cube
-USR_MLIBC_BINS  := $(addprefix $B/usr/bin-mlibc/,$(USR_MLIBC_PROGS))
-
-usr-mlibc: $(USR_MLIBC_BINS)
-
-define USR_MLIBC_PROG_RULE
-$B/usr/bin-mlibc/$(1): usr/mlibc/$(1)/$(1).c usr/mlibc/prism_raw.h \
-                ports/toolchain/bootstrap.sh ports/toolchain/verify.sh \
-                $B/toolchain/usr/.stamp
-	@mkdir -p $$(@D)
-	sh ports/toolchain/bootstrap.sh --mlibc $(MLIBC_SRC) \
-                --prefix $(abspath $(TOOLCHAIN)) stage prog $(1)
-	sh ports/toolchain/verify.sh $$@ $(SYSROOT) $(1)
-endef
-$(foreach p,$(USR_MLIBC_PROGS),$(eval $(call USR_MLIBC_PROG_RULE,$(p))))
 
 # The dynamic half (phase 3.2's last step): the same hello, linked
 # against the sysroot's libc.so with PT_INTERP /lib/ld.so -- the kernel's
@@ -236,11 +209,11 @@ $(foreach p,$(USR_MLIBC_PROGS),$(eval $(call USR_MLIBC_PROG_RULE,$(p))))
 # before it, the mlibc rebuild with -Ddefault_library=both that puts
 # libc.so + ld.so in the sysroot); verify.sh's dyn mode checks the
 # whole chain.
-USR_MLIBC_DYN := $B/usr/bin-mlibc-dyn/hello
+HELLO_DYN := $B/usr/bin-mlibc-dyn/hello
 
-usr-mlibc-dyn: $(USR_MLIBC_DYN)
+hello-dyn: $(HELLO_DYN)
 
-$(USR_MLIBC_DYN): usr/mlibc/hello/hello.c usr/mlibc/prism_raw.h \
+$(HELLO_DYN): apps/hello/src/hello.c apps/include/prism_raw.h \
 		ports/toolchain/build.sh ports/toolchain/verify.sh \
 		$B/toolchain/usr/.stamp
 	@mkdir -p $(@D)
@@ -259,18 +232,16 @@ $B/esp.stamp: $B/loader.efi
 
 # P3: ext4 root, read by the loader (boot tree) and the kernel (root fs).
 root: $B/root.stamp
-# The root carries the dynamic trio too (phase 3.2's last step): /lib's
-# ld.so -- the interpreter the kernel's PT_INTERP handling loads at
-# USER_INTERP_BASE -- and libc.so, the library ld.so maps with file mmap
-# from /lib (the first of its default search paths), plus the dynamically
-# linked hello as /bin/hello-dyn.  Stripped: the kernel reads whole files
-# (MAX_ELF_FILE is 4 MiB) and the debug sections buy it nothing.
-# Phase 3.3: the mlibc cube installs as /bin/cube -- the one mlibc static
-# the image carries, stripped like the /lib duo (same 4 MiB whole-file
-# read, same useless debug sections), so 'exec cube' (or 'exec -t 100000
-# cube' for a long session) spins the user-space cube.
+# The root carries the apps (tools/prism.py installs them, stripped from
+# build/apps-out, at each manifest's [install] path) plus the dynamic trio
+# (phase 3.2's last step): /lib's ld.so -- the interpreter the kernel's
+# PT_INTERP handling loads at USER_INTERP_BASE -- and libc.so, the library
+# ld.so maps with file mmap from /lib (the first of its default search
+# paths), plus the dynamically linked hello as /bin/hello-dyn.  Stripped:
+# the kernel reads whole files (MAX_ELF_FILE is 4 MiB) and the debug
+# sections buy it nothing.
 $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
-	$(USR_BINS) $(USR_MLIBC_DYN) $B/usr/bin-mlibc/cube
+	$(HELLO_DYN) $B/apps.stamp
 	rm -rf $B/root
 	mkdir -p $B/root/boot/lua $B/root/boot/defaults $B/root/boot/kernel \
                  $B/root/bin $B/root/dev $B/root/etc $B/root/lib $B/root/usr
@@ -278,13 +249,8 @@ $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
 	cp boot/conf/defaults-loader.conf $B/root/boot/defaults/loader.conf
 	cp boot/conf/loader.conf $B/root/boot/loader.conf
 	cp $B/kernel $B/root/boot/kernel/kernel
-	cp $(USR_BINS) $B/root/bin/
-	cp $(USR_MLIBC_DYN) $B/root/bin/hello-dyn
-	# Stripped like the /lib duo below: the mlibc meson build's debug
-	# sections would push the static past the kernel's whole-file read
-	# (MAX_ELF_FILE is 4 MiB) and buy the loader nothing.
-	$(TOOLCHAIN)/bin/x86_64-prismos-strip --strip-all \
-		-o $B/root/bin/cube $B/usr/bin-mlibc/cube
+	$(PYTHON) tools/prism.py install --all --dest $B/root
+	cp $(HELLO_DYN) $B/root/bin/hello-dyn
 	printf '#!/bin/sh\necho "not an ELF file"\n' > $B/root/bin/notelf
 	chmod 755 $B/root/bin/*
 	$(TOOLCHAIN)/bin/x86_64-prismos-strip --strip-all \
@@ -387,4 +353,4 @@ fstest:
 	$(PYTHON) tests/fs_test.py
 
 clean:
-	rm -rf $B sys/kern/target
+	rm -rf $B sys/kern/target apps/*/build

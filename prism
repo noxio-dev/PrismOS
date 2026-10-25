@@ -1,0 +1,3 @@
+#!/bin/sh
+# The PrismOS package tool (tools/prism.py) under a short name.
+exec python3 "$(dirname "$0")/tools/prism.py" "$@"

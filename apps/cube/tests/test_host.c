@@ -10,7 +10,7 @@
  *   5. one whole cube frame, as ASCII art
  */
 #define main cube_main_unused
-#include "cube.c"
+#include "../src/cube.c"
 #undef main
 
 #include <math.h>

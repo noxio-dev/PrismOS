@@ -1,0 +1,16 @@
+# /bin/fd -- the descriptor table: open / close / dup / pipe / lseek,
+# the console's O_NONBLOCK included.
+[package]
+name = "fd"
+version = "0.1.0"
+description = "descriptor-table scenarios (open, dup, pipe, nonblocking)"
+
+[build]
+sources = ["src/fd.c"]
+
+[install]
+path = "/bin/fd"
+
+[verify]
+syscalls = [1, 13, 14, 15, 16, 17, 18, 8, 9, 7, 38, 5]
+symbols = ["write", "read", "open", "close", "fork", "__mlibc_signal_restore"]

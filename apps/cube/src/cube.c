@@ -51,7 +51,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#include "../prism_raw.h"
+#include "prism_raw.h"
 
 /* ---- fixed point Q14: 16384 = 1.0 ----------------------------------- */
 

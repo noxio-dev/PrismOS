@@ -55,7 +55,7 @@
  * the same array to main, and the execfd child passes it to execve. */
 extern char **environ;
 
-#include "../prism_raw.h"
+#include "prism_raw.h"
 
 int main(int argc, char **argv, char **envp);
 

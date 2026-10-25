@@ -1,0 +1,18 @@
+# /bin/cube -- the kernel's spinning cube as a process (phase 3.3): Q14
+# maths, an anonymous back buffer, dirty-rect blits through the
+# framebuffer pair (fb_info 44 / fb_blit 45), the 8x8 font, the keyboard
+# through /dev/console O_NONBLOCK.
+[package]
+name = "cube"
+version = "0.1.0"
+description = "the spinning cube, in userland"
+
+[build]
+sources = ["src/cube.c"]
+
+[install]
+path = "/bin/cube"
+
+[verify]
+syscalls = [1, 3, 5, 13, 14, 15, 22, 44, 45]
+symbols = ["write", "read", "open", "close", "mmap", "snprintf", "strlen"]

@@ -1,0 +1,17 @@
+# /bin/hello -- banner, argv / envp / auxv, relocations, the FPU scenarios,
+# on mlibc; only the PrismOS-only calls (uptime, yield, the ms sleep) raw.
+[package]
+name = "hello"
+version = "0.1.0"
+description = "banner + argv/envp/auxv + FPU scenarios, on mlibc"
+
+[build]
+sources = ["src/hello.c"]
+
+[install]
+path = "/bin/hello"
+
+# verify.sh's hello diet: every syscall the program makes.
+[verify]
+syscalls = [1, 7, 3, 4, 5]
+symbols = ["write", "getauxval"]

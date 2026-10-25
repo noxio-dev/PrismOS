@@ -25,18 +25,17 @@
 #   stage headers   mlibc's headers, installed into the sysroot
 #   stage library   mlibc proper: libc.a + the four crt objects, static,
 #                   the whole ansi + posix surface the kernel serves
-#   stage progs     the four /bin programs ported to mlibc (usr/mlibc):
-#                   compiled with the cross compiler, linked as the static
-#                   PIEs the loader expects (step 4)
 #   stage hello     the step-3 proof (ports/toolchain/hello.c), kept as the
-#                   regression it was; `stage prog <name>` builds one port
-#   stage verify    the loader's own checks, statically (verify.sh), for
-#                   each of the four ports
+#                   regression it was
+#   stage verify    the proof under verify.sh's checks, statically
+#
+# The /bin programs themselves are apps/ packages now -- tools/prism.py
+# builds them from the Makefile (`make apps`); this script builds the
+# toolchain and the library they build against.
 #
 # Usage:
 #   sh ports/toolchain/bootstrap.sh                 # all stages, in order
 #   sh ports/toolchain/bootstrap.sh stage <name>    # one stage
-#   sh ports/toolchain/bootstrap.sh stage prog <n>  # one program
 #   sh ports/toolchain/bootstrap.sh list            # the stage names
 #
 # Environment / flags:
@@ -50,7 +49,7 @@
 #   $PREFIX/bin/x86_64-prismos-{gcc,g++,ar,...}   the bootstrap compilers
 #   $PREFIX/x86_64-prismos/usr/include/           mlibc's headers
 #   $PREFIX/x86_64-prismos/usr/lib/{libc.a,crt1.o,Scrt1.o,crti.o,crtn.o}
-#   build/usr/bin-mlibc/{hello,fork,fd,posix}     the ports, static PIEs
+#   build/usr/hello-mlibc/hello                    the step-3 proof, a static PIE
 set -e
 
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
@@ -68,9 +67,8 @@ while [ $# -gt 0 ]; do
         --prefix) PREFIX=$2; SYSROOT=$2/x86_64-prismos; shift 2 ;;
         --jobs)   JOBS=$2; shift 2 ;;
         stage)    STAGE=$2
-                  if [ "$2" = prog ] && [ $# -ge 3 ]; then PROG=$3; shift 1; fi
                   shift 2 ;;
-        list)     echo "wrappers mlibc headers library progs hello verify"; exit 0 ;;
+        list)     echo "wrappers mlibc headers library hello verify"; exit 0 ;;
         *) echo "usage: $0 [--mlibc dir] [--prefix dir] [--jobs n] [stage <name>|list]" >&2; exit 2 ;;
         esac
 done
@@ -224,80 +222,22 @@ do_hello() {
         say hello "build/usr/hello-mlibc/hello"
 }
 
-# ---- stage: progs ------------------------------------------------------------
-# The step-4 port: the five /bin programs off the mini libc, onto mlibc
-# (usr/mlibc).  Same discipline as the step-3 proof -- the sysroot's headers
-# carried explicitly, freestanding compile, the loader's link contract -- only
-# the sources change, and they pull the whole `ansi` + `posix` surface in:
-# stdio buffered on the descriptor table, fork / waitpid / kill, opendir,
-# tcgetattr, uname, ...  The PrismOS-only calls (uptime_ms, yield, the
-# millisecond sleep, brk, and the cube's framebuffer pair) stay raw, through
-# usr/mlibc/prism_raw.h -- the only place the `syscall` instruction appears
-# outside libc.a.
-do_prog() { # <name>
-        name=$1
-        CC=$PREFIX/bin/x86_64-prismos-gcc
-        LD=$PREFIX/bin/x86_64-prismos-ld
-        GCCINC=$($CC -print-file-name=include)
-        OUTDIR=$REPO/build/usr/bin-mlibc
-        mkdir -p "$OUTDIR"
-
-        say "$name" "compiling usr/mlibc/$name/$name.c"
-        $CC -c "$REPO/usr/mlibc/$name/$name.c" -o "$OUTDIR/$name.o" \
-                -O2 -Wall -Wextra -ffreestanding -fPIE \
-                -fno-stack-protector -fno-asynchronous-unwind-tables -fno-math-errno \
-                -nostdinc -isystem "$GCCINC" -isystem "$SYSROOT/usr/include"
-
-        say "$name" "linking the static PIE"
-        CRTBEGIN=$($CC -print-file-name=crtbeginS.o)
-        CRTEND=$($CC -print-file-name=crtendS.o)
-        if ! $LD -m elf_x86_64 -pie --no-dynamic-linker -z separate-code \
-              -z max-page-size=4096 -z noexecstack -z norelro -e _start \
-              -o "$OUTDIR/$name" \
-              "$SYSROOT/usr/lib/Scrt1.o" "$SYSROOT/usr/lib/crti.o" \
-              "$CRTBEGIN" "$OUTDIR/$name.o" \
-              --start-group "$SYSROOT/usr/lib/libc.a" --end-group \
-              "$CRTEND" "$SYSROOT/usr/lib/crtn.o" 2>/dev/null; then
-                say "$name" "retrying with libgcc (compiler intrinsics)"
-                LIBGCC=$($CC -print-libgcc-file-name)
-                $LD -m elf_x86_64 -pie --no-dynamic-linker -z separate-code \
-                      -z max-page-size=4096 -z noexecstack -z norelro -e _start \
-                      -o "$OUTDIR/$name" \
-                      "$SYSROOT/usr/lib/Scrt1.o" "$SYSROOT/usr/lib/crti.o" \
-                      "$CRTBEGIN" "$OUTDIR/$name.o" \
-                      --start-group "$SYSROOT/usr/lib/libc.a" "$LIBGCC" --end-group \
-                      "$CRTEND" "$SYSROOT/usr/lib/crtn.o"
-        fi
-        say "$name" "build/usr/bin-mlibc/$name"
-}
-
-do_progs() {
-        for p in hello fork fd posix cube; do
-                do_prog "$p"
-        done
-}
-
 # ---- stage: verify -----------------------------------------------------------
-# The loader's own checks (verify.sh), statically, for each of the four ports
-# with its own syscall and symbol set.  (The step-3 proof of `stage hello` is
-# verified with the no-program call: verify.sh <elf> <sysroot>.)
+# The step-3 proof under the loader's own checks (verify.sh <elf>
+# <sysroot>, the proof's write / restorer / clock_gettime set).  The
+# apps' own checks run per package, from tools/prism.py, with the
+# manifest's [verify] diet.
 do_verify() {
-        for p in hello fork fd posix cube; do
-                echo "--- $p"
-                sh "$REPO/ports/toolchain/verify.sh" "$REPO/build/usr/bin-mlibc/$p" "$SYSROOT" "$p"
-        done
+	sh "$REPO/ports/toolchain/verify.sh" "$REPO/build/usr/hello-mlibc/hello" "$SYSROOT"
 }
 
 case "$STAGE" in
-        all)     do_wrappers; do_mlibc; do_headers; do_library; do_progs; do_verify ;;
-        wrappers) do_wrappers ;;
-        mlibc)    do_mlibc ;;
-        headers)  do_headers ;;
-        library)  do_library ;;
-        progs)    do_progs ;;
-        prog)     [ -n "$PROG" ] || { echo "stage prog: name required (hello | fork | fd | posix | cube)" >&2; exit 2; }
-                  do_prog "$PROG" ;;
-        hello)    do_hello ;;
-        verify)   do_verify ;;
-        *) echo "unknown stage: $STAGE (try: list)" >&2; exit 2 ;;
+	all)     do_wrappers; do_mlibc; do_headers; do_library; do_hello; do_verify ;;
+	wrappers) do_wrappers ;;
+	mlibc)    do_mlibc ;;
+	headers)  do_headers ;;
+	library)  do_library ;;
+	hello)    do_hello ;;
+	verify)   do_verify ;;
+	*) echo "unknown stage: $STAGE (try: list)" >&2; exit 2 ;;
 esac

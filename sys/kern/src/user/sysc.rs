@@ -591,10 +591,10 @@ pub fn sys_clock_gettime(clk: u64, ts: u64) -> i64 {
 /// and filled); the blit is the honest primitive until then.
 ///
 /// Both calls are PrismOS-only -- POSIX has no word for them -- so the
-/// mlibc userland reaches them raw, through usr/mlibc/prism_raw.h.
+/// mlibc userland reaches them raw, through apps/include/prism_raw.h.
 
 /// `fb_info(info)` (syscall 44): fill `struct prism_fb_info` (nine u32
-/// words, usr/mlibc/prism_raw.h) with the console surface's geometry and
+/// words, apps/include/prism_raw.h) with the console surface's geometry and
 /// pixel format.  `-ENODEV` when there is nothing to draw on (the VGA
 /// text mode of a BIOS boot), `-EFAULT` for a buffer that will not take
 /// the answer.
