@@ -137,6 +137,18 @@ impl Surface {
         ch(r, self.r_shift, self.r_bits) | ch(g, self.g_shift, self.g_bits) | ch(b, self.b_shift, self.b_bits)
     }
 
+    /// The (shift, bits) pair of each colour channel, in r, g, b order --
+    /// what a renderer outside the kernel needs to pack its own pixels
+    /// (`fb_info`, phase 3.3).  `rgb()` above is the kernel-side packing
+    /// of the same format.
+    pub fn rgb_bits(&self) -> [(u8, u8); 3] {
+        [
+            (self.r_shift, self.r_bits),
+            (self.g_shift, self.g_bits),
+            (self.b_shift, self.b_bits),
+        ]
+    }
+
     // -------------------------------------------------------- dirty rect
 
     /// Remember that [x0, x1) x [y0, y1) must be copied to the screen.
@@ -192,6 +204,34 @@ impl Surface {
         if x >= 0 && y >= 0 {
             self.mark(x as usize, y as usize, x as usize + 1, y as usize + 1);
         }
+    }
+
+    /// Copy a run of pixels -- already packed in the framebuffer's own
+    /// format, by the caller -- into row `y` starting at column `x`,
+    /// clipped on every side.  `fb_blit` (phase 3.3) draws a user-space
+    /// renderer's rectangle through this, a line at a time; one `mark()`
+    /// covers the run.
+    pub fn blit_row(&mut self, x: i32, y: i32, px: &[u32]) {
+        if px.is_empty() || y < 0 || y as usize >= self.h {
+            return;
+        }
+        let skip = (-x).max(0) as usize; // leading pixels off the left edge
+        if skip >= px.len() {
+            return;
+        }
+        let x0 = (x + skip as i32).max(0) as usize;
+        if x0 >= self.w {
+            return; // the whole run is past the right edge
+        }
+        let n = (px.len() - skip).min(self.w - x0);
+        // SAFETY: the destination run was clipped to the surface above.
+        unsafe {
+            let dst = self.base.add(y as usize * self.pitch + x0 * 4) as *mut u32;
+            for i in 0..n {
+                dst.add(i).write(px[skip + i]);
+            }
+        }
+        self.mark(x0, y as usize, x0 + n, y as usize + 1);
     }
 
     /// Fill a clipped rectangle without touching the dirty rectangle.

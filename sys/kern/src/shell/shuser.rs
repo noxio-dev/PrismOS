@@ -383,6 +383,7 @@ pub(super) fn cmd_exec(args: &mut Args) {
 
     // Split the command line into one argv per program ("--" separates).
     let mut prio = PRIO_DEFAULT;
+    let mut timeout = 0u64; // watchdog CPU budget, ticks (0 = the 3 s default)
     let mut cmds: Vec<Vec<&str>> = Vec::new();
     let mut cur: Vec<&str> = Vec::new();
     let mut first = true;
@@ -392,6 +393,16 @@ pub(super) fn cmd_exec(args: &mut Args) {
                 Some(v) if v < PRIO_LEVELS as u64 => prio = v as u8,
                 _ => {
                     crate::kprintln!("exec: -p needs a priority 0..{}", PRIO_LEVELS - 1);
+                    return;
+                }
+            }
+            continue;
+        }
+        if first && t == "-t" {
+            match args.next().and_then(parse_u64) {
+                Some(v) => timeout = v,
+                None => {
+                    crate::kprintln!("exec: -t needs a CPU budget in ticks (100 Hz; 0 = the 3 s default)");
                     return;
                 }
             }
@@ -410,8 +421,9 @@ pub(super) fn cmd_exec(args: &mut Args) {
         cmds.push(cur);
     }
     if cmds.is_empty() {
-        crate::kprintln!("usage: exec [-p prio] <program> [args...] [-- <program> [args...]]...");
-        crate::kprintln!("       a bare name is looked up in /bin; try 'ls /bin'");
+        crate::kprintln!("usage: exec [-p prio] [-t ticks] <program> [args...] [-- <program> [args...]]...");
+        crate::kprintln!("       a bare name is looked up in /bin; try 'ls /bin'; -t raises the");
+        crate::kprintln!("       watchdog budget (ticks at 100 Hz, only CPU time is charged)");
         return;
     }
 
@@ -429,7 +441,7 @@ pub(super) fn cmd_exec(args: &mut Args) {
         let argv: Vec<Vec<u8>> = c.iter().map(|a| a.as_bytes().to_vec()).collect();
         let spawned = elf::load_path(&path, &argv, &env)
             .map_err(|e| e.what())
-            .and_then(|l| process::spawn_loaded(elf::base_name(&path), l, prio));
+            .and_then(|l| process::spawn_loaded(elf::base_name(&path), l, prio, timeout));
         match spawned {
             Ok(pid) => pids.push(pid),
             Err(e) => {

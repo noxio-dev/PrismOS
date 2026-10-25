@@ -69,7 +69,7 @@ scname() {
         28) echo getdents;; 29) echo ioctl;; 30) echo unlink;; 31) echo mkdir;;
         32) echo rmdir;; 33) echo rename;; 34) echo link;; 35) echo uname;;
         36) echo arch_prctl;; 38) echo sigaction;; 40) echo mprotect;;
-        43) echo clock_gettime;;
+        43) echo clock_gettime;; 44) echo fb_info;; 45) echo fb_blit;;
         *) echo "syscall $1";; esac
 }
 
@@ -409,9 +409,11 @@ fd)     SYSCALLS="1 13 14 15 16 17 18 8 9 7 38 5"
         SYMBOLS="write read open close fork __mlibc_signal_restore" ;;
 posix)  SYSCALLS="1 13 14 15 16 8 9 10 7 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 38"
         SYMBOLS="write stat fstat mmap opendir readdir uname tcgetattr __mlibc_signal_restore" ;;
+cube)   SYSCALLS="1 3 5 13 14 15 22 44 45"
+        SYMBOLS="write read open close mmap snprintf strlen" ;;
 "")     SYSCALLS="1 12 43"
         SYMBOLS="write __mlibc_signal_restore clock_gettime" ;;
-*)      echo "verify: unknown program '$PROG' (hello | fork | fd | posix)" >&2; exit 2 ;;
+*)      echo "verify: unknown program '$PROG' (hello | fork | fd | posix | cube)" >&2; exit 2 ;;
 esac
 
 for n in $SYSCALLS; do

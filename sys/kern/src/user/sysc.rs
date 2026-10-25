@@ -575,3 +575,131 @@ pub fn sys_clock_gettime(clk: u64, ts: u64) -> i64 {
     }
     0
 }
+
+// ---------------------------------------------------------- framebuffer
+
+/// The two framebuffer calls (phase 3.3): the vocabulary a user-space
+/// renderer needs, and nothing more.  `fb_info` hands out the geometry and
+/// the pixel format of the console surface; `fb_blit` copies a rectangle
+/// of caller-packed pixels onto it.  That is deliberately the whole
+/// graphics API -- no kernel font, no kernel polygon filler: the program
+/// keeps its own back buffer (its malloc, its stride), draws with its own
+/// code and sends only the dirty rectangle over, exactly like the kernel
+/// cube draws into the surface's back buffer and presents its bounding
+/// box.  A shared `/dev/fb` mmap would be the POSIX-shaped answer, but
+/// there is no page cache to map through yet (mmap of a file is private
+/// and filled); the blit is the honest primitive until then.
+///
+/// Both calls are PrismOS-only -- POSIX has no word for them -- so the
+/// mlibc userland reaches them raw, through usr/mlibc/prism_raw.h.
+
+/// `fb_info(info)` (syscall 44): fill `struct prism_fb_info` (nine u32
+/// words, usr/mlibc/prism_raw.h) with the console surface's geometry and
+/// pixel format.  `-ENODEV` when there is nothing to draw on (the VGA
+/// text mode of a BIOS boot), `-EFAULT` for a buffer that will not take
+/// the answer.
+pub fn sys_fb_info(ptr: u64) -> i64 {
+    let Some(words) = crate::console::with_surface(|s| {
+        let [(rs, rb), (gs, gb), (bs, bb)] = s.rgb_bits();
+        [
+            s.w as u32,
+            s.h as u32,
+            32, // bpp: the only format Surface::new accepts
+            rs as u32,
+            rb as u32,
+            gs as u32,
+            gb as u32,
+            bs as u32,
+            bb as u32,
+        ]
+    }) else {
+        return -ENODEV;
+    };
+    let mut b = [0u8; 9 * 4];
+    for (i, w) in words.iter().enumerate() {
+        b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    let Some(cur) = process::current() else { return -EFAULT };
+    let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return -EFAULT };
+    if !aspace.ensure_writable(ptr) || !aspace.write(ptr, &b, false) {
+        return -EFAULT;
+    }
+    0
+}
+
+/// Largest blit we accept, per side.  The surface itself is at most 48 MiB
+/// (gfx.rs), and a caller cannot hold a bigger source than MAX_MAP; this
+/// bound just keeps the arithmetic (below) small and honest.
+const FB_BLIT_MAX: u64 = 16_384;
+/// Widest source stride, bytes: a 16384-pixel row, 4 bytes each.
+const FB_BLIT_STRIDE_MAX: u64 = FB_BLIT_MAX * 4;
+/// Pixels copied per `aspace.read` chunk: 4 KiB, a tame stack footprint.
+const FB_BLIT_CHUNK: usize = 1024;
+
+/// `fb_blit(src, w, h, stride, x, y)` (syscall 45, six arguments like
+/// mmap): copy a `w` x `h` rectangle of pixels -- already packed in the
+/// framebuffer's own format, `stride` bytes per row -- from the caller's
+/// memory onto the console surface at (x, y), clipped on every side.
+/// Rows already delivered stay delivered: a source page that turns bad
+/// mid-rectangle answers -EFAULT after blitting the good ones, so a
+/// renderer that only ever blits its own buffer sees all-or-nothing.
+/// 0 on success (an entirely off-screen rectangle included: that is a
+/// no-op, not an error).
+pub fn sys_fb_blit(a: [u64; 6]) -> i64 {
+    let (src, w, h, stride, x, y) = (a[0], a[1], a[2], a[3], a[4], a[5]);
+    if w == 0 || h == 0 || w > FB_BLIT_MAX || h > FB_BLIT_MAX {
+        return -EINVAL;
+    }
+    if stride & 3 != 0 || stride < w * 4 || stride > FB_BLIT_STRIDE_MAX {
+        return -EINVAL; // not a plausible pixel row
+    }
+    let Some(cur) = process::current() else { return -EFAULT };
+    let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return -EFAULT };
+
+    // Clip the destination rectangle against the screen, trimming the
+    // source to match: columns cut off the left shift the source's start,
+    // the right and bottom edges just drop what falls past them.  The
+    // coordinates are clamped to the blit bound first -- a wild x far off
+    // screen clips to the same no-op without any arithmetic to go wrong.
+    crate::console::with_surface(|s| {
+        let (sw, sh) = (s.w as i64, s.h as i64);
+        let lim = FB_BLIT_MAX as i64;
+        let (x, y) = (x as i64, y as i64); // the caller's bit pattern
+        let (x, y) = (x.clamp(-lim, lim), y.clamp(-lim, lim));
+        let (mut sx, mut sy) = (0u64, 0u64); // source origin, pixels
+        let (mut dx, mut dy) = (x, y); // destination origin
+        if dx < 0 {
+            sx = (-dx) as u64;
+            dx = 0;
+        }
+        if dy < 0 {
+            sy = (-dy) as u64;
+            dy = 0;
+        }
+        let ww = w.saturating_sub(sx).min((sw - dx).max(0) as u64); // columns on screen
+        let hh = h.saturating_sub(sy).min((sh - dy).max(0) as u64); // rows on screen
+        if ww == 0 || hh == 0 {
+            return 0; // nothing on screen: a no-op, not an error
+        }
+        let mut row = [0u32; FB_BLIT_CHUNK]; // 4-byte aligned by its type
+        // SAFETY: `row` is u32-aligned by construction; the byte view
+        // spans exactly the array, and outlives the read below.
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(row.as_mut_ptr().cast::<u8>(), row.len() * 4)
+        };
+        for r in 0..hh {
+            let base = src + (sy + r) * stride + sx * 4;
+            let mut done = 0u64; // columns delivered of this row
+            while done < ww {
+                let n = (ww - done).min(FB_BLIT_CHUNK as u64) as usize;
+                if !aspace.read(base + done * 4, &mut bytes[..n * 4]) {
+                    return -EFAULT; // the good rows above are already on screen
+                }
+                s.blit_row((dx + done as i64) as i32, (dy + r as i64) as i32, &row[..n]);
+                done += n as u64;
+            }
+        }
+        0
+    })
+    .unwrap_or(-ENODEV) // no surface: the same answer fb_info gives
+}

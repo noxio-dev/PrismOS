@@ -225,14 +225,15 @@ do_hello() {
 }
 
 # ---- stage: progs ------------------------------------------------------------
-# The step-4 port: the four /bin programs off the mini libc, onto mlibc
+# The step-4 port: the five /bin programs off the mini libc, onto mlibc
 # (usr/mlibc).  Same discipline as the step-3 proof -- the sysroot's headers
 # carried explicitly, freestanding compile, the loader's link contract -- only
 # the sources change, and they pull the whole `ansi` + `posix` surface in:
 # stdio buffered on the descriptor table, fork / waitpid / kill, opendir,
-# tcgetattr, uname, ...  The four PrismOS-only calls (uptime_ms, yield, the
-# millisecond sleep, brk) stay raw, through usr/mlibc/prism_raw.h -- the only
-# place the `syscall` instruction appears outside libc.a.
+# tcgetattr, uname, ...  The PrismOS-only calls (uptime_ms, yield, the
+# millisecond sleep, brk, and the cube's framebuffer pair) stay raw, through
+# usr/mlibc/prism_raw.h -- the only place the `syscall` instruction appears
+# outside libc.a.
 do_prog() { # <name>
         name=$1
         CC=$PREFIX/bin/x86_64-prismos-gcc
@@ -271,7 +272,7 @@ do_prog() { # <name>
 }
 
 do_progs() {
-        for p in hello fork fd posix; do
+        for p in hello fork fd posix cube; do
                 do_prog "$p"
         done
 }
@@ -281,7 +282,7 @@ do_progs() {
 # with its own syscall and symbol set.  (The step-3 proof of `stage hello` is
 # verified with the no-program call: verify.sh <elf> <sysroot>.)
 do_verify() {
-        for p in hello fork fd posix; do
+        for p in hello fork fd posix cube; do
                 echo "--- $p"
                 sh "$REPO/ports/toolchain/verify.sh" "$REPO/build/usr/bin-mlibc/$p" "$SYSROOT" "$p"
         done
@@ -294,7 +295,7 @@ case "$STAGE" in
         headers)  do_headers ;;
         library)  do_library ;;
         progs)    do_progs ;;
-        prog)     [ -n "$PROG" ] || { echo "stage prog: name required (hello | fork | fd | posix)" >&2; exit 2; }
+        prog)     [ -n "$PROG" ] || { echo "stage prog: name required (hello | fork | fd | posix | cube)" >&2; exit 2; }
                   do_prog "$PROG" ;;
         hello)    do_hello ;;
         verify)   do_verify ;;

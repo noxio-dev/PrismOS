@@ -16,3 +16,43 @@ index ce5a195..ca785e1 100644
  else
  	error('No sysdeps defined for OS: ' + host_machine.system())
  endif
+diff --git a/options/rtld/generic/linker.cpp b/options/rtld/generic/linker.cpp
+index cf503ee0..bb74f3e6 100644
+--- a/options/rtld/generic/linker.cpp
++++ b/options/rtld/generic/linker.cpp
+@@ -543,6 +543,17 @@ void ObjectRepository::_fetchFromPhdrs(SharedObject *object, void *phdr_pointer,
+ 	// Note: the entry pointer is absolute and not relative to the base address.
+ 	object->entry = entry_pointer;
+ 
++	// PrismOS (phase 3.3): static PIEs linked `--no-dynamic-linker` carry
++	// no PT_PHDR (binutils only emits it beside a PT_INTERP), so the loop
++	// below would leave baseAddress at 0 and every structure the Loader
++	// touches would land on the raw, unrelocated VMAs -- the kernel's low
++	// supervisor identity map answers the first read with a page fault.
++	// For those binaries the ELF header IS the base: the link contract
++	// puts the first PT_LOAD at vaddr 0, and __ehdr_start is exactly
++	// where the kernel mapped it.
++	bool seenPhdr = false;
++	extern __attribute__((visibility("hidden"))) char __ehdr_start[];
++
+ 	frg::optional<ptrdiff_t> dynamic_offset;
+ 	frg::optional<ptrdiff_t> tls_offset;
+ 
+@@ -553,6 +564,7 @@ void ObjectRepository::_fetchFromPhdrs(SharedObject *object, void *phdr_pointer,
+ 		case PT_PHDR:
+ 			// Determine the executable's base address (in the PIE case) by comparing
+ 			// the PHDR segment's load address against it's address in the ELF file.
++			seenPhdr = true;
+ 			object->baseAddress = reinterpret_cast<uintptr_t>(phdr_pointer) - phdr->p_vaddr;
+ 			if(rtldConfig.debugVerbose)
+ 				mlibc::infoLogger() << "rtld: Executable is loaded at "
+@@ -579,6 +591,9 @@ void ObjectRepository::_fetchFromPhdrs(SharedObject *object, void *phdr_pointer,
+ 		}
+ 	}
+ 
++	if(!seenPhdr)
++		object->baseAddress = reinterpret_cast<uintptr_t>(&__ehdr_start);
++
+ 	if(dynamic_offset)
+ 		object->dynamic = (elf_dyn *)(object->baseAddress + *dynamic_offset);
+ 	if(tls_offset)

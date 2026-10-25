@@ -39,6 +39,13 @@
 //                                      (select's 4th and 5th ride in
 //                                      r10 / r8)
 //
+// Phase 3.3 (the user-space framebuffer, for the mlibc cube port):
+//    44 fb_info(struct prism_fb_info *)  the screen's geometry + format
+//    45 fb_blit(src, w, h, stride, x, y) copy caller-packed pixels onto
+//                                      the console surface -- six arguments
+//                                      (r10 / r8 / r9 carry 4..6, like
+//                                      mmap)
+//
 // `exit` never returns to the caller.  `yield` and `sleep` switch to another
 // process and come back here only when the process is scheduled again (the
 // trap frame stayed on its kernel stack).  `yield` only hands the CPU to a
@@ -271,6 +278,9 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         41 => fd::sys_poll(a0, a1, a2),
         42 => fd::sys_select(a0, a1, a2, frame.r10, frame.r8),
         43 => sysc::sys_clock_gettime(a0, a1),
+        // ---- phase 3.3: the user-space framebuffer ---------------------
+        44 => sysc::sys_fb_info(a0),
+        45 => sysc::sys_fb_blit([a0, a1, a2, frame.r10, frame.r8, frame.r9]),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

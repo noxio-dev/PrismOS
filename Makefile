@@ -186,10 +186,12 @@ usr: $(USR_BINS)
 #                     objects in the x86_64-prismos sysroot (fast path; no
 #                     toolchain build -- ports/toolchain/build.sh replaces the
 #                     wrappers with the real cross tools under the same names)
-#   make usr-mlibc    build/usr/bin-mlibc/{hello,fork,fd,posix}, the step-4
-#                     ports, each one checked by verify.sh with its own
+#   make usr-mlibc    build/usr/bin-mlibc/{hello,fork,fd,posix,cube}, the
+#                     step-4 ports, each one checked by verify.sh with its own
 #                     syscall and symbol set (the step-3 proof remains
-#                     `bootstrap.sh stage hello`)
+#                     `bootstrap.sh stage hello`); cube (phase 3.3) is the
+#                     kernel's spinning cube as a process -- the framebuffer
+#                     pair (fb_info 44 / fb_blit 45) it draws through
 #   make usr-mlibc-dyn the phase's last step: build/usr/bin-mlibc-dyn/hello,
 #                     the same program linked dynamically -- PT_INTERP
 #                     /lib/ld.so, DT_NEEDED libc.so, BIND_NOW -- against
@@ -205,12 +207,12 @@ SYSROOT    := $(TOOLCHAIN)/x86_64-prismos
 
 .PHONY: mlibc usr-mlibc usr-mlibc-dyn
 mlibc: $B/toolchain/usr/.stamp
-$B/toolchain/usr/.stamp: ports/toolchain/bootstrap.sh ports/toolchain/cross.txt ports/mlibc/README.md
+$B/toolchain/usr/.stamp: ports/toolchain/bootstrap.sh ports/toolchain/cross.txt ports/mlibc/README.md ports/mlibc/mlibc-prismos.patch
 	@mkdir -p $(@D)
 	sh ports/toolchain/bootstrap.sh --mlibc $(MLIBC_SRC) --prefix $(abspath $(TOOLCHAIN))
 	@touch $@
 
-USR_MLIBC_PROGS := hello fork fd posix
+USR_MLIBC_PROGS := hello fork fd posix cube
 USR_MLIBC_BINS  := $(addprefix $B/usr/bin-mlibc/,$(USR_MLIBC_PROGS))
 
 usr-mlibc: $(USR_MLIBC_BINS)
@@ -263,8 +265,12 @@ root: $B/root.stamp
 # from /lib (the first of its default search paths), plus the dynamically
 # linked hello as /bin/hello-dyn.  Stripped: the kernel reads whole files
 # (MAX_ELF_FILE is 4 MiB) and the debug sections buy it nothing.
+# Phase 3.3: the mlibc cube installs as /bin/cube -- the one mlibc static
+# the image carries, stripped like the /lib duo (same 4 MiB whole-file
+# read, same useless debug sections), so 'exec cube' (or 'exec -t 100000
+# cube' for a long session) spins the user-space cube.
 $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
-	$(USR_BINS) $(USR_MLIBC_DYN)
+	$(USR_BINS) $(USR_MLIBC_DYN) $B/usr/bin-mlibc/cube
 	rm -rf $B/root
 	mkdir -p $B/root/boot/lua $B/root/boot/defaults $B/root/boot/kernel \
                  $B/root/bin $B/root/dev $B/root/etc $B/root/lib $B/root/usr
@@ -274,6 +280,11 @@ $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
 	cp $B/kernel $B/root/boot/kernel/kernel
 	cp $(USR_BINS) $B/root/bin/
 	cp $(USR_MLIBC_DYN) $B/root/bin/hello-dyn
+	# Stripped like the /lib duo below: the mlibc meson build's debug
+	# sections would push the static past the kernel's whole-file read
+	# (MAX_ELF_FILE is 4 MiB) and buy the loader nothing.
+	$(TOOLCHAIN)/bin/x86_64-prismos-strip --strip-all \
+		-o $B/root/bin/cube $B/usr/bin-mlibc/cube
 	printf '#!/bin/sh\necho "not an ELF file"\n' > $B/root/bin/notelf
 	chmod 755 $B/root/bin/*
 	$(TOOLCHAIN)/bin/x86_64-prismos-strip --strip-all \

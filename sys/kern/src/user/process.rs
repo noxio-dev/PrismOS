@@ -409,10 +409,14 @@ pub fn spawn_user_prio(prog: &Prog, prio: u8) -> Result<u64, &'static str> {
 
 /// Spawn a process from a loaded ELF image (phase 2.4).  The break starts
 /// right after the last segment (phase 3.1), the cwd is the shell's.
-pub fn spawn_loaded(name: String, prog: Loaded, prio: u8) -> Result<u64, &'static str> {
+/// `timeout_ticks` is the watchdog CPU budget (0 = the 3 s default): the
+/// shell's `exec -t` (phase 3.3) raises it for the long-running programs
+/// -- the user-space cube turns its wheels for hours on a screen's worth
+/// of per-frame rendering.
+pub fn spawn_loaded(name: String, prog: Loaded, prio: u8, timeout_ticks: u64) -> Result<u64, &'static str> {
     let brk = prog.image_end;
     let cwd = String::from(crate::fs::fsys::cwd());
-    spawn_common(name, Some(prog.aspace), Entry::User, (prog.entry, prog.rsp), 0, prio, 0, cwd, brk, brk)
+    spawn_common(name, Some(prog.aspace), Entry::User, (prog.entry, prog.rsp), timeout_ticks, prio, 0, cwd, brk, brk)
 }
 
 /// Spawn a kernel thread (runs `f` in ring 0 on its own kernel stack).
