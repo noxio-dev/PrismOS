@@ -59,10 +59,13 @@ static mut TABLE: Table = Table { slots: core::ptr::null_mut(), cap: 0, used: 0,
 fn alloc_slots(cap: usize) -> *mut Entry {
     let Ok(layout) = core::alloc::Layout::array::<Entry>(cap) else { return core::ptr::null_mut() };
     // SAFETY: the layout is non-zero (cap is a power of two >= 512); a fresh
-    // allocation, zeroed so every slot reads "empty".
+    // allocation, zeroed by `alloc_zeroed` so every slot reads "empty".  A
+    // null result (out of memory) is returned as is, never written through.
     unsafe {
         let p = alloc::alloc::alloc_zeroed(layout);
-        core::ptr::write_bytes(p, 0, core::mem::size_of::<Entry>() * cap);
+        if p.is_null() {
+            return core::ptr::null_mut();
+        }
         p.cast::<Entry>()
     }
 }

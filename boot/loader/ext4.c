@@ -405,7 +405,8 @@ static int dir_walk(const struct inode *dir, dent_cb cb, void *arg)
                 const uint8_t *de = buf + off;
                 uint16_t rlen = rd16(de + 4);
                 uint8_t nlen = de[6], ftype = de[7];
-                if (rlen < 8 || (rlen & 3) || 8 + (uint32_t)nlen > rlen)
+                if (rlen < 8 || (rlen & 3) || 8 + (uint32_t)nlen > rlen ||
+                    rlen > e4.bs - off)         /* entry must stay inside the block */
                     goto out;                   /* corrupt entry: stop here */
                 off += rlen;
                 uint32_t ino = rd32(de);

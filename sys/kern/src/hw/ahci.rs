@@ -318,10 +318,12 @@ unsafe fn build_cmd(
     t.add(10).write((lba >> 40) as u8);
     if ncq {
         // FPDMA: the sector count travels in the FEATURES field (SATA
-        // queued commands) and the queue tag in the auxiliary dword.
+        // queued commands) and the queue tag in the Count field: byte 12,
+        // bits 7:3 (the tag shifted left by three), per the SATA spec.
         t.add(3).write(count as u8);
         t.add(0x0B).write((count >> 8) as u8);
-        t.add(0x10).write(slot); // aux: tag (bits 0-5)
+        t.add(12).write((slot & 0x1F) << 3);
+        t.add(13).write(0);
     } else {
         t.add(12).write(count as u8);
         t.add(13).write((count >> 8) as u8);
@@ -512,25 +514,20 @@ fn setup_disk(port: u8, idx: usize) -> Option<Disk> {
     };
     // Bounce memory: NCQ_DEPTH chunks of BOUNCE_PAGES (plus the first
     // chunk doubles as the slot-0 buffer for IDENTIFY/FLUSH).
+    // The PRDs address the bounce area as base + 4096 * n, so it MUST be one
+    // physically contiguous run (pages taken one by one are scattered on a
+    // fragmented machine and the DMA would hit foreign pages).  Try the full
+    // NCQ area first, then a single non-queued chunk.
     let mut got = 0usize;
     let mut bounce = 0u64;
-    for _ in 0..NCQ_DEPTH * BOUNCE_PAGES {
-        match crate::mem::pmm::alloc_page_low() {
-            Some(p) => {
-                if got == 0 {
-                    bounce = p;
-                }
-                got += 1;
-            }
-            None => break,
+    for n in [NCQ_DEPTH * BOUNCE_PAGES, BOUNCE_PAGES] {
+        if let Some(p) = crate::mem::pmm::alloc_pages_low_contig(n) {
+            bounce = p;
+            got = n;
+            break;
         }
     }
     if got < BOUNCE_PAGES {
-        if got > 0 {
-            for i in 0..got {
-                crate::mem::pmm::free_page(bounce + 4096 * i as u64);
-            }
-        }
         for i in 0..NCQ_DEPTH + 1 {
             crate::mem::pmm::free_page(page + 4096 * i as u64);
         }

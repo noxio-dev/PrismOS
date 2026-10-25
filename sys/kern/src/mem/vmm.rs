@@ -1097,12 +1097,14 @@ impl AddressSpace {
     }
 
     /// True when no page of `[virt, virt + len)` is mapped -- the free-gap
-    /// probe behind `mmap`'s first-fit placement (phase 3.1).
+    /// probe behind `mmap`'s first-fit placement (phase 3.1).  A `PROT_NONE`
+    /// reservation (present, but without U/S) counts as mapped: `translate`
+    /// only sees user-accessible pages, so the PTE itself is checked.
     pub fn range_free(&self, virt: u64, len: u64) -> bool {
         let Some(end) = virt.checked_add(len) else { return false };
         let mut v = virt & !(PAGE - 1);
         while v < end {
-            if self.translate(v).is_some() {
+            if self.pte_slot(v).is_some() || self.translate(v).is_some() {
                 return false;
             }
             v += PAGE;

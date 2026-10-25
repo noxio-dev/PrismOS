@@ -303,9 +303,12 @@ impl Journal {
             // Journal full: flush the pending blocks to their final place
             // (the caller's cache write-back) and restart the log.
             fs.checkpoint()?;
-            self.start = 0;
-            self.head = 1;
+            // `fs.jrn` is taken (we are `self`), so fs.checkpoint() could not
+            // touch the on-disk journal superblock: release the log here,
+            // persistently, before any new transaction overwrites it.
+            self.checkpoint_done(fs)?;
         }
+        let saved = (self.start, self.first_seq, self.next_seq, self.head);
         let txn_start = if self.head == 0 { 1 } else { self.head };
         let seq = self.next_seq;
         let mut pos = txn_start;
@@ -383,8 +386,13 @@ impl Journal {
         }
         self.next_seq = seq + 1;
         self.head = step(pos, self.len);
-        self.write_sb(fs)?;
-        fs.dev.flush().map_err(FsError::from)
+        // The in-memory state only advances when the superblock write
+        // really happened; otherwise it must keep matching the disk.
+        let published = self.write_sb(fs).and_then(|_| fs.dev.flush().map_err(FsError::from));
+        if published.is_err() {
+            (self.start, self.first_seq, self.next_seq, self.head) = saved;
+        }
+        published
     }
 }
 
