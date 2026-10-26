@@ -262,9 +262,17 @@ $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
 	$(HELLO_DYN) $B/apps.stamp
 	rm -rf $B/root
 	mkdir -p $B/root/boot/lua $B/root/boot/defaults $B/root/boot/kernel \
-                 $B/root/dev $B/root/etc $B/root/tmp \
+                 $B/root/dev $B/root/etc $B/root/proc $B/root/tmp \
                  $B/root/usr/bin $B/root/usr/lib
 	chmod 1777 $B/root/tmp
+	# /etc for the session (phase 3.3): passwd + group -- the
+	# identity lookups a libc's getpwnam serves, root only -- and
+	# the motd init's shell greets with.  /proc is here as well:
+	# the procfs the kernel mounts on it needs the directory.
+	printf 'root:x:0:0:root:/:/usr/bin/sh\n' > $B/root/etc/passwd
+	printf 'root:x:0:\n' > $B/root/etc/group
+	printf 'Welcome to PrismOS (init + tty + procfs, phase 3.3).\n' \
+		> $B/root/etc/motd
 	cp boot/lua/*.lua $B/root/boot/lua/
 	cp boot/conf/defaults-loader.conf $B/root/boot/defaults/loader.conf
 	cp boot/conf/loader.conf $B/root/boot/loader.conf

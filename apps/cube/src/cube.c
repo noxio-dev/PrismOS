@@ -49,6 +49,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include "prism_raw.h"
@@ -457,6 +458,33 @@ static void draw_cube(int cx, int cy, int d, int ax, int ay, int az,
 
 static int kbd = -1;
 
+/* The tty's raw mode while the demo owns the console (phase 3.3): the
+ * line discipline would otherwise assemble lines and echo the controls
+ * back; the demo wants its bytes as they come.  Restored on the way out
+ * (the kernel shell's reader and the userland shell both sit on the same
+ * terminal). */
+static struct termios cube_tio;
+static int cube_tio_saved;
+
+static void tty_raw(void)
+{
+        if (tcgetattr(kbd, &cube_tio) == 0) {
+                struct termios t = cube_tio;
+
+                t.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
+                tcsetattr(kbd, TCSANOW, &t);
+                cube_tio_saved = 1;
+        }
+}
+
+static void tty_restore(void)
+{
+        if (cube_tio_saved) {
+                tcsetattr(kbd, TCSANOW, &cube_tio);
+                cube_tio_saved = 0;
+        }
+}
+
 /* The keys of the command line itself may still be in the queue; the
  * kernel original drained pop_char() the same way before starting. */
 static void kbd_drain(void)
@@ -550,6 +578,7 @@ static int run(void)
                 printf("cube: cannot open /dev/console (%s)\n", strerror(errno));
                 return 1;
         }
+        tty_raw();
         kbd_drain();
 
         F_BG = rgb_pack(8, 10, 18);
@@ -628,6 +657,7 @@ static int run(void)
                         dirty_reset();
                         dirty_add(0, 0, CW, CH);
                         (void)blit_dirty();
+                        tty_restore();
                         close(kbd);
                         return 0;
                 }
@@ -691,6 +721,7 @@ static int run(void)
                 if (blit_dirty() < 0) {
 blit_failed:
                         printf("cube: fb_blit failed\n");
+                        tty_restore();
                         close(kbd);
                         return 1;
                 }

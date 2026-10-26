@@ -43,12 +43,14 @@
 #include <stdint.h>
 
 enum {
-	PRISM_SYS_UPTIME_MS = 3,
-	PRISM_SYS_YIELD = 4,
-	PRISM_SYS_SLEEP = 5,
-	PRISM_SYS_BRK = 21,
-	PRISM_SYS_FB_INFO = 44,
-	PRISM_SYS_FB_BLIT = 45,
+        PRISM_SYS_UPTIME_MS = 3,
+        PRISM_SYS_YIELD = 4,
+        PRISM_SYS_SLEEP = 5,
+        PRISM_SYS_BRK = 21,
+        PRISM_SYS_IOCTL = 29,
+        PRISM_SYS_FB_INFO = 44,
+        PRISM_SYS_FB_BLIT = 45,
+        PRISM_SYS_STATFS = 48,
 };
 
 /* errno values the fb pair answers with (the kernel's own numbering). */
@@ -58,45 +60,45 @@ enum {
 
 static inline long prism_raw3(long n, long a, long b, long c)
 {
-	long r;
-	__asm__ volatile("syscall"
-	    : "=a"(r)
-	    : "a"(n), "D"(a), "S"(b), "d"(c)
-	    : "rcx", "r11", "memory");
-	return r;
+        long r;
+        __asm__ volatile("syscall"
+            : "=a"(r)
+            : "a"(n), "D"(a), "S"(b), "d"(c)
+            : "rcx", "r11", "memory");
+        return r;
 }
 
 /* Six-argument call (fb_blit): r10 / r8 / r9 carry arguments 4..6, the
  * same register order the kernel's dispatcher reads (mmap, futex ...). */
 static inline long prism_raw6(long n, long a, long b, long c, long d, long e, long f)
 {
-	long r;
-	register long r10 __asm__("r10") = d;
-	register long r8 __asm__("r8") = e;
-	register long r9 __asm__("r9") = f;
-	__asm__ volatile("syscall"
-	    : "=a"(r)
-	    : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10), "r"(r8), "r"(r9)
-	    : "rcx", "r11", "memory");
-	return r;
+        long r;
+        register long r10 __asm__("r10") = d;
+        register long r8 __asm__("r8") = e;
+        register long r9 __asm__("r9") = f;
+        __asm__ volatile("syscall"
+            : "=a"(r)
+            : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10), "r"(r8), "r"(r9)
+            : "rcx", "r11", "memory");
+        return r;
 }
 
 /* The milliseconds since boot. */
 static inline long prism_uptime_ms(void)
 {
-	return prism_raw3(PRISM_SYS_UPTIME_MS, 0, 0, 0);
+        return prism_raw3(PRISM_SYS_UPTIME_MS, 0, 0, 0);
 }
 
 /* Hand the CPU to the next process. */
 static inline void prism_yield(void)
 {
-	prism_raw3(PRISM_SYS_YIELD, 0, 0, 0);
+        prism_raw3(PRISM_SYS_YIELD, 0, 0, 0);
 }
 
 /* Sleep for `ms` milliseconds (the kernel bounds it at 10 s). */
 static inline void prism_sleep_ms(long ms)
 {
-	prism_raw3(PRISM_SYS_SLEEP, ms, 0, 0);
+        prism_raw3(PRISM_SYS_SLEEP, ms, 0, 0);
 }
 
 /*
@@ -107,7 +109,7 @@ static inline void prism_sleep_ms(long ms)
  */
 static inline unsigned long prism_brk(unsigned long addr)
 {
-	return (unsigned long)prism_raw3(PRISM_SYS_BRK, (long)addr, 0, 0);
+        return (unsigned long)prism_raw3(PRISM_SYS_BRK, (long)addr, 0, 0);
 }
 
 /*
@@ -120,17 +122,17 @@ static inline unsigned long prism_brk(unsigned long addr)
  *   ch(v, shift, bits) = (v >> (8 - bits)) << shift   (bits 0 or > 8: 0)
  */
 struct prism_fb_info {
-	uint32_t w, h;		    /* pixels */
-	uint32_t bpp;		    /* always 32 today */
-	uint32_t r_shift, r_bits;
-	uint32_t g_shift, g_bits;
-	uint32_t b_shift, b_bits;
+        uint32_t w, h;              /* pixels */
+        uint32_t bpp;               /* always 32 today */
+        uint32_t r_shift, r_bits;
+        uint32_t g_shift, g_bits;
+        uint32_t b_shift, b_bits;
 };
 
 /* Fill *info: 0, or the kernel's negative errno (-ENODEV on VGA text). */
 static inline long prism_fb_info(struct prism_fb_info *info)
 {
-	return prism_raw3(PRISM_SYS_FB_INFO, (long)info, 0, 0);
+        return prism_raw3(PRISM_SYS_FB_INFO, (long)info, 0, 0);
 }
 
 /*
@@ -140,10 +142,50 @@ static inline long prism_fb_info(struct prism_fb_info *info)
  * is a no-op, not an error), or the kernel's negative errno.
  */
 static inline long prism_fb_blit(const uint32_t *src, uint32_t w, uint32_t h,
-	uint32_t stride, int32_t x, int32_t y)
+        uint32_t stride, int32_t x, int32_t y)
 {
-	return prism_raw6(PRISM_SYS_FB_BLIT, (long)src, (long)w, (long)h,
-	    (long)stride, (long)x, (long)y);
+        return prism_raw6(PRISM_SYS_FB_BLIT, (long)src, (long)w, (long)h,
+            (long)stride, (long)x, (long)y);
+}
+
+/*
+ * statfs(48) (phase 3.3): the statistics of the mount `path` sits on,
+ * in the x86-64 Linux struct statfs layout the kernel fills (user/fd.rs
+ * -- f_type, f_bsize, the block / inode counts, f_fsid, f_namelen,
+ * f_frsize, f_flags, spare).  POSIX has the call but mlibc's tag for
+ * it lives behind the linux option and its kernel headers, so the
+ * shell's `df` speaks it raw here -- until busybox brings that option.
+ */
+struct prism_statfs {
+        uint64_t f_type;
+        uint64_t f_bsize;
+        uint64_t f_blocks;
+        uint64_t f_bfree;
+        uint64_t f_bavail;
+        uint64_t f_files;
+        uint64_t f_ffree;
+        uint32_t f_fsid[2];
+        uint64_t f_namelen;
+        uint64_t f_frsize;
+        uint64_t f_flags;
+        uint64_t f_spare[4];
+};
+
+static inline long prism_statfs(const char *path, struct prism_statfs *buf)
+{
+        return prism_raw3(PRISM_SYS_STATFS, (long)path, (long)buf, 0);
+}
+
+/*
+ * ioctl(29) (phase 3.3): the raw form of the one request pair a shell
+ * needs -- TIOCSPGRP, the foreground claim that a ^C of ISIG targets
+ * (mlibc's public ioctl() is glibc-option code the port keeps off;
+ * tcgetattr / tcsetattr / isatty are library calls).  The answer is the
+ * kernel's: 0 or the negative errno.
+ */
+static inline long prism_ioctl(int fd, unsigned long request, void *arg)
+{
+        return prism_raw3(PRISM_SYS_IOCTL, fd, (long)request, (long)arg);
 }
 
 #endif /* PRISM_RAW_H */

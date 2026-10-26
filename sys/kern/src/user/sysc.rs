@@ -703,3 +703,136 @@ pub fn sys_fb_blit(a: [u64; 6]) -> i64 {
     })
     .unwrap_or(-ENODEV) // no surface: the same answer fb_info gives
 }
+
+// ------------------------------------------------ phase 3.3: the rest
+
+/// `getppid()` (syscall 49): the parent's pid, 0 for a kernel-born process
+/// (init itself: its parent is the kernel).
+pub fn sys_getppid() -> i64 {
+    process::current().map_or(0, |p| p.ppid) as i64
+}
+
+/// `getuid()` (syscall 50) / `getgid()` (syscall 51): there are no users
+/// yet -- the fixed root identity every unix boots with, like the roadmap
+/// says (permission bits land with phase 3.5).
+pub fn sys_getuid() -> i64 {
+    0
+}
+
+/// `getgid()` (syscall 51): see `sys_getuid`.
+pub fn sys_getgid() -> i64 {
+    0
+}
+
+/// `umask(mask)` (syscall 52): exchange the file creation mask, answered
+/// with the previous one (POSIX).  The mask is applied by `mkdir`; `open`
+/// creation keeps the VFS's fixed mode until chmod lands (roadmap 3.4.2).
+pub fn sys_umask(mask: u64) -> i64 {
+    let Some(cur) = process::current() else { return -EFAULT };
+    let old = cur.umask;
+    cur.umask = (mask & 0o7777) as u16;
+    old as i64
+}
+
+/// `gettimeofday(tv, tz)` (syscall 53): the realtime clock of
+/// `clock_gettime(CLOCK_REALTIME)` in `struct timeval` clothes (i64 sec,
+/// i64 usec).  `tz` is accepted and ignored, like on Linux.
+pub fn sys_gettimeofday(tv_p: u64, _tz_p: u64) -> i64 {
+    let ms = realtime_ms();
+    let pair = [(ms / 1000) as i64, ((ms % 1000) * 1000) as i64];
+    if tv_p == 0 {
+        return 0; // a NULL tv is a plain "what time is it" probe
+    }
+    let Some(cur) = process::current() else { return -EFAULT };
+    let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return -EFAULT };
+    let mut b = [0u8; 16];
+    b[0..8].copy_from_slice(&pair[0].to_le_bytes());
+    b[8..16].copy_from_slice(&pair[1].to_le_bytes());
+    if !aspace.ensure_writable(tv_p) || !aspace.write(tv_p, &b, false) {
+        return -EFAULT;
+    }
+    0
+}
+
+/// `nanosleep(req, rem)` (syscall 54): park the caller for the requested
+/// span.  `rem` is accepted and cleared: a sleep cannot be interrupted --
+/// nothing here can shorten one except a signal that wakes the process
+/// early, and the remainder bookkeeping is not worth the machinery (the
+/// answer stays "slept it all").  House-capped like every sleep.
+pub fn sys_nanosleep(req_p: u64, rem_p: u64) -> i64 {
+    let read_i64 = |p: u64, out: &mut i64| -> bool {
+        let Some(cur) = process::current() else { return false };
+        let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return false };
+        let mut b = [0u8; 8];
+        if !aspace.read(p, &mut b) {
+            return false;
+        }
+        *out = i64::from_le_bytes(b);
+        true
+    };
+    let (mut sec, mut nsec) = (0i64, 0i64);
+    if !read_i64(req_p, &mut sec) || !read_i64(req_p + 8, &mut nsec) {
+        return -EFAULT;
+    }
+    if nsec < 0 || nsec >= 1_000_000_000 || sec < 0 {
+        return -EINVAL;
+    }
+    let ms = (sec as u64).saturating_mul(1000) + (nsec as u64) / 1_000_000;
+    process::sleep_current(ms);
+    if rem_p != 0 {
+        let Some(cur) = process::current() else { return -EFAULT };
+        let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return -EFAULT };
+        let zeros = [0u8; 16];
+        if !aspace.ensure_writable(rem_p) || !aspace.write(rem_p, &zeros, false) {
+            return -EFAULT;
+        }
+    }
+    0
+}
+
+/// `reboot(cmd)` (syscall 57): flush every file system, then restart or
+/// power the machine off.  The commands are the Linux ones; anything else
+/// is -EINVAL.  The exit routes are the classic ISA ones: the 0x604 and
+/// 0xB004 words the emulators watch, then the CF9 reset register -- one of
+/// them takes on every machine this kernel has booted on.
+pub fn sys_reboot(cmd: u64) -> i64 {
+    const LINUX_REBOOT_CMD_RESTART: u64 = 0x0123_4567;
+    const LINUX_REBOOT_CMD_POWER_OFF: u64 = 0x4321_FEDC;
+    const LINUX_REBOOT_CMD_HALT: u64 = 0xCDEF_0123;
+    match cmd {
+        LINUX_REBOOT_CMD_RESTART | LINUX_REBOOT_CMD_POWER_OFF => {
+            crate::fs::fsys::sync_all();
+            if cmd == LINUX_REBOOT_CMD_POWER_OFF {
+                power_off()
+            } else {
+                // SAFETY: raw port writes, the last thing this kernel does.
+                unsafe {
+                    crate::arch::io::outw(0x604, 0x2000); // QEMU (the newer PIIX4 datum)
+                    crate::arch::io::outw(0xB004, 0x2000); // Bochs / older QEMU
+                    crate::arch::io::outb(0xCF9, 0x0E); // the CF9 reset register
+                }
+                // Nothing answered: spin with interrupts off.
+                crate::arch::intr::park()
+            }
+        }
+        LINUX_REBOOT_CMD_HALT => {
+            crate::fs::fsys::sync_all();
+            crate::arch::intr::park()
+        }
+        _ => -EINVAL,
+    }
+}
+
+/// The power-off attempt list, the same every hobby kernel walks: the
+/// QEMU / Bochs words, then the ACPI PM1a control register -- the port is
+/// discovered by the same person who writes this README, and until then
+/// the words are what works on the machines that matter.
+fn power_off() -> ! {
+    // SAFETY: raw port writes, the last thing this kernel does.
+    unsafe {
+        crate::arch::io::outw(0x604, 0x2000);
+        crate::arch::io::outw(0xB004, 0x2000);
+        crate::arch::io::outw(0x4004, 0x3400);
+    }
+    crate::arch::intr::park()
+}

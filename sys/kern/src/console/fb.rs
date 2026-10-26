@@ -59,6 +59,12 @@ impl FbConsole {
         &mut self.surf
     }
 
+    /// The text grid, (columns, rows) -- the geometry a TIOCGWINSZ on the
+    /// console answers (phase 3.3).
+    pub fn text_dims(&self) -> (usize, usize) {
+        (self.cols, self.rows)
+    }
+
     /// Move the text cursor to the top-left corner without erasing anything.
     pub fn home(&mut self) {
         self.x = 0;

@@ -163,6 +163,18 @@ pub fn char_width(c: char) -> usize {
     }
 }
 
+/// The text grid of the active console, (columns, rows) -- the framebuffer's
+/// own geometry (phase 3.3: TIOCGWINSZ answers it), 80x25 in VGA text mode.
+pub fn text_dims() -> (usize, usize) {
+    // SAFETY: read-only access to the console configuration.
+    let con = unsafe { &*addr_of_mut!(CONSOLE) };
+    if let Some(f) = con.fb.as_ref() {
+        f.text_dims()
+    } else {
+        (80, 25)
+    }
+}
+
 /// Clear every active console.
 pub fn clear() {
     // SAFETY: single CPU, called from the boot console context.

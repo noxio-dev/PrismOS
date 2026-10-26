@@ -28,12 +28,18 @@ use crate::fs::vfs::{self, DirEntry, FileSystem, FileType, FsError, FsResult, St
 pub const DEV_CONSOLE: u32 = 1;
 pub const DEV_NULL: u32 = 2;
 pub const DEV_ZERO: u32 = 3;
+pub const DEV_TTY: u32 = 4;
+pub const DEV_TTY0: u32 = 5;
+pub const DEV_FULL: u32 = 6;
 
 /// Name and permission bits of each device node, in readdir order.
-const NODES: [(&str, u32, u16); 3] = [
+const NODES: [(&str, u32, u16); 6] = [
     ("console", DEV_CONSOLE, 0o620), // crw--w---- like every real unix
     ("null", DEV_NULL, 0o666),
     ("zero", DEV_ZERO, 0o666),
+    ("tty", DEV_TTY, 0o666),   // the controlling terminal of a session
+    ("tty0", DEV_TTY0, 0o620), // the console itself, by its other name
+    ("full", DEV_FULL, 0o666), // writes answer ENOSPC (phase 3.3)
 ];
 
 /// Inode of the /dev directory itself (devices start at 1).

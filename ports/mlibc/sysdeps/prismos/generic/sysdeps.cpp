@@ -362,6 +362,22 @@ int Sysdeps<Tcgetwinsize>::operator()(int fd, struct winsize *winsz) {
         return 0;
 }
 
+int Sysdeps<Tcsetattr>::operator()(int fd, int opts, const struct termios *attr) {
+        /* TCSANOW / TCSADRAIN / TCSAFLUSH -- the drain and flush halves
+         * are the kernel's TCSETSW / TCSETSF (the output queue never runs
+         * deep enough to tell them apart).
+         */
+        unsigned long req = TCSETS;
+        if(opts == TCSADRAIN)
+                req = TCSETSW;
+        else if(opts == TCSAFLUSH)
+                req = TCSETSF;
+        auto ret = sys(PRISM_SYS_IOCTL, fd, req, attr);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
 int Sysdeps<Poll>::operator()(struct pollfd *fds, nfds_t count, int timeout, int *num_events) {
         auto ret = sys(PRISM_SYS_POLL, fds, count, timeout);
         if(int e = sc_error(ret); e)
@@ -542,6 +558,36 @@ int Sysdeps<Uname>::operator()(struct utsname *buf) {
 
 pid_t Sysdeps<GetPid>::operator()() {
         return static_cast<pid_t>(sys(PRISM_SYS_GETPID));
+}
+
+pid_t Sysdeps<GetPpid>::operator()() {
+        return static_cast<pid_t>(sys(PRISM_SYS_GETPPID));
+}
+
+/* There are no users yet: the fixed root identity, real and effective
+ * the same number (the kernel's getuid / getgid pair). */
+uid_t Sysdeps<GetUid>::operator()() {
+        return static_cast<uid_t>(sys(PRISM_SYS_GETUID));
+}
+
+uid_t Sysdeps<GetEuid>::operator()() {
+        return static_cast<uid_t>(sys(PRISM_SYS_GETUID));
+}
+
+gid_t Sysdeps<GetGid>::operator()() {
+        return static_cast<gid_t>(sys(PRISM_SYS_GETGID));
+}
+
+gid_t Sysdeps<GetEgid>::operator()() {
+        return static_cast<gid_t>(sys(PRISM_SYS_GETGID));
+}
+
+int Sysdeps<Umask>::operator()(mode_t mode, mode_t *old) {
+        auto ret = sys(PRISM_SYS_UMASK, mode);
+        if(int e = sc_error(ret); e)
+                return e;
+        *old = static_cast<mode_t>(ret);
+        return 0;
 }
 
 void Sysdeps<Yield>::operator()() {

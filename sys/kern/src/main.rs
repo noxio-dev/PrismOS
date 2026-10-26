@@ -40,9 +40,13 @@ use fs::fsys;
 use hw::{acpi, ahci, apic, blk, kbd, pci, pic, pit, serial, smp};
 use mem::{heap, pmm, vmm};
 use user::process;
+use user::tty;
 
 use core::arch::asm;
 use core::panic::PanicInfo;
+
+use alloc::string::String;
+use alloc::vec::Vec;
 
 #[no_mangle]
 #[link_section = ".text._start"]
@@ -135,7 +139,16 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         if serial::present() { "" } else { " (no UART detected)" }
     );
 
-    intr::register_irq(pic::IRQ_TIMER, |f| pit::on_tick(f.cs & 3 == 3));
+    intr::register_irq(pic::IRQ_TIMER, |f| {
+        // The terminal drains here too (phase 3.3): a ^C typed while
+        // nothing reads is acted on within one tick, not at the next
+        // read.  Only while a userland session is up -- the kernel
+        // shell's own reader owns the input queues otherwise.
+        if process::init_pid().is_some() {
+            tty::pump();
+        }
+        pit::on_tick(f.cs & 3 == 3)
+    });
     intr::register_irq(pic::IRQ_KBD, |_f| kbd::on_irq());
 
     // --- Memory management ----------------------------------------------------
@@ -297,6 +310,60 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // --- VFS / ext4 (phase 1.4) ---------------------------------------------
     fsys::init();
 
+    // What /proc says about this boot (phase 3.3): the CPU probe and the
+    // loader's command line (fsys recorded the root volume's name while
+    // mounting /).
+    {
+        fs::procfs::set_boot_info(
+            cpu.brand(),
+            cpu.vendor(),
+            cpu.family(),
+            cpu.model(),
+            cpu.stepping(),
+            bi.cmdline(),
+        );
+    }
+
+    // --- init (phase 3.3): the userland takes over ---------------------------
+    // The kernel starts /sbin/init (the usr-merge symlink to
+    // /usr/bin/init) as pid 1 instead of the kernel shell, which stays
+    // as the rescue mode: `kernel_options="init=kshell"` in loader.conf
+    // boots it, and a missing or crashed init falls back to it.
+    let cmdline = bi.cmdline();
+    let mut init = "/sbin/init";
+    let mut rescue = false;
+    for opt in cmdline.split_whitespace() {
+        if let Some(v) = opt.strip_prefix("init=") {
+            if v == "kshell" || v == "none" {
+                rescue = true;
+            } else if !v.is_empty() {
+                init = v;
+            }
+        }
+    }
+    if !rescue {
+        match spawn_init(init) {
+            Ok(pid) => {
+                kprintln!("user     : {} as pid {} -- the userland session", init, pid);
+                // This is the idle loop of the session era: init waits, the
+                // shell parks on its reads, commands come and go, and this
+                // call returns only when the whole session is dead.
+                process::run_until_idle();
+                process::drain_and_reap();
+                kprintln!("init     : the session is over -- rescue shell");
+            }
+            Err(e) => {
+                kprintln!("vfs      : no init at {} ({})", init, e);
+            }
+        }
+    } else {
+        kprintln!("user     : init= is kshell -- rescue mode");
+    }
+
+    // The rescue kernel shell: the console input belongs to it alone
+    // (the tty's queues go, the tick stops pumping).
+    process::set_init(0);
+    tty::reset_input();
     kprintln!("dropping to the shell");
     kprintln!();
 
@@ -307,6 +374,33 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     shell::set_boot_info(Some(bi));
     shell::run()
+}
+
+/// Start the userland init (phase 3.3): load the ELF, spawn it as pid 1
+/// with no watchdog and the same environment the kernel shell's `exec`
+/// gives its programs, and record the hand-over (the orphan re-parenting
+/// and the tick's tty pump key off it).
+fn spawn_init(path: &str) -> Result<u64, &'static str> {
+    let argv = alloc::vec![path.as_bytes().to_vec()];
+    let env = [
+        "PATH=/usr/bin:/bin",
+        "HOME=/",
+        "TERM=prism",
+        concat!("PRISMOS=", env!("CARGO_PKG_VERSION")),
+    ];
+    let envp: Vec<Vec<u8>> = env.iter().map(|e| e.as_bytes().to_vec()).collect();
+    let loaded = user::elf::load_path(path, &argv, &envp).map_err(|e| e.what())?;
+    let name = user::elf::base_name(path);
+    let flat = process::argv_flat(&argv);
+    let pid = process::spawn_loaded(name, loaded, process::PRIO_DEFAULT, process::NO_WATCHDOG)?;
+    process::set_init(pid);
+    // /proc's view of pid 1: the argv it was started with and the binary
+    // it is (a kernel-born process starts with both empty).
+    let _ = process::with_pid_mut(pid, |p| {
+        p.argv = flat;
+        p.exe = String::from(path);
+    });
+    Ok(pid)
 }
 
 /// Unmask an ISA IRQ on whichever controller is in charge.

@@ -40,4 +40,5 @@ pub mod process;
 pub mod signal;
 pub mod sysc;
 pub mod syscall;
+pub mod tty;
 pub mod usermode;

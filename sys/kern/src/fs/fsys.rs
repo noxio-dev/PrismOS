@@ -10,6 +10,7 @@ use crate::hw::ahci;
 use crate::hw::blk::{read_gpt, BlockDev, GptEntry, Partition};
 use crate::fs::devfs::DevFs;
 use crate::fs::ext4::Ext4;
+use crate::fs::procfs::ProcFs;
 use crate::fs::tmpfs::{TmpFs, MAX_BYTES, MAX_FILES};
 use crate::fs::vfs::{self, FsError, Vfs};
 use alloc::boxed::Box;
@@ -198,16 +199,18 @@ pub fn init() {
                 (st.free_blocks * st.block_size as u64) >> 20,
                 if m.first().map_or(true, |m| m.read_only) { "read-only" } else { "read-write" }
             );
+            // What /proc/mounts calls the root (the volume's boot-time name).
+            crate::fs::procfs::set_root_source(&name(f));
         }
         Err(e) => crate::kprintln!("vfs      : {} is not mountable: {}", name(f), e.as_str()),
     }
-    // /dev holds the device nodes (console, null, zero) served by the
-    // descriptor layer (user/fd.rs).  It needs an existing /dev directory
-    // in the root file system (the build creates one); without a root
-    // mount there is nothing to hang it on either.
+    // /dev holds the device nodes (console, tty, null, zero, full) served
+    // by the descriptor layer (user/fd.rs).  It needs an existing /dev
+    // directory in the root file system (the build creates one); without a
+    // root mount there is nothing to hang it on either.
     if vfs().is_mounted() {
         match vfs().mount("/dev", Box::new(DevFs::new())) {
-            Ok(()) => crate::kprintln!("vfs      : devfs on /dev (console, null, zero)"),
+            Ok(()) => crate::kprintln!("vfs      : devfs on /dev (console, tty, null, zero, full)"),
             Err(e) => crate::kprintln!("vfs      : cannot mount devfs on /dev: {}", e.as_str()),
         }
     }
@@ -227,6 +230,74 @@ pub fn init() {
             },
             Err(e) => crate::kprintln!("vfs      : cannot create /tmp: {}", e.as_str()),
         }
+    }
+    // /proc is the generated kernel / process state (phase 3.3,
+    // fs/procfs.rs): version, uptime, meminfo, cpuinfo, cmdline, mounts,
+    // self and one directory per live process.  Read-only by construction.
+    if vfs().is_mounted() {
+        match vfs().mkdir_p("/proc", 0o555) {
+            Ok(()) => match vfs().mount("/proc", Box::new(ProcFs::new())) {
+                Ok(()) => crate::kprintln!("vfs      : procfs on /proc (generated, read-only)"),
+                Err(e) => crate::kprintln!("vfs      : cannot mount procfs on /proc: {}", e.as_str()),
+            },
+            Err(e) => crate::kprintln!("vfs      : cannot create /proc: {}", e.as_str()),
+        }
+    }
+}
+
+// ------------------------------------------------ mount / umount (phase 3.3)
+
+/// `mount(source, target, fstype, flags)` (syscall 55): mount a discovered
+/// ext volume ("disk1", "disk0:2" -- the names the boot log and `mount -l`
+/// print) or a fresh tmpfs at an existing directory.  Read-only is the
+/// only flag; `fstype` is checked against what the source turns out to be
+/// (accepting ext2/3/4 for the ext family).  The kernel's own mounts --
+/// /, /dev, /tmp, /proc -- are made the same way at boot.
+pub fn sys_mount(src_p: u64, tgt_p: u64, type_p: u64, flags: u64) -> i64 {
+    let (src, tgt, fstype) = match (user_str(src_p), user_str(tgt_p), user_str(type_p)) {
+        (Ok(s), Ok(t), Ok(y)) => (s, t, y),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return e,
+    };
+    let read_only = flags & 1 != 0; // MS_RDONLY
+    if read_only && src.is_empty() {
+        return -22; // EINVAL
+    }
+    if fstype == "tmpfs" {
+        return vfs().mkdir_p(&tgt, 0o1777).and_then(|_| vfs().mount(&tgt, Box::new(TmpFs::new()))).map_or_else(
+            |e| -crate::user::fd::fs_errno(e),
+            |_| 0,
+        );
+    }
+    // A real volume: resolve the source spec through the discovery scan.
+    let Some(f) = find(&src) else {
+        return -2; // ENOENT
+    };
+    if !matches!(fstype.as_str(), "ext2" | "ext3" | "ext4" | "") {
+        return -22; // EINVAL
+    }
+    mount(&f, &tgt, read_only).map_or_else(|e| -crate::user::fd::fs_errno(e), |_| 0)
+}
+
+/// `umount(target)` (syscall 56): flush and detach the file system at
+/// `target` -- the VFS refuses a busy one (open files, mounts below).
+pub fn sys_umount(tgt_p: u64) -> i64 {
+    let tgt = match user_str(tgt_p) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    vfs().umount(&tgt).map_or_else(|e| -crate::user::fd::fs_errno(e), |_| 0)
+}
+
+/// Read a NUL-terminated string from the caller (the mount pair's paths).
+fn user_str(ptr: u64) -> Result<String, i64> {
+    let Some(cur) = crate::user::process::current() else { return Err(-14) };
+    let Some(aspace) = cur.aspace.as_ref() else { return Err(-14) };
+    match crate::user::syscall::read_user_cstr(aspace, ptr, 255) {
+        Ok(v) => match String::from_utf8(v) {
+            Ok(s) => Ok(s),
+            Err(_) => Err(-22), // a non-utf8 string is not a path
+        },
+        Err(e) => Err(e),
     }
 }
 

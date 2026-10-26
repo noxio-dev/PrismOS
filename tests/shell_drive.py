@@ -5,7 +5,7 @@ import subprocess
 import sys
 import time
 
-def run(image, cmds, timeout=60, extra=None):
+def run(image, cmds, timeout=60, extra=None, prompt=b"prism# "):
     base = ["qemu-system-x86_64", "-m", "256M", "-display", "none", "-no-reboot",
             "-chardev", "stdio,id=ser,signal=off", "-serial", "chardev:ser",
             "-drive", f"file={image},format=raw"]
@@ -28,8 +28,10 @@ def run(image, cmds, timeout=60, extra=None):
                     break
                 out += chunk
                 last_data = time.time()
-            if b"prism# " in out and sent < len(pending):
-                # shell is alive: send the next command after a short pause
+            seen = out.count(prompt)
+            if seen > seen_prompt and sent < len(pending):
+                # a new prompt appeared: send the next command
+                seen_prompt = seen
                 time.sleep(0.4)
                 cmd = pending[sent]
                 sent += 1

@@ -339,6 +339,16 @@ impl Vfs {
             .collect()
     }
 
+    /// The mount `path` sits on (its name / read-only state) -- what a
+    /// `statfs` of the path reports (phase 3.3).
+    pub fn mount_of(&self, path: &str) -> Option<MountInfo> {
+        self.mount_for(path).map(|i| MountInfo {
+            path: self.mounts[i].path.clone(),
+            fs_name: self.mounts[i].fs.fs_name(),
+            read_only: self.mounts[i].fs.read_only(),
+        })
+    }
+
     pub fn is_mounted(&self) -> bool {
         !self.mounts.is_empty()
     }

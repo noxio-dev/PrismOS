@@ -1,0 +1,23 @@
+# /usr/bin/init -- the session keeper (phase 3.3.7): what the kernel
+# starts as pid 1 instead of its own shell.  It respawns the console
+# shell /usr/bin/sh and reaps everything that dies (the kernel
+# re-parents the orphans to it), the terminal signals bounce off it,
+# and its crash is the kernel's rescue-shell trigger (the kernel shell
+# also answers `kernel_options="init=kshell"` in loader.conf).
+[package]
+name = "init"
+version = "0.1.0"
+description = "the session keeper: respawns the console shell, reaps the orphans"
+
+[build]
+sources = ["src/init.c"]
+
+[install]
+path = "/usr/bin/init"
+
+# verify.sh's init diet: every syscall the program makes (printf rides
+# write 1; signal() is mlibc's sigaction wrapper, hence 38; the respawn
+# loop never exits, hence no syscall 0).
+[verify]
+syscalls = [1, 5, 7, 8, 9, 38]
+symbols = ["fork", "execve", "waitpid", "signal", "sleep", "printf", "perror"]

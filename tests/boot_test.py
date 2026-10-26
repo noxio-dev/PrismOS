@@ -107,7 +107,49 @@ def main():
     hello = ["Hello, world!", "PrismOS kernel", "gdt/tss", "idt", "pic",
              "pit      : channel 0 at 100 Hz", "pmm      :", "vmm      :",
              "heap     :", "kbd      :", "interrupts enabled",
-             "vfs      : devfs on /dev", "prism# "]
+             "vfs      : devfs on /dev", "procfs on /proc",
+             "user     : /sbin/init as pid 1 -- the userland session",
+             "PrismOS init: starting the console shell"]
+
+    # Phase 3.3: the default boot is the userland session (init as pid 1
+    # and the shell at prism$); the kernel shell is the rescue mode.  The
+    # kernel-shell scenarios below run against a rescue image -- the same
+    # root tree with kernel_options="init=kshell" in its loader.conf,
+    # rebuilt with the same tools -- and the userland ones against the
+    # image as built.
+    build = os.path.dirname(os.path.abspath(image))
+
+    def make_rescue():
+        rescue = os.path.join(build, "prismos-rescue.img")
+        rroot = os.path.join(build, "root-rescue")
+        conf = os.path.join(rroot, "boot", "loader.conf")
+        fresh = not (os.path.exists(rescue) and os.path.exists(conf))
+        if not fresh:
+            with open(conf) as f:
+                fresh = "init=kshell" not in f.read()
+        if fresh:
+            if os.path.exists(rroot):
+                shutil.rmtree(rroot)
+            shutil.copytree(os.path.join(build, "root"), rroot)
+            with open(conf, "a") as f:
+                f.write('\n# rescue boot: the kernel shell instead of /sbin/init\n'
+                        'kernel_options="init=kshell"\n')
+            mkimage = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "..", "tools", "mkimage.py")
+            subprocess.run([sys.executable, mkimage,
+                            "--boot0", os.path.join(build, "boot0.bin"),
+                            "--boot1", os.path.join(build, "boot1.bin"),
+                            "--loader", os.path.join(build, "loader.bin"),
+                            "--esp-dir", os.path.join(build, "esp"),
+                            "--root-dir", rroot, "-o", rescue], check=True)
+        return rescue
+
+    rescue = make_rescue()
+
+    def ksh_cmd():
+        """the rescue boot (init=kshell): the kernel shell owns the console"""
+        shutil.copyfile(rescue, work)
+        return base + ahci_boot(work)
     scenarios = [
         # BIOS gets a VBE linear framebuffer now: the loader switches to it at the
         # point of no return and the kernel double-buffers its console.
@@ -115,17 +157,17 @@ def main():
         ("BIOS prompt: Esc, then boot", bios_cmd,
          [("Autoboot in", "\x1b"), ("OK ", "version\rboot -v\r")],
          ["OK ", "PrismOS loader (bios, Lua 5.4.8)", "Hello, world!", 'cmdline  : "-v"'], 40),
-        ("BIOS shell: exception recovery", bios_cmd,
+        ("BIOS shell: exception recovery", ksh_cmd,
          [("prism# ", "crash int\r"), ("prism# ", "crash page\r"),
           ("prism# ", "crash div\r"), ("prism# ", "uptime\r")],
          ["handled, continuing", "page mapped, continuing", "divide by zero",
           "survived", "ticks at 100 Hz"], 60),
-        ("BIOS shell: memory + layout", bios_cmd,
+        ("BIOS shell: memory + layout", ksh_cmd,
          [("prism# ", "meminfo\r"), ("prism# ", "layout fr\r"), ("prism# ", "kbd\r")],
          ["pages total", "self-test: ok", "switched to fr", "i8042"], 60),
         # Phase 2: ring 3 processes, context switch, preemptive scheduler
         # (time slices, priorities, sleep/wakeup), watchdog.
-        ("BIOS shell: ring 3 processes + scheduler (phase 2.3)", bios_cmd,
+        ("BIOS shell: ring 3 processes + scheduler (phase 2.3)", ksh_cmd,
          [("prism# ", "user ping pong\r"), ("prism# ", "user spin:3 sleep:0\r"),
           ("prism# ", "usertest\r"), ("prism# ", "ps\r")],
          ["user     : syscall/sysret ready",
@@ -140,7 +182,7 @@ def main():
         # built by `make`): loader, argv/envp/auxv, execve, per-process FPU
         # state (two float workloads interleaved by the scheduler), fault
         # containment, exit status.  pids are sequential since boot.
-        ("BIOS shell: ELF programs + execve (phase 2.4)", bios_cmd,
+        ("BIOS shell: ELF programs + execve (phase 2.4)", ksh_cmd,
          [("prism# ", "exec hello info alpha\r"),
           ("pid 1 hello -- exited with status 0", "exec hello chain x y\r"),
           ("pid 2 hello -- exited with status 0", "exec hello errors\r"),
@@ -163,7 +205,7 @@ def main():
         # and WNOHANG waits, SIGCHLD handlers, SIGTERM kills, register
         # restoration through sigreturn, execve from a forked child, orphan
         # adoption.
-        ("BIOS shell: fork, wait, signals (phase 2.5)", bios_cmd,
+        ("BIOS shell: fork, wait, signals (phase 2.5)", ksh_cmd,
          [("prism# ", "exec fork\r"),
           ("fork: all 10 passed", "ps\r")],
          ["fork (pid 1): fork, wait, signals and copy-on-write",
@@ -184,7 +226,7 @@ def main():
         # the close(1) + open renumbering trick), a real read of fd 0 from
         # the serial line, and fds surviving execve.  The `ls /dev` and
         # `mount` steps check the namespace side (devfs, the mount table).
-        ("BIOS shell: descriptors, pipes, /dev (phase 2.6)", bios_cmd,
+        ("BIOS shell: descriptors, pipes, /dev (phase 2.6)", ksh_cmd,
          [("prism# ", "exec fd\r"),
           ("type 4 bytes (EXACTLY wxyz):", "wxyz\r"),
           ("prism# ", "ps\r"),
@@ -218,7 +260,7 @@ def main():
         # dirent records of /bin and /dev), the name-space syscalls (mkdir,
         # unlink, rmdir, rename, link) and uname / the isatty ioctl pair.
         # The shell steps also exercise its own `cd` + `pwd`.
-        ("BIOS shell: newlib syscall set (phase 3.1)", bios_cmd,
+        ("BIOS shell: newlib syscall set (phase 3.1)", ksh_cmd,
          [("prism# ", "exec posix\r"),
           ("posix: all 10 passed", "ps\r"),
           ("prism# ", "cd /boot\r"),
@@ -243,11 +285,13 @@ def main():
     else:
         print("note: OVMF not found, skipping UEFI scenarios")
 
-    # The loader reads its boot tree from the ext4 root partition (P3) and the
-    # kernel mounts the same partition as / -- the whole disk chain (boot0 ->
-    # boot1 -> loader -> kernel) runs off one ext4 volume.
+    # The loader reads its loader.conf overrides from the ext4 root
+    # partition (P3) and the kernel mounts the same partition as / -- the
+    # whole disk chain (boot0 -> boot1 -> loader -> kernel) runs off one
+    # ext4 volume.  (Rescue image: the writes belong to the kernel shell's
+    # own /d commands.)
     def fs_cmd():
-        shutil.copyfile(image, fswork)
+        shutil.copyfile(rescue, fswork)
         return base + ahci_boot(fswork)
 
     scenarios.append(
@@ -265,7 +309,7 @@ def main():
     # mounts the second disk read-write, writes to it, and unmounts cleanly.
     if have_fs:
         def data_cmd():
-            shutil.copyfile(image, work)
+            shutil.copyfile(rescue, work)
             return base + ahci_boot(work) + data_drive()
 
         scenarios.append(
@@ -290,7 +334,7 @@ def main():
     # blocks) and the kernel (dx_probe lookup) must still find their files.
     idximg = None
     if have_fs and shutil.which("debugfs"):
-        idximg = index_boot_tree(image, os.path.join(tmp, "idx.img"))
+        idximg = index_boot_tree(rescue, os.path.join(tmp, "idx.img"))
     if idximg:
         def idx_cmd():
             return base + ahci_boot(idximg)
@@ -308,7 +352,7 @@ def main():
     # run their own LAPIC timer and answer IPIs (the scheduler stays on the
     # BSP until phase 2 grows per-CPU scheduling).
     def smp_cmd():
-        shutil.copyfile(image, work)
+        shutil.copyfile(rescue, work)
         return base + ["-smp", "3"] + ahci_boot(work)
 
     scenarios.append(
@@ -318,6 +362,35 @@ def main():
          ["smp      : 3 cpu(s) online (2 AP up, IPI round-trip 2/2)",
           "cpu  lapic  state   ticks      ipis   idle-halts",
           "online", "ipi      : ok", "uptime   :", "ticks at 100 Hz"], 120))
+
+    # Phase 3.3: the userland session -- init (pid 1) and the shell on the
+    # tty's line discipline, /proc generated on read, and a ^C that reaches
+    # a blocked foreground read through TIOCSPGRP.
+    scenarios += [
+        ("BIOS userland: init, /proc, ps, df (phase 3.3)", bios_cmd,
+         [("prism$ ", "cat /proc/version\r"),
+          ("prism$ ", "cat /proc/meminfo\r"),
+          ("prism$ ", "ls /proc\r"),
+          ("prism$ ", "ps\r"),
+          ("prism$ ", "df\r"),
+          ("prism$ ", "cat /etc/motd\r"),
+          ("prism$ ", "cat /etc/passwd\r"),
+          ("prism$ ", "hello\r")],
+         ["user     : /sbin/init as pid 1 -- the userland session",
+          "PrismOS init: starting the console shell",
+          "PrismOS version", "MemTotal:", "MemFree:",
+          "meminfo", "cpuinfo", "cmdline", "mounts", "self",
+          "init", "sh",
+          "tmpfs", "procfs", "mounted on",
+          "Welcome to PrismOS",
+          "root:x:0:0:root:/:/usr/bin/sh",
+          "hello from an ELF program"], 240),
+        ("BIOS userland: ^C interrupts a blocked read (phase 3.3)", bios_cmd,
+         [("prism$ ", "fd\r"),
+          ("type 4 bytes (EXACTLY wxyz):", "\x03"),
+          ("sh: fd: killed by signal 2", "ps\r")],
+         ["fd (pid ", "type 4 bytes", "sh: fd: killed by signal 2"], 240),
+    ]
 
     failed = 0
     for name, cmd, steps, expect, timeout in scenarios:

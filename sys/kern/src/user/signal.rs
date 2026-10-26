@@ -185,6 +185,16 @@ fn with_current<R>(f: impl FnOnce(&mut SignalState) -> R) -> Option<R> {
     process::current().map(|p| f(&mut p.signals))
 }
 
+/// Whether the running process has a deliverable signal pending (phase
+/// 3.3): an unblocked bit that carries a handler.  The blocking read paths
+/// check this after every park and answer -EINTR -- the unix rule for an
+/// interruptible wait.  Pending bits only ever exist for handler-installed
+/// signals (see `post_signal`), so "pending and not blocked" is exactly
+/// "a handler is about to run".
+pub fn interrupt_pending() -> bool {
+    with_current(|s| s.pending & !s.blocked != 0).unwrap_or(false)
+}
+
 /// `signal(sig, handler)`: install a handler (0 = default action, 1 =
 /// SIG_IGN) and return the old disposition.  A handler must live in user
 /// space: a kernel address there would either fault on `sysretq` or hand

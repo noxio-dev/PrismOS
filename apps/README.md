@@ -3,9 +3,10 @@
 A userland program on PrismOS is a **package**: a directory under `apps/`
 carrying a `prism.toml` manifest.  The mini libc is gone — **mlibc is the
 only libc** — and `tools/prism.py` (the `./prism` shim at the repo root) is
-the builder.  Six packages live here: `hello`, `fork`, `fd`, `posix`,
-`cube` (the kernel's spinning cube) and `tmpfs` (the phase 3.3 RAM file
-system, exercised from ring 3).
+the builder.  Eight packages live here: `hello`, `fork`, `fd`, `posix`,
+`cube` (the kernel's spinning cube), `tmpfs` (the phase 3.3 RAM file
+system, exercised from ring 3), `init` (the session keeper the kernel
+starts as pid 1) and `sh` (the console shell it respawns).
 
 ## The five-minute tour
 
@@ -14,9 +15,13 @@ $ ./prism init demo            # scaffold apps/demo (manifest + src/main.c)
 $ ./prism build demo           # compile + link + verify + stage, stripped
 $ make                         # the image picks it up: /usr/bin/demo
 $ ./prism run                  # boot it (make run-uefi-kvm)
-prism# exec demo
+prism$ demo
 hello from demo (uptime 1437 ms)
 ```
+
+(The session prompt is `prism$ ` now — init + the userland shell own
+the console; the kernel shell's `prism# ` is the rescue mode,
+`kernel_options="init=kshell"` in loader.conf.)
 
 No Makefile wiring, no editing anywhere else: drop a directory with a
 manifest under `apps/` and the next `make` builds it, checks it against the
