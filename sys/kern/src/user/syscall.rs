@@ -281,6 +281,9 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         // ---- phase 3.3: the user-space framebuffer ---------------------
         44 => sysc::sys_fb_info(a0),
         45 => sysc::sys_fb_blit([a0, a1, a2, frame.r10, frame.r8, frame.r9]),
+        // ---- phase 3.3: /tmp tmpfs + the usr-merge userland ------------
+        46 => fd::sys_symlink(a0, a1),
+        47 => fd::sys_readlink(a0, a1, a2),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

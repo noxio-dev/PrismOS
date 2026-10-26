@@ -23,7 +23,7 @@ QEMU_AHCI := -device ahci,id=ahci0
 QEMU_DATA := -drive id=data,file=$(DATA_IMG),format=raw,if=none -device ide-hd,drive=data,bus=ahci0.1
 # $(call qemu_boot_drive,image) - the bootable disk, AHCI port 0
 qemu_boot_drive = -drive id=boot,file=$(1),format=raw,if=none -device ide-hd,drive=boot,bus=ahci0.0
-QEMUFLAGS ?= -m 256M $(QEMU_AHCI) $(QEMU_DATA) -smp 4
+QEMUFLAGS ?= -m 256M $(QEMU_AHCI) $(QEMU_DATA)
 OVMF_CODE ?= $(firstword $(wildcard \
     /usr/share/OVMF/OVMF_CODE_4M.fd \
     /usr/share/OVMF/OVMF_CODE.fd \
@@ -196,7 +196,19 @@ SYSROOT    := $(TOOLCHAIN)/x86_64-prismos
 
 .PHONY: mlibc apps hello-dyn
 mlibc: $B/toolchain/usr/.stamp
-$B/toolchain/usr/.stamp: ports/toolchain/bootstrap.sh ports/toolchain/cross.txt ports/mlibc/README.md ports/mlibc/mlibc-prismos.patch
+
+# Any change under ports/mlibc -- the sysdeps tree, not just the
+# registration patch -- reaches the build on the next make: the port's
+# checksum is a stamp dependency, so an edited sysdep rebuilds the
+# library without the manual `rm -rf build/mlibc`.
+MLIBC_PORT_FILES := $(shell find ports/mlibc -type f | sort)
+$B/mlibc-port.md5: $(MLIBC_PORT_FILES)
+	@mkdir -p $(@D)
+	@md5sum $(MLIBC_PORT_FILES) > $@.new
+	@cmp -s $@.new $@ || mv $@.new $@
+	@rm -f $@.new
+
+$B/toolchain/usr/.stamp: ports/toolchain/bootstrap.sh ports/toolchain/cross.txt $B/mlibc-port.md5
 	@mkdir -p $(@D)
 	sh ports/toolchain/bootstrap.sh --mlibc $(MLIBC_SRC) --prefix $(abspath $(TOOLCHAIN))
 	@touch $@
@@ -232,32 +244,44 @@ $B/esp.stamp: $B/loader.efi
 
 # P3: ext4 root, read by the loader (boot tree) and the kernel (root fs).
 root: $B/root.stamp
-# The root carries the apps (tools/prism.py installs them, stripped from
-# build/apps-out, at each manifest's [install] path) plus the dynamic trio
-# (phase 3.2's last step): /lib's ld.so -- the interpreter the kernel's
-# PT_INTERP handling loads at USER_INTERP_BASE -- and libc.so, the library
-# ld.so maps with file mmap from /lib (the first of its default search
-# paths), plus the dynamically linked hello as /bin/hello-dyn.  Stripped:
-# the kernel reads whole files (MAX_ELF_FILE is 4 MiB) and the debug
-# sections buy it nothing.
+# The root tree is usr-merged (phase 3.3): the binaries live in /usr/bin
+# -- the apps (tools/prism.py installs them, stripped from
+# build/apps-out, at each manifest's [install] path) plus the dynamic
+# proof hello-dyn and the not-an-ELF sample -- and the shared half in
+# /usr/lib: ld.so (the interpreter the kernel's PT_INTERP handling loads
+# at USER_INTERP_BASE) and libc.so (the library ld.so maps with file
+# mmap).  The root carries the four /usr-merge symlinks -- bin and sbin
+# -> usr/bin, lib and lib64 -> usr/lib -- and the kernel's path walk
+# follows symlinks end to end, so the /bin/<prog> of `exec` and the
+# /lib/ld.so of PT_INTERP change nothing but their spelling.  /tmp is
+# here as well: the tmpfs the kernel mounts on it at boot needs an
+# existing directory (1777, the classic /tmp).  Stripped: the kernel
+# reads whole files (MAX_ELF_FILE is 4 MiB) and the debug sections buy
+# it nothing.
 $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
 	$(HELLO_DYN) $B/apps.stamp
 	rm -rf $B/root
 	mkdir -p $B/root/boot/lua $B/root/boot/defaults $B/root/boot/kernel \
-                 $B/root/bin $B/root/dev $B/root/etc $B/root/lib $B/root/usr
+                 $B/root/dev $B/root/etc $B/root/tmp \
+                 $B/root/usr/bin $B/root/usr/lib
+	chmod 1777 $B/root/tmp
 	cp boot/lua/*.lua $B/root/boot/lua/
 	cp boot/conf/defaults-loader.conf $B/root/boot/defaults/loader.conf
 	cp boot/conf/loader.conf $B/root/boot/loader.conf
 	cp $B/kernel $B/root/boot/kernel/kernel
 	$(PYTHON) tools/prism.py install --all --dest $B/root
-	cp $(HELLO_DYN) $B/root/bin/hello-dyn
-	printf '#!/bin/sh\necho "not an ELF file"\n' > $B/root/bin/notelf
-	chmod 755 $B/root/bin/*
+	cp $(HELLO_DYN) $B/root/usr/bin/hello-dyn
+	printf '#!/bin/sh\necho "not an ELF file"\n' > $B/root/usr/bin/notelf
+	chmod 755 $B/root/usr/bin/*
 	$(TOOLCHAIN)/bin/x86_64-prismos-strip --strip-all \
-		-o $B/root/lib/ld.so $(SYSROOT)/usr/lib/ld.so
+		-o $B/root/usr/lib/ld.so $(SYSROOT)/usr/lib/ld.so
 	$(TOOLCHAIN)/bin/x86_64-prismos-strip --strip-all \
-		-o $B/root/lib/libc.so $(SYSROOT)/usr/lib/libc.so
-	chmod 755 $B/root/lib/ld.so $B/root/lib/libc.so
+		-o $B/root/usr/lib/libc.so $(SYSROOT)/usr/lib/libc.so
+	chmod 755 $B/root/usr/lib/ld.so $B/root/usr/lib/libc.so
+	ln -s usr/bin $B/root/bin
+	ln -s usr/bin $B/root/sbin
+	ln -s usr/lib $B/root/lib
+	ln -s usr/lib $B/root/lib64
 	touch $@
 
 $B/$(NAME).img: $B/boot0.bin $B/boot1.bin $B/loader.bin $B/esp.stamp $B/root.stamp tools/mkimage.py include/prism.inc

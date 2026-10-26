@@ -1,4 +1,4 @@
-# /bin/fork -- fork / waitpid / kill / signal, with the C library's
+# /usr/bin/fork -- fork / waitpid / kill / signal, with the C library's
 # vocabulary; the PrismOS-only calls stay raw through prism_raw.h.
 [package]
 name = "fork"
@@ -9,7 +9,7 @@ description = "fork / waitpid / kill / signal scenarios"
 sources = ["src/fork.c"]
 
 [install]
-path = "/bin/fork"
+path = "/usr/bin/fork"
 
 [verify]
 syscalls = [1, 8, 9, 10, 38, 7, 5]

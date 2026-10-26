@@ -18,7 +18,10 @@ Disk layout (GPT with a protective MBR carrying boot0):
     next             P3 "PrismOS root": ext4, read by the loader (read-only
                      boot tree) and by the kernel (root filesystem):
                          /boot/kernel/kernel, /boot/lua/*.lua,
-                         /boot/loader.conf, /bin, /etc, /usr
+                         /boot/loader.conf, and the usr-merged tree
+                         (phase 3.3): /usr/{bin,lib} with the root
+                         symlinks bin|sbin -> usr/bin, lib|lib64 -> usr/lib,
+                         /dev, /etc and /tmp (the tmpfs mount point)
     last 33 LBAs     backup GPT
 
 Only the Python standard library plus mkfs.fat, mtools and mke2fs are
@@ -115,6 +118,38 @@ def build_fat(esp_dir, size_mib, workdir):
     return img
 
 
+def validate_root(root_dir):
+    """The usr-merge layout contract (phase 3.3), checked before mke2fs so
+    a broken staging dies with a message instead of an unbootable image:
+    binaries in /usr/bin, the shared half in /usr/lib, the four /usr-merge
+    symlinks at the root, a /tmp directory for the boot-time tmpfs mount,
+    and the kernel where the loader reads it."""
+    if not os.path.isdir(root_dir):
+        sys.exit("root tree: %s is not a directory" % root_dir)
+    if not os.path.isfile(os.path.join(root_dir, "boot", "kernel", "kernel")):
+        sys.exit("root tree: boot/kernel/kernel missing (the loader reads it)")
+    for d in ("usr/bin", "usr/lib", "dev", "etc", "tmp"):
+        if not os.path.isdir(os.path.join(root_dir, d)):
+            sys.exit("root tree: /%s missing" % d)
+    bins = [f for f in os.listdir(os.path.join(root_dir, "usr", "bin"))
+            if not f.startswith(".")]
+    if not bins:
+        sys.exit("root tree: /usr/bin is empty (the packages did not install)")
+    for f in ("ld.so", "libc.so"):
+        if not os.path.isfile(os.path.join(root_dir, "usr", "lib", f)):
+            sys.exit("root tree: /usr/lib/%s missing (the dynamic half)" % f)
+    # The four /usr-merge symlinks: bin, sbin -> usr/bin; lib, lib64 -> usr/lib.
+    for name, target in (("bin", "usr/bin"), ("sbin", "usr/bin"),
+                         ("lib", "usr/lib"), ("lib64", "usr/lib")):
+        p = os.path.join(root_dir, name)
+        if not os.path.islink(p):
+            sys.exit("root tree: /%s is not a symlink (the usr-merge)" % name)
+        if os.readlink(p) != target:
+            sys.exit("root tree: /%s -> %r, wanted %r"
+                     % (name, os.readlink(p), target))
+    print("root tree: usr-merge layout ok (%d binaries in /usr/bin)" % len(bins))
+
+
 def build_ext4(root_dir, size_mib, workdir):
     """ext4 filesystem image populated from root_dir (P3)."""
     img = os.path.join(workdir, "root.img")
@@ -142,6 +177,8 @@ def main():
                     help="ext4 root size in MiB")
     ap.add_argument("-o", "--output", required=True)
     args = ap.parse_args()
+
+    validate_root(args.root_dir)
 
     c = read_constants(args.inc)
     boot1_sectors = c["BOOT1_SECTORS"]

@@ -410,6 +410,93 @@ def run_fallocate(tmp):
     return (not probs), "\n".join(probs) + "\n" + log[-600:]
 
 
+def run_tmpfs(tmp):
+    """phase 3.3: the tmpfs the kernel mounts on /tmp at boot -- the whole
+    mutable surface against RAM nodes, the byte quota, and the mount
+    boundary (nothing crosses it, the mount point itself is busy)."""
+    img = os.path.join(tmp, "tmpfs.img")
+    with open(img, "wb") as f:
+        f.truncate(16 * 1024 * 1024)
+    sh(["mke2fs", "-q", "-F", "-t", "ext4", img])
+    lines = [
+        "mkdir /tmp",                      # what the kernel's mkdir_p does
+        "tmpfs /tmp 65536 32",             # 64 KiB / 32 files, test-sized
+        "df /tmp",
+        "mkdir /tmp/d",
+        "write /tmp/d/a hello tmpfs\\n",
+        "cat /tmp/d/a",
+        "append /tmp/d/a second line\\n",
+        "cat /tmp/d/a",
+        "size /tmp/d/a",
+        "ln /tmp/d/a /tmp/hard",
+        "nlink /tmp/d/a",
+        "symlink a /tmp/d/soft",
+        "readlink /tmp/d/soft",
+        "cat /tmp/d/soft",
+        "ls /tmp/d",
+        "mv /tmp/d/a /tmp/d/b",
+        "cat /tmp/d/b",
+        "!cat /tmp/d/a",
+        "chmod /tmp/d/b 600",
+        "mode /tmp/d/b",
+        "!rm /tmp/d",                      # a directory: unlink's IsDir
+        "!rmdir /tmp/d",                    # not empty
+        "!rmdir /tmp",                      # the mount point is busy
+        "!rm /tmp",
+        "write /on-disk persistent\\n",
+        "!mv /tmp/d/b /cross-out",          # nothing crosses the mount
+        "!mv /on-disk /tmp/cross-in",
+        "!ln /tmp/d/b /on-disk-link",
+        "gen /tmp/big 11:60000",
+        "check /tmp/big 11:60000",
+        "!gen /tmp/over 12:10000",          # the byte quota
+        "df /tmp",
+        "rm /tmp/big",
+        "gen /tmp/after 13:3000",           # the space came back
+        "check /tmp/after 13:3000",
+        "truncate /tmp/after 10",
+        "size /tmp/after",
+        "prealloc /tmp/after 4096 1000",    # extends past EOF (RAM: zeros)
+        "size /tmp/after",
+        "blk /tmp/after",
+        "umount /tmp",
+        "!cat /tmp/d/b",                    # the RAM went with the mount
+        "ls /tmp",
+        # the inode quota, on a fresh mount: 5 nodes are root + four dirs
+        "tmpfs /tmp 1048576 5",
+        "mkdir /tmp/i1",
+        "mkdir /tmp/i2",
+        "mkdir /tmp/i3",
+        "mkdir /tmp/i4",
+        "!mkdir /tmp/i5",
+        "umount /tmp",
+    ]
+    log, rc = run_script(img, lines, tmp, "tmpfs")
+    probs = []
+    if rc != 0:
+        probs.append("script failed:\n" + log[-2000:])
+    for want in ["cat /tmp/d/a: hello tmpfs\nsecond line",
+                 "readlink /tmp/d/soft: a",
+                 "nlink /tmp/d/a: 2",
+                 "ls /tmp/d: a soft",
+                 "mode /tmp/d/b: 600",
+                 "ERR IsDir", "ERR NotEmpty", "ERR Busy", "ERR CrossDevice",
+                 "ERR NoSpace", "ls /tmp: "]:
+        if want not in log:
+            probs.append("missing: " + repr(want))
+    dfs = [l.split(": ", 1)[1] for l in log.splitlines() if l.startswith("df /tmp")]
+    # empty mount: 64 KiB free of 16 blocks, 31 free of 32 files
+    if len(dfs) >= 1 and dfs[0] != "16 16 32 31":
+        probs.append("fresh df: " + dfs[0])
+    # 60019 bytes used at the quota wall: 1 free block, 26 free files
+    if len(dfs) >= 2 and dfs[1] != "16 1 32 26":
+        probs.append("quota df: " + dfs[1])
+    ok, out = fsck(img)                    # the tmpfs never touched the disk
+    if not ok:
+        probs.append("e2fsck:\n" + out[-1500:])
+    return (not probs), "\n".join(probs) + "\n" + log[-1500:]
+
+
 def run_csum_detect(tmp):
     """phase 1.5: metadata checksums are verified on read -- a corrupted
     inode or superblock is detected, not silently used."""
@@ -458,7 +545,8 @@ def main():
                      ("journal crash + replay (phase 1.5)", run_journal_crash),
                      ("journal replay by e2fsck (phase 1.5)", run_journal_crash_e2fsck_replay),
                      ("fallocate preallocation (phase 1.5)", run_fallocate),
-                     ("checksum detection (phase 1.5)", run_csum_detect)):
+                     ("checksum detection (phase 1.5)", run_csum_detect),
+                     ("tmpfs on /tmp (phase 3.3)", run_tmpfs)):
         ok, msg = fn(tmp)
         print(("ok    " if ok else "FAIL  ") + name)
         if not ok:

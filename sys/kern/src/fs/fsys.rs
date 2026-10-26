@@ -10,6 +10,7 @@ use crate::hw::ahci;
 use crate::hw::blk::{read_gpt, BlockDev, GptEntry, Partition};
 use crate::fs::devfs::DevFs;
 use crate::fs::ext4::Ext4;
+use crate::fs::tmpfs::{TmpFs, MAX_BYTES, MAX_FILES};
 use crate::fs::vfs::{self, FsError, Vfs};
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -208,6 +209,23 @@ pub fn init() {
         match vfs().mount("/dev", Box::new(DevFs::new())) {
             Ok(()) => crate::kprintln!("vfs      : devfs on /dev (console, null, zero)"),
             Err(e) => crate::kprintln!("vfs      : cannot mount devfs on /dev: {}", e.as_str()),
+        }
+    }
+    // /tmp is a tmpfs (phase 3.3): RAM-backed, everything the VFS can do
+    // to a file system, bounded by a 16 MiB / 4096-file quota (fs/tmpfs.rs).
+    // The mount needs an existing /tmp directory in the root -- the build
+    // creates one (1777); mkdir_p keeps older images working.
+    if vfs().is_mounted() {
+        match vfs().mkdir_p("/tmp", 0o1777) {
+            Ok(()) => match vfs().mount("/tmp", Box::new(TmpFs::new())) {
+                Ok(()) => crate::kprintln!(
+                    "vfs      : tmpfs on /tmp (RAM, {} MiB / {} files quota)",
+                    MAX_BYTES >> 20,
+                    MAX_FILES
+                ),
+                Err(e) => crate::kprintln!("vfs      : cannot mount tmpfs on /tmp: {}", e.as_str()),
+            },
+            Err(e) => crate::kprintln!("vfs      : cannot create /tmp: {}", e.as_str()),
         }
     }
 }

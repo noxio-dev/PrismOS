@@ -3,15 +3,16 @@
 A userland program on PrismOS is a **package**: a directory under `apps/`
 carrying a `prism.toml` manifest.  The mini libc is gone — **mlibc is the
 only libc** — and `tools/prism.py` (the `./prism` shim at the repo root) is
-the builder.  Five packages live here: `hello`, `fork`, `fd`, `posix` and
-`cube` (the kernel's spinning cube, phase 3.3).
+the builder.  Six packages live here: `hello`, `fork`, `fd`, `posix`,
+`cube` (the kernel's spinning cube) and `tmpfs` (the phase 3.3 RAM file
+system, exercised from ring 3).
 
 ## The five-minute tour
 
 ```
 $ ./prism init demo            # scaffold apps/demo (manifest + src/main.c)
 $ ./prism build demo           # compile + link + verify + stage, stripped
-$ make                         # the image picks it up: /bin/demo
+$ make                         # the image picks it up: /usr/bin/demo
 $ ./prism run                  # boot it (make run-uefi-kvm)
 prism# exec demo
 hello from demo (uptime 1437 ms)
@@ -39,7 +40,7 @@ strip = true                # the kernel reads whole files (4 MiB cap)
 verify = true               # verify.sh's loader-contract checks
 
 [install]
-path = "/bin/hello"         # where it lands in the image's root
+path = "/usr/bin/hello"     # where it lands in the image's root
 
 [verify]                     # optional: the program's own ABI
 syscalls = [1, 7, 3, 4, 5]  # every syscall it makes, by number
@@ -97,8 +98,9 @@ the binary has to be the same static PIE either way.
 
 `prism install` then copies the staged binary into a root tree (the
 Makefile's `root.stamp` calls `install --all --dest build/root`), and the
-manifest's `[install] path` decides where it lands — `/bin/hello`,
-`/bin/cube`, ...
+manifest's `[install] path` decides where it lands — `/usr/bin/hello`,
+`/usr/bin/cube`, ... (the image is usr-merged: `/bin` is a symlink to
+`usr/bin`, so the shell's `exec hello` spells it either way)
 
 ### The diet, honestly
 
@@ -131,7 +133,7 @@ prism clean [name]     a package's outputs, or all of them (--all)
 
 ## Not packages (yet)
 
-`/bin/hello-dyn` — the dynamically linked proof of phase 3.2's last step
+`/usr/bin/hello-dyn` — the dynamically linked proof of phase 3.2's last step
 (`make hello-dyn`, `ports/toolchain/build.sh stage dyn`) — and `/lib`'s
 `ld.so` + `libc.so` stay toolchain-phase artifacts.  A `dynamic = true`
 manifest mode is the natural next step.

@@ -370,9 +370,11 @@ pub(super) fn cmd_usertest(_args: &mut Args) {
     }
 }
 
-/// Default environment of programs started from the shell.
+/// Default environment of programs started from the shell.  PATH walks the
+/// usr-merge layout first (/usr/bin, where the packages install) and keeps
+/// /bin -- a symlink to usr/bin -- for muscle memory.
 const DEFAULT_ENV: [&str; 3] = [
-    "PATH=/bin",
+    "PATH=/usr/bin:/bin",
     "HOME=/",
     concat!("PRISMOS=", env!("CARGO_PKG_VERSION")),
 ];

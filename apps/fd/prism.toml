@@ -1,4 +1,4 @@
-# /bin/fd -- the descriptor table: open / close / dup / pipe / lseek,
+# /usr/bin/fd -- the descriptor table: open / close / dup / pipe / lseek,
 # the console's O_NONBLOCK included.
 [package]
 name = "fd"
@@ -9,7 +9,7 @@ description = "descriptor-table scenarios (open, dup, pipe, nonblocking)"
 sources = ["src/fd.c"]
 
 [install]
-path = "/bin/fd"
+path = "/usr/bin/fd"
 
 [verify]
 syscalls = [1, 13, 14, 15, 16, 17, 18, 8, 9, 7, 38, 5]

@@ -19,6 +19,7 @@ use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::rc::Rc;
+use alloc::boxed::Box;
 
 struct FileDev {
     f: RefCell<File>,
@@ -180,8 +181,18 @@ fn main() {
                 "chmod" => { vfs.chmod(a, u16::from_str_radix(rest, 8).unwrap())?; String::new() }
                 "touch" => { vfs.create(a, 0o644)?; String::new() }
                 "sync" => { vfs.sync_all()?; String::new() }
-                "df" => { let s = vfs.statfs("/")?; format!("{} {} {} {}", s.blocks, s.free_blocks, s.files, s.free_files) }
+                "df" => { let s = vfs.statfs(if a.is_empty() {"/"} else {a})?; format!("{} {} {} {}", s.blocks, s.free_blocks, s.files, s.free_files) }
                 "umount" => { vfs.umount(a)?; String::new() }
+                // tmpfs <path> [max_bytes] [max_files] (phase 3.3): mount the
+                // RAM file system the kernel mounts on /tmp at boot, with
+                // test-sized limits for the quota scenarios.
+                "tmpfs" => {
+                    let mut it = rest.split_whitespace();
+                    let bytes: u64 = it.next().map_or(fs::tmpfs::MAX_BYTES, |s| s.parse().unwrap());
+                    let files: u64 = it.next().map_or(fs::tmpfs::MAX_FILES, |s| s.parse().unwrap());
+                    vfs.mount(a, Box::new(fs::tmpfs::TmpFs::with_limits(bytes, files)))?;
+                    String::new()
+                }
                 // phase 1.5: preallocation (two flavours), block count,
                 // raw bytes, and the crash-right-after-journal-commit exit.
                 "prealloc" => { let (o, l) = rest.split_once(' ').unwrap(); vfs.fallocate(a, o.parse().unwrap(), l.parse().unwrap(), false)?; String::new() }

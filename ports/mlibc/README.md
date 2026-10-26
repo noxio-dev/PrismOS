@@ -167,8 +167,8 @@ Building the library *shared* — `ld.so` linked `-nostdlib` against nothing,
 
 ## What comes next
 
-Both remaining steps of the phase are done — the four `/bin` ports on this
-library (step 4, `usr/mlibc`) and the ELF loader's dynamic linking (step 5:
+Both remaining steps of the phase are done — the four ports on this
+library (step 4, `apps/` — usr-merged into `/usr/bin` now) and the ELF loader's dynamic linking (step 5:
 `PT_INTERP`, this port's `ld.so` + `libc.so` built `-Ddefault_library=both`,
 `DT_NEEDED` resolution in `/lib` and `/usr/lib`, RELRO through `mprotect`).
 What is left is the *run*: a dev box booting the image and executing

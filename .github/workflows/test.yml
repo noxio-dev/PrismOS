@@ -29,6 +29,10 @@ jobs:
         timeout-minutes: 5
         run: make test
 
+      - name: Test /tmp tmpfs + usr-merge (phase 3.3)
+        timeout-minutes: 5
+        run: python3 tests/tmpfs_drive.py build/prismos.img
+
       - name: Upload disk image (on failure, for debug)
         if: failure()
         uses: actions/upload-artifact@v4

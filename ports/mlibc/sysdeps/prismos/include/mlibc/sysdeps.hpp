@@ -58,6 +58,8 @@ struct PrismOSSysdepTags :
         Unlinkat,
         Rename,
         Link,
+        Symlink,
+        Readlink,
         Uname,
         Ioctl,
         Poll,

@@ -511,6 +511,26 @@ int Sysdeps<Link>::operator()(const char *old_path, const char *new_path) {
         return 0;
 }
 
+int Sysdeps<Symlink>::operator()(const char *target_path, const char *link_path) {
+        // The target travels verbatim -- the kernel stores relative targets
+        // relative (the VFS resolves them at walk time), so no *at() shape
+        // and no cwd joining on this argument.
+        auto ret = sys(PRISM_SYS_SYMLINK, target_path, link_path);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<Readlink>::operator()(const char *path, void *buffer, size_t max_size,
+                ssize_t *length) {
+        auto ret = sys(PRISM_SYS_READLINK, path, buffer, max_size);
+        if(int e = sc_error(ret); e)
+                return e;
+        // The kernel's answer is the byte count it placed (no NUL, POSIX).
+        *length = static_cast<ssize_t>(ret);
+        return 0;
+}
+
 int Sysdeps<Uname>::operator()(struct utsname *buf) {
         auto ret = sys(PRISM_SYS_UNAME, buf);
         if(int e = sc_error(ret); e)
@@ -579,7 +599,7 @@ int Sysdeps<Sigaction>::operator()(int signum, const struct sigaction *act,
          * answer mlibc's PthreadSignalInstaller accepts as "cancellation not
          * supported" -- any other error trips its __ensure at load time. */
         if(signum == SIGCANCEL)
-        	return ENOSYS;
+                return ENOSYS;
 #endif
         ksigaction kact = {}, kold = {};
         if(act) {

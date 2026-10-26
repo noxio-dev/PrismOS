@@ -73,6 +73,7 @@ scname() {
         32) echo rmdir;; 33) echo rename;; 34) echo link;; 35) echo uname;;
         36) echo arch_prctl;; 38) echo sigaction;; 40) echo mprotect;;
         43) echo clock_gettime;; 44) echo fb_info;; 45) echo fb_blit;;
+        46) echo symlink;; 47) echo readlink;;
         *) echo "syscall $1";; esac
 }
 
@@ -417,7 +418,7 @@ cube)   SYSCALLS="1 3 5 13 14 15 22 44 45"
 "")     SYSCALLS="1 12 43"
         SYMBOLS="write __mlibc_signal_restore clock_gettime" ;;
 custom) SYSCALLS=${PRISM_VERIFY_SYSCALLS:-}
-	SYMBOLS=${PRISM_VERIFY_SYMBOLS:-} ;;
+        SYMBOLS=${PRISM_VERIFY_SYMBOLS:-} ;;
 *)      echo "verify: unknown program '$PROG' (hello | fork | fd | posix | cube | custom)" >&2; exit 2 ;;
 esac
 

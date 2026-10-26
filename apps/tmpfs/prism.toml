@@ -1,0 +1,19 @@
+# /usr/bin/tmpfs -- the /tmp tmpfs exercised end to end from ring 3
+# (phase 3.3): create / write / read / append, lseek, stat, hard links,
+# symlinks through the new syscall pair (46 / 47), rename, mkdir and
+# rmdir, getdents through opendir -- and the cleanup, because a good
+# /tmp citizen removes what it created.
+[package]
+name = "tmpfs"
+version = "0.1.0"
+description = "the /tmp tmpfs exercised from ring 3"
+
+[build]
+sources = ["src/tmpfs.c"]
+
+[install]
+path = "/usr/bin/tmpfs"
+
+[verify]
+syscalls = [1, 13, 14, 15, 16, 19, 20, 28, 30, 31, 32, 33, 34, 46, 47]
+symbols = ["write", "open", "read", "close", "lseek", "stat", "fstat", "opendir", "readdir", "unlink", "rename", "mkdir", "rmdir", "link", "symlink", "readlink", "snprintf"]

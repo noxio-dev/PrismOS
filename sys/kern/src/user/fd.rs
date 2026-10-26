@@ -371,6 +371,23 @@ fn user_path(ptr: u64) -> Result<String, i64> {
     Ok(process::abs_current(&path))
 }
 
+/// Read the NUL-terminated string at user address `ptr` *verbatim* -- no
+/// cwd join, no normalization.  The symlink target is the one path-shaped
+/// argument that must reach the file system exactly as the caller wrote
+/// it (a relative target stays relative).
+fn user_string(ptr: u64) -> Result<String, i64> {
+    let Some(cur) = process::current() else { return Err(-EFAULT) };
+    let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return Err(-EFAULT) };
+    match crate::user::syscall::read_user_cstr(aspace, ptr, 255) {
+        Ok(v) => match String::from_utf8(v) {
+            Ok(s) => Ok(s),
+            Err(_) => Err(-EINVAL), // like user_path: a non-utf8 string is not a path
+        },
+        Err(-7) => Err(-ENAMETOOLONG),
+        Err(e) => Err(e),
+    }
+}
+
 /// Next input byte from the keyboard or the serial line, if either has one
 /// (the same merge the shell's line reader does; non-blocking).
 fn get_input_byte() -> Option<u8> {
@@ -1192,6 +1209,46 @@ pub fn sys_link(old_p: u64, new_p: u64) -> i64 {
         Err(e) => return e,
     };
     crate::fs::fsys::vfs().link(&old, &new).map_or_else(|e| -fs_errno(e), |_| 0)
+}
+
+/// `symlink(target, linkpath)` (syscall 46): a symbolic link.  The target
+/// is stored verbatim -- a relative target stays relative, exactly what
+/// the shell's `ln -s` writes through the same VFS call -- and the link
+/// path is resolved against the *process* cwd like every path call.
+pub fn sys_symlink(target_p: u64, link_p: u64) -> i64 {
+    let target = match user_string(target_p) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let link = match user_path(link_p) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    crate::fs::fsys::vfs().symlink(&target, &link).map_or_else(|e| -fs_errno(e), |_| 0)
+}
+
+/// `readlink(path, buf, bufsz)` (syscall 47): the target of a symlink,
+/// copied *without* a NUL (POSIX) and answered as the number of bytes
+/// placed.  -EINVAL on anything that is not a link and on a zero-size
+/// buffer (the Linux answer).
+pub fn sys_readlink(path_p: u64, buf_p: u64, bufsz: u64) -> i64 {
+    if bufsz == 0 {
+        return -EINVAL;
+    }
+    let abs = match user_path(path_p) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    match crate::fs::fsys::vfs().readlink(&abs) {
+        Ok(target) => {
+            let n = (target.len() as u64).min(bufsz) as usize;
+            if !copy_out(buf_p, 0, &target.as_bytes()[..n]) {
+                return -EFAULT;
+            }
+            n as i64
+        }
+        Err(e) => -fs_errno(e),
+    }
 }
 
 // ------------------------------------------------------- poll / select (3.2)

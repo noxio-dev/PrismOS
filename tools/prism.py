@@ -454,7 +454,7 @@ sources = ["src/main.c"]
 # verify = true                    # verify.sh after every build
 
 [install]
-path = "/bin/%(name)s"
+path = "/usr/bin/%(name)s"
 
 # The program's ABI, checked under disassembly: every syscall it makes and
 # a symbol or two those paths live in (verify.sh's reaches).  The scaffold
@@ -482,7 +482,7 @@ def cmd_init(args):
         f.write(INIT_MAIN_C % {"name": name})
     print("prism: apps/%s scaffolded -- build it with "
           "`python3 tools/prism.py build %s`" % (name, name))
-    print("prism: `make` picks it up: the image installs /bin/%s" % name)
+    print("prism: `make` picks it up: the image installs /usr/bin/%s" % name)
 
 
 # ----------------------------------------------------------------- commands
