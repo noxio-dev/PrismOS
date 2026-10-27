@@ -67,6 +67,20 @@ enum {
         PRISM_SYS_FB_BLIT = 45,      /* fb_blit(x, y, w, h, buf, stride) */
         PRISM_SYS_SYMLINK = 46,      /* symlink(target, linkpath) */
         PRISM_SYS_READLINK = 47,     /* readlink(path, buf, bufsz) */
+        PRISM_SYS_STATFS = 48,       /* statfs(path, &statfsbuf) -- phase 3.3 */
+        PRISM_SYS_GETPPID = 49,      /* getppid() */
+        PRISM_SYS_GETUID = 50,       /* getuid() -- the fixed root */
+        PRISM_SYS_GETGID = 51,       /* getgid() */
+        PRISM_SYS_UMASK = 52,        /* umask(mask) -> the old one */
+        PRISM_SYS_GETTIMEOFDAY = 53, /* gettimeofday(&tv, tz) */
+        PRISM_SYS_NANOSLEEP = 54,    /* nanosleep(&req, &rem) */
+        PRISM_SYS_MOUNT = 55,        /* mount(src, tgt, type, flags) */
+        PRISM_SYS_UMOUNT = 56,       /* umount(tgt) */
+        PRISM_SYS_REBOOT = 57,       /* reboot(cmd) [noreturn] */
+        PRISM_SYS_LSTAT = 58,       /* lstat(path, &statbuf) -- phase 3.3.4 */
+        PRISM_SYS_SETSID = 59,      /* setsid() -> the new sid */
+        PRISM_SYS_SETPGID = 60,     /* setpgid(pid, pgid) */
+        PRISM_SYS_GETPGID = 61,     /* getpgid(pid) -- 0 = the caller */
 };
 
 /* arch_prctl() codes -- the Linux x86-64 values the kernel expects. */

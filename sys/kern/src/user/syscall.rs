@@ -46,6 +46,20 @@
 //                                      (r10 / r8 / r9 carry 4..6, like
 //                                      mmap)
 //
+// Phase 3.3 (the rest: the init / TTY / /proc step):
+//    46 symlink(target, linkpath)   47 readlink(path, buf, bufsz)
+//    48 statfs(path, buf)          the mount a path sits on
+//    49 getppid()                   50 getuid()        51 getgid()
+//    52 umask(mask)                 53 gettimeofday(tv, tz)
+//    54 nanosleep(req, rem)         57 reboot(cmd)
+//    55 mount(source, target, fstype, flags) -- four args, flags in r10
+//    56 umount(target)
+//
+// Phase 3.3.4 (sessions and process groups):
+//    58 lstat(path, buf)            stat that does not follow the final link
+//    59 setsid()                    60 setpgid(pid, pgid)   61 getpgid(pid)
+//    (a negative kill pid names a group; TIOCSCTTY claims a terminal)
+//
 // `exit` never returns to the caller.  `yield` and `sleep` switch to another
 // process and come back here only when the process is scheduled again (the
 // trap frame stayed on its kernel stack).  `yield` only hands the CPU to a
@@ -180,12 +194,15 @@ fn sys_execve(frame: &mut IsrFrame, path_p: u64, argv_p: u64, envp_p: u64) -> i6
         let abs = process::abs_current(&path);
         // A program started without argv still gets argv[0].
         let argv = if argv.is_empty() { alloc::vec![path.clone().into_bytes()] } else { argv };
+        // /proc's view of the new image (phase 3.3), taken now: the flat
+        // command line it was started with.
+        let flat = process::argv_flat(&argv);
         match elf::load_path(&abs, &argv, &envp) {
-            Ok(l) => (l, abs),
+            Ok(l) => (l, abs, flat),
             Err(e) => return -e.errno(),
         }
     };
-    let (new, abs) = loaded;
+    let (new, abs, flat) = loaded;
     // Point of no return: swap the address space (the new tables go live
     // before the old ones are freed), rename the process, restart in ring 3.
     let old = cur.aspace.replace(new.aspace);
@@ -194,6 +211,10 @@ fn sys_execve(frame: &mut IsrFrame, path_p: u64, argv_p: u64, envp_p: u64) -> i6
     unsafe { cur.aspace.as_ref().unwrap().activate() };
     drop(old);
     cur.name = elf::base_name(&abs);
+    // /proc's view of the new image (phase 3.3): the command line it was
+    // started with and the binary it became.
+    cur.argv = flat;
+    cur.exe = abs.clone();
     cur.fpu.reset();
     cur.signals.exec_reset(); // POSIX: caught -> default, SIG_IGN kept, mask kept
     cur.brk_base = new.image_end; // the new image's heap bounds (3.1)
@@ -284,6 +305,22 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         // ---- phase 3.3: /tmp tmpfs + the usr-merge userland ------------
         46 => fd::sys_symlink(a0, a1),
         47 => fd::sys_readlink(a0, a1, a2),
+        // ---- phase 3.3: statfs, identity, time, mounts, reboot ----------
+        48 => fd::sys_statfs(a0, a1),
+        49 => sysc::sys_getppid(),
+        50 => sysc::sys_getuid(),
+        51 => sysc::sys_getgid(),
+        52 => sysc::sys_umask(a0),
+        53 => sysc::sys_gettimeofday(a0, a1),
+        54 => sysc::sys_nanosleep(a0, a1),
+        55 => crate::fs::fsys::sys_mount(a0, a1, a2, frame.r10),
+        56 => crate::fs::fsys::sys_umount(a0),
+        57 => sysc::sys_reboot(a0),
+        // ---- phase 3.3.4: sessions and process groups -------------------
+        58 => fd::sys_lstat(a0, a1),
+        59 => sysc::sys_setsid(),
+        60 => sysc::sys_setpgid(a0, a1),
+        61 => sysc::sys_getpgid(a0),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

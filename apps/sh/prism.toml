@@ -1,0 +1,29 @@
+# /usr/bin/sh -- the userland shell (phase 3.3.7): what init respawns
+# on the console.  The tty does the line editing (ICANON + ECHO, the
+# kernel's user/tty.rs), this does the words: builtins for the daily
+# surface (cd, ls, cat, write, append, df, ps, ...), a PATH walk for
+# everything else, ^C for the foreground command (TIOCSPGRP).  busybox
+# ash replaces it at 3.4.5 -- until then it is the honest test rig for
+# the whole phase: termios, /proc, statfs, the interruptible reads.
+[package]
+name = "sh"
+version = "0.1.0"
+description = "the userland shell: builtins + PATH exec, on the tty's line discipline"
+
+[build]
+sources = ["src/sh.c"]
+
+[install]
+path = "/usr/bin/sh"
+
+# verify.sh's sh diet: every syscall the program makes (the foreground
+# claim and df's statfs go raw -- prism_ioctl / prism_statfs, hence 29 /
+# 48 without the libc symbols; signal() is mlibc's sigaction wrapper,
+# hence 38; the exit path is _exit, syscall 0 never rides a symbol).
+[verify]
+syscalls = [1, 2, 7, 8, 9, 13, 14, 15, 19, 24, 25, 28, 29, 30, 31, 32, 38, 43, 47, 48, 49, 58, 59, 60, 61]
+symbols = ["printf", "read", "write", "open", "close", "opendir", "readdir", "lstat", "stat", "fork", "execve", "waitpid", "chdir", "getcwd", "unlink", "mkdir", "rmdir", "readlink", "getpid", "getpgrp", "setsid", "setpgid", "signal"]
+
+# 58 lstat (ls -l on a symlink), 59 setsid / 60 setpgid / 61 getpgid:
+# the session + process-group setup of phase 3.3.4 (the foreground claim
+# is a group now, hence the TIOCSCTTY / TIOCSPGRP pair riding 29).

@@ -3,15 +3,17 @@
 # Copyright (c) 2026 noxio-dev
 """
 Boot-time proof of phase 3.3: the /tmp tmpfs and the usr-merge, driven
-through the shell of a freshly booted image (needs qemu, like
-tests/shell_drive.py whose run() this reuses).
+through the *userland shell* of a freshly booted image (needs qemu,
+like tests/shell_drive.py whose run() this reuses -- phase 3.3.7: the
+boot goes through init, the prompt is prism$).
 
     tests/tmpfs_drive.py build/prismos.img
 
-Checks: the boot log mounts tmpfs on /tmp; /bin, /sbin, /lib and
-/lib64 are the usr-merge symlinks; the tmpfs package passes its own
-scenarios from ring 3 -- twice, because a good /tmp citizen leaves
-the tree clean -- and the shell can write /tmp itself.
+Checks: the boot log mounts tmpfs on /tmp and starts init as pid 1;
+/bin, /sbin, /lib and /lib64 are the usr-merge symlinks; the tmpfs
+package passes its own scenarios from ring 3 -- twice, because a good
+/tmp citizen leaves the tree clean -- and the shell can write /tmp
+itself.
 """
 import os
 import sys
@@ -26,18 +28,20 @@ def main():
         return 2
     out = run(sys.argv[1], [
         "ls -l /",
-        "exec hello",
-        "exec tmpfs",
-        "exec tmpfs",
-        "write /tmp/from-shell written by the shell\\n",
+        "hello",
+        "tmpfs",
+        "tmpfs",
+        "write /tmp/from-shell written by the shell",
         "cat /tmp/from-shell",
         "df",
-    ], timeout=180)
+    ], timeout=180, prompt=b"prism$ ")
     print(out)
     want = [
-        "tmpfs on /tmp",                      # the boot-time mount
-        "-> usr/bin",                         # bin, sbin symlinks
-        "-> usr/lib",                         # lib, lib64 symlinks
+        "init: /tmp mounted (tmpfs)",         # pid 1's mount (phase 3.3.7)
+        "init: /proc mounted (procfs, read-only)",  # its other half
+        "user     : /sbin/init as pid 1",      # the session hand-over
+        "-> usr/bin",                         # bin, sbin symlinks (lstat)
+        "-> usr/lib",                         # lib, lib64 symlinks (lstat)
         "tmpfs: 37/37 checks passed",         # the package, first run
         "written by the shell",               # the shell's own write
     ]

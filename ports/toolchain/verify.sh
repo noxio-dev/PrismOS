@@ -73,7 +73,12 @@ scname() {
         32) echo rmdir;; 33) echo rename;; 34) echo link;; 35) echo uname;;
         36) echo arch_prctl;; 38) echo sigaction;; 40) echo mprotect;;
         43) echo clock_gettime;; 44) echo fb_info;; 45) echo fb_blit;;
-        46) echo symlink;; 47) echo readlink;;
+        46) echo symlink;; 47) echo readlink;; 48) echo statfs;;
+        49) echo getppid;; 50) echo getuid;; 51) echo getgid;;
+        52) echo umask;; 53) echo gettimeofday;; 54) echo nanosleep;;
+        55) echo mount;; 56) echo umount;; 57) echo reboot;;
+        58) echo lstat;; 59) echo setsid;; 60) echo setpgid;;
+        61) echo getpgid;;
         *) echo "syscall $1";; esac
 }
 

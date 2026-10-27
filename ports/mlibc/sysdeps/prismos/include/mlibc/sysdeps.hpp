@@ -70,7 +70,28 @@ struct PrismOSSysdepTags :
         OpenDir,
         ReadEntries,
         Tcgetattr,
-        Tcgetwinsize
+        Tcgetwinsize,
+
+        /* the phase 3.3 step: the tty's write side, the identity pair and
+         * the creation mask -- what an init and a shell lean on.  (The
+         * mount pair and statfs are kernel-side syscalls 48 / 55 / 56,
+         * but their tags live behind mlibc's linux option and its
+         * kernel headers; they stay raw through apps/include/prism_raw.h
+         * until that option lands with the busybox step.) */
+        Tcsetattr,
+        GetPpid,
+        GetUid,
+        GetEuid,
+        GetGid,
+        GetEgid,
+        Umask,
+
+        /* the phase 3.3.4 step: sessions and process groups -- what a
+         * getty / shell does before claiming a controlling terminal
+         * (lstat rides on the Stat tag's AT_SYMLINK_NOFOLLOW flag). */
+        SetSid,
+        SetPgid,
+        GetPgid
 {};
 
 struct SysdepTraits {

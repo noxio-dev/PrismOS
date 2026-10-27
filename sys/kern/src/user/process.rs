@@ -69,7 +69,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::naked_asm;
 use core::ptr::addr_of_mut;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::intr::IsrFrame;
 use crate::mem::vmm::{self, AddressSpace};
@@ -94,6 +94,14 @@ pub const SLICE_TICKS: u32 = 2;
 /// Longest single `sleep` in milliseconds: the shell is blocked while a
 /// process sleeps, so an absurd request must not wedge the machine.
 pub const MAX_SLEEP_MS: u64 = 10_000;
+
+/// Watchdog budget meaning "no watchdog" (phase 3.3): a process spawned
+/// with this many ticks (init, from the boot hand-over) and the fork /
+/// execve of a userland parent run without a CPU budget -- the unix rule.
+/// The kernel shell's `exec` keeps applying its 3 s default to what IT
+/// spawns (containment for the kernel-console session); a userland session
+/// contains its runaway programs with ^C, the tty's ISIG, not with a timer.
+pub const NO_WATCHDOG: u64 = u64::MAX;
 
 const EFAULT: i64 = 14;
 const ECHILD: i64 = 10;
@@ -194,6 +202,29 @@ pub struct Process {
     /// keeps it, `chdir` changes it -- every path-taking syscall of the
     /// process resolves against it.
     pub cwd: String,
+    /// Flat NUL-separated command line (phase 3.3, for /proc/<pid>/cmdline):
+    /// what `execve` received, capped at 512 bytes.  `fork` copies it,
+    /// `execve` replaces it, a kernel-born process starts empty (the kernel
+    /// spawner installs what it passed).
+    pub argv: Vec<u8>,
+    /// The binary path that was executed (phase 3.3, for /proc/<pid>/exe):
+    /// absolute, set by `execve` and the boot hand-over.
+    pub exe: String,
+    /// File creation mask (phase 3.3): applied by `mkdir` and kept across
+    /// `fork` and `execve` (POSIX).  File creation through `open` keeps the
+    /// VFS's fixed mode until chmod lands (roadmap 3.4.2).
+    pub umask: u16,
+    /// Process group (phase 3.3.4): the processes a ^C or a SIGHUP is for
+    /// as a group.  A fresh process starts as its own leader (pgid = pid);
+    /// `fork` keeps the parent's group, `setsid` makes a new one.
+    pub pgid: u64,
+    /// Session (phase 3.3.4): the setsid leader's pid, or the inherited
+    /// one.  The session is who a controlling terminal belongs to.
+    pub sid: u64,
+    /// Controlling terminal of the session (phase 3.3.4): 0 none, 1 the
+    /// console tty, 2 the serial tty (`TIOCSCTTY`).  Inherited by `fork`
+    /// (what /dev/tty resolves to), cleared by `setsid`.
+    pub ctty: u8,
     /// Where the heap began: the page after the loaded image (phase 3.1).
     /// The break may shrink back to it but never below -- `brk`'s notion of
     /// "the image ends here" survives growth and shrinkage.
@@ -243,6 +274,23 @@ static mut TABLE: Vec<Box<Process>> = Vec::new();
 static mut NEXT_PID: u64 = 1;
 /// Death counter behind `Process::exit_seq`.
 static mut EXIT_SEQ: u64 = 0;
+
+/// The userland init (phase 3.3): pid 1 once the kernel handed over, 0
+/// while the kernel shell is the session.  Orphans are re-parented to it
+/// (it reaps them through `wait`, like every unix) and it is the one
+/// process the boot hands a `NO_WATCHDOG` budget to.
+static INIT_PID: AtomicU64 = AtomicU64::new(0);
+
+/// Record the init pid (the boot hand-over, once).
+pub fn set_init(pid: u64) {
+    INIT_PID.store(pid, Ordering::Relaxed);
+}
+
+/// The live init, if one is running.
+pub fn init_pid() -> Option<u64> {
+    let pid = INIT_PID.load(Ordering::Relaxed);
+    (pid != 0 && has_live(pid)).then_some(pid)
+}
 
 /// Next death number (interrupts masked at every call site).
 fn next_exit_seq() -> u64 {
@@ -307,6 +355,113 @@ pub fn count() -> usize {
     unsafe { (*addr_of_mut!(TABLE)).len() }
 }
 
+/// The flat NUL-separated form of an argv (phase 3.3, what
+/// /proc/<pid>/cmdline serves): every argument followed by its NUL,
+/// capped at 512 bytes -- the whole honest command line, or as much of
+/// it as fits.
+pub fn argv_flat(argv: &[Vec<u8>]) -> Vec<u8> {
+    const CAP: usize = 512;
+    let mut out = Vec::new();
+    for a in argv {
+        if out.len() >= CAP {
+            break;
+        }
+        let n = a.len().min(CAP - out.len());
+        out.extend_from_slice(&a[..n]);
+        out.push(0);
+    }
+    out
+}
+
+// ------------------------------------------------------- procfs snapshot
+
+/// What procfs needs to know about one process (phase 3.3).  A plain copy
+/// taken under masked interrupts, so the formatting that follows cannot
+/// race the tick's state flips or a concurrent spawn's table growth.
+pub struct ProcInfo {
+    pub pid: u64,
+    pub ppid: u64,
+    pub state: State,
+    pub prio: u8,
+    pub used: u64,
+    pub switches: u64,
+    pub name: String,
+    pub argv: Vec<u8>,
+    pub exe: String,
+    /// The working directory (phase 3.3.6, /proc/<pid>/cwd).
+    pub cwd: String,
+    /// Process group and session (phase 3.3.4), for /proc's stat / status.
+    pub pgid: u64,
+    pub sid: u64,
+}
+
+/// Snapshot the whole table (procfs's /proc/<pid>/ and the `ps` of a
+/// userland session).  Read-only, interrupts masked for the walk.
+pub fn snapshot_table() -> Vec<ProcInfo> {
+    let flags = crate::arch::io::cli_save();
+    // SAFETY: read-only walk with interrupts masked (no spawn / reap /
+    // kill can interleave -- they need the CPU we hold).
+    let out = unsafe {
+        let table = &*addr_of_mut!(TABLE);
+        table
+            .iter()
+            .map(|p| ProcInfo {
+                pid: p.pid,
+                ppid: p.ppid,
+                state: p.state,
+                prio: p.prio,
+                used: p.used,
+                switches: p.switches,
+                name: p.name.clone(),
+                argv: p.argv.clone(),
+                exe: p.exe.clone(),
+                cwd: p.cwd.clone(),
+                pgid: p.pgid,
+                sid: p.sid,
+            })
+            .collect()
+    };
+    // SAFETY: flags came from cli_save on this stack.
+    unsafe { crate::arch::io::restore_flags(flags) };
+    out
+}
+
+/// The live pids of process group `pgrp` (phase 3.3.4): what a ^C through
+/// a terminal's foreground claim and a `kill(-pgrp)` reach.
+pub fn group_pids(pgrp: u64) -> Vec<u64> {
+    let flags = crate::arch::io::cli_save();
+    // SAFETY: read-only walk with interrupts masked.
+    let out = unsafe {
+        let table = &*addr_of_mut!(TABLE);
+        table
+            .iter()
+            .filter(|p| p.pgid == pgrp && p.state != State::Zombie)
+            .map(|p| p.pid)
+            .collect()
+    };
+    // SAFETY: as cli_save.
+    unsafe { crate::arch::io::restore_flags(flags) };
+    out
+}
+
+/// Every live pid except `me` and init (the `kill(-1)` ladder: pid 1 is
+/// the session itself, it never takes part in a broadcast).
+pub fn all_pids_but(me: u64) -> Vec<u64> {
+    let flags = crate::arch::io::cli_save();
+    // SAFETY: read-only walk with interrupts masked.
+    let out = unsafe {
+        let table = &*addr_of_mut!(TABLE);
+        table
+            .iter()
+            .filter(|p| p.pid != me && p.pid != 1 && p.state != State::Zombie)
+            .map(|p| p.pid)
+            .collect()
+    };
+    // SAFETY: as cli_save.
+    unsafe { crate::arch::io::restore_flags(flags) };
+    out
+}
+
 // ------------------------------------------------------------------ spawn
 
 /// Create a process, ready to be scheduled.  `timeout_ticks` is the
@@ -360,7 +515,13 @@ fn spawn_common(
         signals: SignalState::new(),
         fds: FdTable::with_stdio(),
         cwd,
-        brk_base: brk,
+        argv: Vec::new(),
+        exe: String::new(),
+        umask: 0o022,
+        pgid: 0, // assigned with the pid below: a fresh process leads its own
+        sid: 0,
+        ctty: 0,
+        brk_base: brk_base,
         brk,
         fs_base: 0,
         gs_base: 0,
@@ -383,6 +544,11 @@ fn spawn_common(
         NEXT_PID += 1;
         let mut b = Box::new(proc);
         b.pid = pid;
+        // A fresh process is a group of one and a session of one (the
+        // kernel-spawned init included); `setsid` and `setpgid` from ring 3
+        // rearrange the tree later.
+        b.pgid = pid;
+        b.sid = pid;
         (*addr_of_mut!(TABLE)).push(b);
         Ok(pid)
     }
@@ -495,6 +661,12 @@ pub fn fork_current(frame: &IsrFrame) -> i64 {
     let (name, prio, pid_of_parent) = (cur.name.clone(), cur.prio, cur.pid);
     let fpu = cur.fpu.snapshot();
     let signals = cur.signals.fork_copy();
+    // The child keeps the caller's command line, binary path and umask
+    // (phase 3.3): /proc must show what the process tree is.
+    let (argv, exe, umask) = (cur.argv.clone(), cur.exe.clone(), cur.umask);
+    // And its session / process group / controlling terminal (phase 3.3.4):
+    // a forked child joins nothing, it is born where the parent is.
+    let (pgid, sid, ctty) = (cur.pgid, cur.sid, cur.ctty);
     // The child shares the parent's open descriptions (Rc bumps): the
     // tables are separate, what they point at is not.
     let fds = cur.fds.fork_copy();
@@ -521,7 +693,7 @@ pub fn fork_current(frame: &IsrFrame) -> i64 {
         Some(aspace),
         Entry::UserFrame(child_frame),
         (0, 0),
-        0,
+        NO_WATCHDOG, // phase 3.3: a userland child is nobody to contain
         prio,
         pid_of_parent,
         cwd,
@@ -538,6 +710,12 @@ pub fn fork_current(frame: &IsrFrame) -> i64 {
                 c.fds = fds;
                 c.fs_base = fs_base;
                 c.gs_base = gs_base;
+                c.argv = argv;
+                c.exe = exe;
+                c.umask = umask;
+                c.pgid = pgid;
+                c.sid = sid;
+                c.ctty = ctty;
             });
             pid as i64
         }
@@ -967,18 +1145,44 @@ unsafe fn after_death(pid: u64) {
     // SAFETY: as the safety contract.
     unsafe {
         let table = &mut *addr_of_mut!(TABLE);
+        // A live init (not the dying pid itself) adopts what is left behind
+        // (phase 3.3): it reaps through `wait()`, like every unix.  Without
+        // one the kernel does (ppid 0, the kernel shell reaps them).
+        let adopt = init_pid().filter(|a| *a != pid);
         // 1. find the parent (it zombified already, so its ppid is final)
+        //    -- and whether the dying process was a session leader with a
+        //    controlling terminal (phase 3.3.4: the group that held the
+        //    terminal's foreground hears about the loss through SIGHUP).
         let mut ppid = 0;
+        let mut dead_sid_ctty = None;
         for q in table.iter() {
             if q.pid == pid {
                 ppid = q.ppid;
+                if q.sid == q.pid && q.ctty != 0 {
+                    dead_sid_ctty = Some((q.sid, q.ctty));
+                }
                 break;
             }
         }
-        // 2. orphans: the kernel / shell adopts them
+        // 2a. a kernel-born process (ppid 0) that is not init itself is
+        //     handed to init as well, so its zombie is reapable by the
+        //     session's `wait` loop
+        if ppid == 0 {
+            if let Some(a) = adopt {
+                for q in table.iter_mut() {
+                    if q.pid == pid {
+                        q.ppid = a;
+                        break;
+                    }
+                }
+                ppid = a;
+            }
+        }
+        // 2b. orphans: adopted by init when one is alive, by the kernel
+        //     (ppid 0) otherwise
         for q in table.iter_mut() {
             if q.ppid == pid && q.state != State::Zombie {
-                q.ppid = 0;
+                q.ppid = adopt.unwrap_or(0);
             }
         }
         // 3. wake the waiting parent / raise SIGCHLD
@@ -993,6 +1197,22 @@ unsafe fn after_death(pid: u64) {
                     }
                     break;
                 }
+            }
+        }
+        // 4. a session leader that held a controlling terminal is gone
+        //    (phase 3.3.4): the foreground group of that terminal gets
+        //    SIGHUP -- the ^C of last resort, the one a shell's children
+        //    cannot miss -- and the claim goes back to unclaimed, so the
+        //    next session starts from a clean terminal.
+        if let Some((_sid, ctty)) = dead_sid_ctty {
+            let which = match ctty {
+                1 => crate::user::tty::Term::Console,
+                _ => crate::user::tty::Term::Serial,
+            };
+            let fg = crate::user::tty::fg_pgrp(which);
+            crate::user::tty::set_fg(which, 0);
+            if fg != 0 {
+                crate::user::signal::signal_pgrp(fg, crate::user::signal::SIGHUP);
             }
         }
     }
@@ -1066,6 +1286,15 @@ pub fn post_signal(pid: u64, sig: u64) -> bool {
                 if p.signals.handler_of(sig) != 0 {
                     p.signals.pending |= 1 << sig;
                     raised = true;
+                    // A parked process must see the bit now, not at its
+                    // next alarm: the read paths of a tty / pipe re-check
+                    // `interrupt_pending` after every park and answer
+                    // -EINTR (phase 3.3, the unix rule for interruptible
+                    // waits).  Flipping the state only short-circuits the
+                    // park -- the wake_at bookkeeping needs no undo.
+                    if p.state == State::Sleeping {
+                        p.state = State::Ready;
+                    }
                 }
                 break;
             }
@@ -1299,4 +1528,40 @@ pub fn drain_and_reap() {
     reap();
     // SAFETY: as cli_save.
     unsafe { crate::arch::io::restore_flags(flags) };
+}
+
+/// True when process group `pgrp` has at least one live member whose
+/// session is `sid` (the setpgid join rule: an existing group may only be
+/// joined from inside its own session, phase 3.3.4).
+pub fn group_exists_in_session(pgrp: u64, sid: u64) -> bool {
+    let flags = crate::arch::io::cli_save();
+    // SAFETY: read-only walk with interrupts masked.
+    let found = unsafe {
+        let table = &*addr_of_mut!(TABLE);
+        table.iter().any(|p| {
+            p.pgid == pgrp && p.sid == sid && p.state != State::Zombie
+        })
+    };
+    // SAFETY: as cli_save.
+    unsafe { crate::arch::io::restore_flags(flags) };
+    found
+}
+
+/// The live pids of session `sid` (the TIOCSCTTY claim: the controlling
+/// terminal belongs to the whole session, every member resolves
+/// /dev/tty through it, phase 3.3.4).
+pub fn session_pids(sid: u64) -> Vec<u64> {
+    let flags = crate::arch::io::cli_save();
+    // SAFETY: read-only walk with interrupts masked.
+    let out = unsafe {
+        let table = &*addr_of_mut!(TABLE);
+        table
+            .iter()
+            .filter(|p| p.sid == sid && p.state != State::Zombie)
+            .map(|p| p.pid)
+            .collect()
+    };
+    // SAFETY: as cli_save.
+    unsafe { crate::arch::io::restore_flags(flags) };
+    out
 }

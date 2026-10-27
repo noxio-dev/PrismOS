@@ -362,6 +362,49 @@ int Sysdeps<Tcgetwinsize>::operator()(int fd, struct winsize *winsz) {
         return 0;
 }
 
+int Sysdeps<Tcsetattr>::operator()(int fd, int opts, const struct termios *attr) {
+        /* TCSANOW / TCSADRAIN / TCSAFLUSH -- the drain and flush halves
+         * are the kernel's TCSETSW / TCSETSF (the output queue never runs
+         * deep enough to tell them apart).
+         */
+        unsigned long req = TCSETS;
+        if(opts == TCSADRAIN)
+                req = TCSETSW;
+        else if(opts == TCSAFLUSH)
+                req = TCSETSF;
+        auto ret = sys(PRISM_SYS_IOCTL, fd, req, attr);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<SetSid>::operator()(pid_t *sid) {
+        /* The session-making call of a getty / shell (phase 3.3.4): the
+         * kernel answers the new session id, which is the caller's pid.
+         */
+        auto ret = sys(PRISM_SYS_SETSID);
+        if(int e = sc_error(ret); e)
+                return e;
+        *sid = static_cast<pid_t>(ret);
+        return 0;
+}
+
+int Sysdeps<SetPgid>::operator()(pid_t pid, pid_t pgid) {
+        auto ret = sys(PRISM_SYS_SETPGID, pid, pgid);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<GetPgid>::operator()(pid_t pid, pid_t *pgid) {
+        /* pid 0 is the caller -- the spelling getpgrp() uses. */
+        auto ret = sys(PRISM_SYS_GETPGID, pid);
+        if(int e = sc_error(ret); e)
+                return e;
+        *pgid = static_cast<pid_t>(ret);
+        return 0;
+}
+
 int Sysdeps<Poll>::operator()(struct pollfd *fds, nfds_t count, int timeout, int *num_events) {
         auto ret = sys(PRISM_SYS_POLL, fds, count, timeout);
         if(int e = sc_error(ret); e)
@@ -405,10 +448,21 @@ int Sysdeps<Pselect>::operator()(int num_fds, fd_set *read_set, fd_set *write_se
 
 // ------------------------------------------------------------ the namespace
 
-int Sysdeps<Stat>::operator()(fsfd_target fsfdt, int fd, const char *path, int,
+int Sysdeps<Stat>::operator()(fsfd_target fsfdt, int fd, const char *path, int flags,
                 struct stat *statbuf) {
         switch(fsfdt) {
         case fsfd_target::path: {
+                /* AT_SYMLINK_NOFOLLOW (the Linux value) is how lstat()
+                 * spells itself through this tag: the kernel's 58 answers
+                 * the final symlink as itself (phase 3.3.4).  Two call
+                 * sites, not a chosen number: verify.sh tracks the
+                 * immediates, and a runtime pick retires the trace. */
+                if(flags & 0x100) {
+                        auto ret = sys(PRISM_SYS_LSTAT, path, statbuf);
+                        if(int e = sc_error(ret); e)
+                                return e;
+                        return 0;
+                }
                 auto ret = sys(PRISM_SYS_STAT, path, statbuf);
                 if(int e = sc_error(ret); e)
                         return e;
@@ -542,6 +596,36 @@ int Sysdeps<Uname>::operator()(struct utsname *buf) {
 
 pid_t Sysdeps<GetPid>::operator()() {
         return static_cast<pid_t>(sys(PRISM_SYS_GETPID));
+}
+
+pid_t Sysdeps<GetPpid>::operator()() {
+        return static_cast<pid_t>(sys(PRISM_SYS_GETPPID));
+}
+
+/* There are no users yet: the fixed root identity, real and effective
+ * the same number (the kernel's getuid / getgid pair). */
+uid_t Sysdeps<GetUid>::operator()() {
+        return static_cast<uid_t>(sys(PRISM_SYS_GETUID));
+}
+
+uid_t Sysdeps<GetEuid>::operator()() {
+        return static_cast<uid_t>(sys(PRISM_SYS_GETUID));
+}
+
+gid_t Sysdeps<GetGid>::operator()() {
+        return static_cast<gid_t>(sys(PRISM_SYS_GETGID));
+}
+
+gid_t Sysdeps<GetEgid>::operator()() {
+        return static_cast<gid_t>(sys(PRISM_SYS_GETGID));
+}
+
+int Sysdeps<Umask>::operator()(mode_t mode, mode_t *old) {
+        auto ret = sys(PRISM_SYS_UMASK, mode);
+        if(int e = sc_error(ret); e)
+                return e;
+        *old = static_cast<mode_t>(ret);
+        return 0;
 }
 
 void Sysdeps<Yield>::operator()() {
