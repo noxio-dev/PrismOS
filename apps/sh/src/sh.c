@@ -266,7 +266,10 @@ static void ls_entry(const char *path, int longfmt)
 {
         struct stat st;
 
-        if (stat(path, &st) < 0) {
+        /* lstat (phase 3.3.4): a symlink answers as itself -- its own
+         * type and length -- so the usr-merge /bin -> usr/bin shows as
+         * the link it is instead of the directory it points at. */
+        if (lstat(path, &st) < 0) {
                 err("ls", path, strerror(errno));
                 return;
         }
@@ -406,6 +409,26 @@ static int bi_rm(int argc, char **argv)
 /* write / append FILE TEXT... -- the kernel shell's conveniences, same
  * spelling: the text (joined with single spaces) lands in the file,
  * write truncating, append adding a line. */
+/* write(2) in a loop: partial writes answered, the real errno reported --
+ * none of stdio's buffering, which parks the bytes in a FILE and only
+ * surfaces the ENOSPC at its destruction (the /dev/full write used to
+ * end as an mlibc flush warning instead of an error line). */
+static int emit_all(int fd, const char *buf, size_t n, int *errn)
+{
+        while (n > 0) {
+                ssize_t w = write(fd, buf, n);
+                if (w < 0) {
+                        if (errno == EINTR)
+                                continue;
+                        *errn = errno;
+                        return -1;
+                }
+                buf += w;
+                n -= (size_t)w;
+        }
+        return 0;
+}
+
 static int write_file(int argc, char **argv, int append)
 {
         if (argc < 2) {
@@ -419,13 +442,26 @@ static int write_file(int argc, char **argv, int append)
                 return 1;
         }
         int bad = 0;
-        for (int i = 2; i < argc; i++)
-                bad |= dprintf(fd, "%s%s", i > 2 ? " " : "", argv[i]) < 0;
-        bad |= dprintf(fd, "\n") < 0;
-        close(fd);
-        if (bad)
-                err(argv[0], argv[1], strerror(errno));
-        return bad ? 1 : 0;
+        int errn = 0;
+        for (int i = 2; i < argc && !bad; i++) {
+                if (i > 2)
+                        bad = emit_all(fd, " ", 1, &errn) < 0;
+                if (!bad)
+                        bad = emit_all(fd, argv[i], strlen(argv[i]), &errn) < 0;
+        }
+        if (!bad)
+                bad = emit_all(fd, "\n", 1, &errn) < 0;
+        int cerr = errno;
+        int cr = close(fd);
+        if (cr < 0 && !bad) {
+                bad = 1;
+                errn = cerr;
+        }
+        if (bad) {
+                err(argv[0], argv[1], strerror(errn));
+                return 1;
+        }
+        return 0;
 }
 
 /* df: /proc/mounts + the statfs of each (through prism_raw.h -- the
@@ -512,12 +548,24 @@ static int bi_ps(void)
 
 /* ------------------------------------------------------- the run loop */
 
-/* The foreground claim: parked on the child while it runs, back on this
- * shell at the prompt (TIOCSPGRP -- that is what a ^C targets). */
-static void set_fg(pid_t pid)
+/* The foreground claim (phase 3.3.4): parked on the command's process
+ * group while it runs, back on this shell's group at the prompt
+ * (TIOCSPGRP -- that is the group a ^C is delivered to). */
+static void set_fg(pid_t pgrp)
 {
-        int pgrp = pid;
+        int g = (int)pgrp;
 
+        (void)prism_ioctl(0, TIOCSPGRP, &g);
+}
+
+/* The session setup (phase 3.3.4): a session of its own, the terminal
+ * it runs on claimed as its controlling one (TIOCSCTTY -- what a later
+ * /dev/tty open resolves to), and its group in the foreground. */
+static void claim_tty(void)
+{
+        int pgrp = (int)getpgrp();
+
+        (void)prism_ioctl(0, TIOCSCTTY, 0);
         (void)prism_ioctl(0, TIOCSPGRP, &pgrp);
 }
 
@@ -573,6 +621,10 @@ static int run_line(int argc, char **argv)
         }
         if (pid == 0) {
                 signal(SIGINT, SIG_DFL);
+                /* A group of its own (phase 3.3.4), still inside the
+                 * shell's session: a ^C then reaches the command (the
+                 * foreground group) and not the shell (its own group). */
+                setpgid(0, 0);
                 extern char **environ;
                 char path[512];
                 if (strchr(cmd, '/')) {
@@ -594,12 +646,17 @@ static int run_line(int argc, char **argv)
                 printf("sh: %s: command not found\n", cmd);
                 _exit(127);
         }
+        /* Both sides make the child the leader of its own group (the
+         * child's setpgid(0, 0) above may not have run yet): whichever
+         * lands first, the group exists before the foreground claim
+         * reads it. */
+        setpgid(pid, pid);
         set_fg(pid);
         int st;
 
         while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
                 ;
-        set_fg(getpid());
+        set_fg(getpgrp());
         if (WIFSIGNALED(st))
                 printf("sh: %s: killed by signal %d\n", cmd, WTERMSIG(st));
         return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
@@ -640,7 +697,8 @@ int main(int argc, char **argv)
 {
         setvbuf(stdout, 0, _IONBF, 0);
         signal(SIGINT, on_sigint);
-        set_fg(getpid());
+        setsid();
+        claim_tty();
 
         /* sh -c 'words' */
         if (argc == 3 && !strcmp(argv[1], "-c")) {

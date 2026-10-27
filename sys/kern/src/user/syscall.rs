@@ -55,6 +55,11 @@
 //    55 mount(source, target, fstype, flags) -- four args, flags in r10
 //    56 umount(target)
 //
+// Phase 3.3.4 (sessions and process groups):
+//    58 lstat(path, buf)            stat that does not follow the final link
+//    59 setsid()                    60 setpgid(pid, pgid)   61 getpgid(pid)
+//    (a negative kill pid names a group; TIOCSCTTY claims a terminal)
+//
 // `exit` never returns to the caller.  `yield` and `sleep` switch to another
 // process and come back here only when the process is scheduled again (the
 // trap frame stayed on its kernel stack).  `yield` only hands the CPU to a
@@ -311,6 +316,11 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         55 => crate::fs::fsys::sys_mount(a0, a1, a2, frame.r10),
         56 => crate::fs::fsys::sys_umount(a0),
         57 => sysc::sys_reboot(a0),
+        // ---- phase 3.3.4: sessions and process groups -------------------
+        58 => fd::sys_lstat(a0, a1),
+        59 => sysc::sys_setsid(),
+        60 => sysc::sys_setpgid(a0, a1),
+        61 => sysc::sys_getpgid(a0),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

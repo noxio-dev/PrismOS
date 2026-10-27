@@ -3,7 +3,7 @@
 [package]
 name = "posix"
 version = "0.1.0"
-description = "the POSIX surface: stat, mmap, opendir, uname, termios"
+description = "the POSIX surface: stat, mmap, opendir, uname, termios, sessions"
 
 [build]
 sources = ["src/posix.c"]
@@ -12,5 +12,9 @@ sources = ["src/posix.c"]
 path = "/usr/bin/posix"
 
 [verify]
-syscalls = [1, 13, 14, 15, 16, 8, 9, 10, 7, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 38]
-symbols = ["write", "stat", "fstat", "mmap", "opendir", "readdir", "uname", "tcgetattr", "__mlibc_signal_restore"]
+syscalls = [1, 13, 14, 15, 16, 8, 9, 10, 7, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 38, 5, 58, 59, 60, 61]
+symbols = ["write", "stat", "lstat", "fstat", "mmap", "opendir", "readdir", "uname", "tcgetattr", "isatty", "readlink", "setsid", "setpgid", "getpgrp", "kill", "sleep", "__mlibc_signal_restore"]
+# 58 lstat / 59 setsid / 60 setpgid / 61 getpgid -- the phase 3.3.4
+# session scenario (kill -pgrp rides the existing 10; the parked child
+# sleeps through mlibc's Sleep tag, syscall 5, and the group SIGUSR1
+# cuts it short).

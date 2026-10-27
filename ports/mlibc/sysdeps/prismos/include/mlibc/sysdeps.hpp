@@ -84,7 +84,14 @@ struct PrismOSSysdepTags :
         GetEuid,
         GetGid,
         GetEgid,
-        Umask
+        Umask,
+
+        /* the phase 3.3.4 step: sessions and process groups -- what a
+         * getty / shell does before claiming a controlling terminal
+         * (lstat rides on the Stat tag's AT_SYMLINK_NOFOLLOW flag). */
+        SetSid,
+        SetPgid,
+        GetPgid
 {};
 
 struct SysdepTraits {

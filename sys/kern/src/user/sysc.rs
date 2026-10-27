@@ -836,3 +836,77 @@ fn power_off() -> ! {
     }
     crate::arch::intr::park()
 }
+
+// --------------------------------------------------- sessions (phase 3.3.4)
+
+/// `setsid()` (syscall 59): a new session and a new process group, both
+/// led by the caller -- the classic getty/shell move before claiming a
+/// controlling terminal (TIOCSCTTY).  Refused with -EPERM when the caller
+/// is already a process group leader (its pid already names a group:
+/// POSIX's guard against two sessions sharing a number).
+pub fn sys_setsid() -> i64 {
+    const EPERM: i64 = 1;
+    let Some(cur) = process::current() else { return -EFAULT };
+    if cur.pgid == cur.pid {
+        return -EPERM;
+    }
+    cur.sid = cur.pid;
+    cur.pgid = cur.pid;
+    cur.ctty = 0; // a new session has no controlling terminal yet
+    cur.pid as i64
+}
+
+/// `setpgid(pid, pgid)` (syscall 60): move `pid` (0 = the caller) into
+/// `pgid` (0 = the target's own pid, the "make it a leader" spelling).
+/// The rules that matter here: the target exists (-ESRCH), the group is
+/// positive (-EINVAL), an existing group may only be joined inside the
+/// target's own session (-EPERM), a session leader never moves (-EPERM),
+/// and only the caller or a forked child still on its pre-exec legs may
+/// move (-EPERM, the POSIX `EACCES` case folds into it: a post-exec child
+/// cannot be regrouped).
+pub fn sys_setpgid(pid: u64, pgid: u64) -> i64 {
+    const ESRCH: i64 = 3;
+    const EINVAL: i64 = 22;
+    const EPERM: i64 = 1;
+    let Some(cur) = process::current() else { return -EFAULT };
+    let me = cur.pid;
+    let target = if pid == 0 { me } else { pid };
+    if pgid > i32::MAX as u64 {
+        return -EINVAL;
+    }
+    let group = if pgid == 0 { target } else { pgid };
+    if group == 0 {
+        return -EINVAL;
+    }
+    // The target's row (it may be us -- with_pid_mut walks the table, and
+    // for the caller it finds CURRENT just as well).
+    let Some((sid, ppid)) =
+        process::with_pid_mut(target, |p| (p.sid, p.ppid))
+    else {
+        return -ESRCH;
+    };
+    // A session leader is pinned into its group (POSIX).
+    if sid == target {
+        return -EPERM;
+    }
+    // Only self or a direct, still-malleable child.
+    if target != me && ppid != me {
+        return -EPERM;
+    }
+    // Joining an existing group stays inside the session.
+    if group != target && !process::group_exists_in_session(group, sid) {
+        return -EPERM;
+    }
+    let _ = process::with_pid_mut(target, |p| p.pgid = group);
+    0
+}
+
+/// `getpgid(pid)` (syscall 61): the process group of `pid` (0 = the
+/// caller -- which is how mlibc's `getpgrp` spells itself).  -ESRCH when
+/// there is no such live process.
+pub fn sys_getpgid(pid: u64) -> i64 {
+    const ESRCH: i64 = 3;
+    let me = process::getpid();
+    let target = if pid == 0 { me } else { pid };
+    process::with_pid_mut(target, |p| p.pgid).map_or(-ESRCH, |g| g as i64)
+}

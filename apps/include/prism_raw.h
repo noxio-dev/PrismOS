@@ -50,6 +50,7 @@ enum {
         PRISM_SYS_IOCTL = 29,
         PRISM_SYS_FB_INFO = 44,
         PRISM_SYS_FB_BLIT = 45,
+        PRISM_SYS_MOUNT = 55,      /* mount(src, tgt, type, flags) */
         PRISM_SYS_STATFS = 48,
 };
 
@@ -174,6 +175,26 @@ struct prism_statfs {
 static inline long prism_statfs(const char *path, struct prism_statfs *buf)
 {
         return prism_raw3(PRISM_SYS_STATFS, (long)path, (long)buf, 0);
+}
+
+/*
+ * mount(55) (phase 3.3.7): the raw form -- mlibc's public mount() is
+ * linux-option code the port keeps off.  The fourth argument (flags, in
+ * r10) carries MS_RDONLY as bit 0, the only flag there is.  Used by
+ * init, which owns the /proc and /tmp mounts the way a real unix's pid 1
+ * does.
+ */
+static inline long prism_mount(const char *source, const char *target,
+                const char *fstype, unsigned long flags)
+{
+        register long r10 __asm__("r10") = (long)flags;
+        long r;
+        __asm__ volatile("syscall"
+            : "=a"(r)
+            : "a"(PRISM_SYS_MOUNT), "D"((long)source), "S"((long)target),
+              "d"((long)fstype), "r"(r10)
+            : "rcx", "r11", "memory");
+        return r;
 }
 
 /*

@@ -77,6 +77,10 @@ enum {
         PRISM_SYS_MOUNT = 55,        /* mount(src, tgt, type, flags) */
         PRISM_SYS_UMOUNT = 56,       /* umount(tgt) */
         PRISM_SYS_REBOOT = 57,       /* reboot(cmd) [noreturn] */
+        PRISM_SYS_LSTAT = 58,       /* lstat(path, &statbuf) -- phase 3.3.4 */
+        PRISM_SYS_SETSID = 59,      /* setsid() -> the new sid */
+        PRISM_SYS_SETPGID = 60,     /* setpgid(pid, pgid) */
+        PRISM_SYS_GETPGID = 61,     /* getpgid(pid) -- 0 = the caller */
 };
 
 /* arch_prctl() codes -- the Linux x86-64 values the kernel expects. */

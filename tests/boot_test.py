@@ -104,12 +104,22 @@ def main():
             cmd += data_drive()
         return cmd
 
+    # The rescue boot (init=kshell): the kernel mounts /tmp and /proc
+    # itself and says so -- the kernel-shell scenarios expect those lines.
     hello = ["Hello, world!", "PrismOS kernel", "gdt/tss", "idt", "pic",
              "pit      : channel 0 at 100 Hz", "pmm      :", "vmm      :",
              "heap     :", "kbd      :", "interrupts enabled",
              "vfs      : devfs on /dev", "procfs on /proc",
-             "user     : /sbin/init as pid 1 -- the userland session",
-             "PrismOS init: starting the console shell"]
+             "vfs      : tmpfs on /tmp"]
+    # The default boot (the userland session): the same kernel lines minus
+    # the two mounts -- pid 1 makes those now (phase 3.3.7), and says so
+    # in its own words, together with the serial session it starts.
+    hello_user = [l for l in hello if "on /proc" not in l and "on /tmp" not in l] + [
+            "user     : /sbin/init as pid 1 -- the userland session",
+            "init: /proc mounted (procfs, read-only)",
+            "init: /tmp mounted (tmpfs)",
+            "PrismOS init: starting the console shell",
+            "PrismOS init: starting the serial shell (ttyS0)"]
 
     # Phase 3.3: the default boot is the userland session (init as pid 1
     # and the shell at prism$); the kernel shell is the rescue mode.  The
@@ -127,10 +137,20 @@ def main():
         if not fresh:
             with open(conf) as f:
                 fresh = "init=kshell" not in f.read()
+        # The tree the rescue image embeds must follow the root it was
+        # copied from: a newer kernel / app build (root.stamp) means the
+        # copy -- and the image -- are stale.
+        stamp = os.path.join(build, "root.stamp")
+        if not fresh and os.path.exists(stamp):
+            fresh = os.path.getmtime(stamp) > os.path.getmtime(rescue)
         if fresh:
             if os.path.exists(rroot):
                 shutil.rmtree(rroot)
-            shutil.copytree(os.path.join(build, "root"), rroot)
+            # symlinks=True: the usr-merge /bin -> usr/bin must survive
+            # the copy as the link it is (copytree's default FOLLOWS it
+            # and pastes the target directory in its place, which the
+            # image builder's usr-merge check then rightly refuses).
+            shutil.copytree(os.path.join(build, "root"), rroot, symlinks=True)
             with open(conf, "a") as f:
                 f.write('\n# rescue boot: the kernel shell instead of /sbin/init\n'
                         'kernel_options="init=kshell"\n')
@@ -153,7 +173,7 @@ def main():
     scenarios = [
         # BIOS gets a VBE linear framebuffer now: the loader switches to it at the
         # point of no return and the kernel double-buffers its console.
-        ("BIOS autoboot", bios_cmd, [], hello + ["firmware : BIOS", " framebuffer", "back buffer active"], 40),
+        ("BIOS autoboot", bios_cmd, [], hello_user + ["firmware : BIOS", " framebuffer", "back buffer active"], 40),
         ("BIOS prompt: Esc, then boot", bios_cmd,
          [("Autoboot in", "\x1b"), ("OK ", "version\rboot -v\r")],
          ["OK ", "PrismOS loader (bios, Lua 5.4.8)", "Hello, world!", 'cmdline  : "-v"'], 40),
@@ -262,14 +282,14 @@ def main():
         # The shell steps also exercise its own `cd` + `pwd`.
         ("BIOS shell: newlib syscall set (phase 3.1)", ksh_cmd,
          [("prism# ", "exec posix\r"),
-          ("posix: all 10 passed", "ps\r"),
+          ("posix: all 11 passed", "ps\r"),
           ("prism# ", "cd /boot\r"),
           ("prism# ", "pwd\r")],
-         ["posix (pid 1): the newlib syscall set",
+         ["posix (pid 1): the C library's syscall set",
           "stat      ok", "brk       ok", "mmap      ok", "cwd       ok",
           "dup2      ok", "nonblk    ok", "sigpipe   ok", "getdents  ok",
           "fsops     ok", "uname     ok",
-          "posix: all 10 passed",
+          "posix: all 11 passed",
           "postexec: O_CLOEXEC fd closed, dupfd alive, stdout ok",
           "pid 1 posix -- exited with status 0",
           "process table empty",
@@ -277,7 +297,7 @@ def main():
     ]
     if code and vars_ and os.path.exists(code):
         scenarios += [
-            ("UEFI autoboot", uefi_cmd, [], hello + ["firmware : UEFI", " framebuffer", "back buffer active"], 90),
+            ("UEFI autoboot", uefi_cmd, [], hello_user + ["firmware : UEFI", " framebuffer", "back buffer active"], 90),
             ("UEFI prompt: Esc, then boot", uefi_cmd,
              [("Autoboot in", "\x1b"), ("OK ", "lsmem\rboot -v\r")],
              ["OK ", "usable", "Hello, world!", 'cmdline  : "-v"'], 90),
@@ -375,7 +395,7 @@ def main():
           ("prism$ ", "df\r"),
           ("prism$ ", "cat /etc/motd\r"),
           ("prism$ ", "cat /etc/passwd\r"),
-          ("prism$ ", "hello\r")],
+          ("prism$ ", "hello info\r")],
          ["user     : /sbin/init as pid 1 -- the userland session",
           "PrismOS init: starting the console shell",
           "PrismOS version", "MemTotal:", "MemFree:",
@@ -391,6 +411,14 @@ def main():
           ("sh: fd: killed by signal 2", "ps\r")],
          ["fd (pid ", "type 4 bytes", "sh: fd: killed by signal 2"], 240),
     ]
+
+    # A substring filter for focused runs (comma-separated): keep the
+    # whole-suite default for CI, let a developer ask for one scenario.
+    wanted = [f.strip() for f in os.environ.get("PRISM_SCENARIOS", "").split(",") if f.strip()]
+    if wanted:
+        scenarios = [sc for sc in scenarios if any(w in sc[0] for w in wanted)]
+        print("note: running %d scenario(s) (PRISM_SCENARIOS=%s)"
+              % (len(scenarios), ",".join(wanted)))
 
     failed = 0
     for name, cmd, steps, expect, timeout in scenarios:

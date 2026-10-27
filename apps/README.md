@@ -3,10 +3,15 @@
 A userland program on PrismOS is a **package**: a directory under `apps/`
 carrying a `prism.toml` manifest.  The mini libc is gone — **mlibc is the
 only libc** — and `tools/prism.py` (the `./prism` shim at the repo root) is
-the builder.  Eight packages live here: `hello`, `fork`, `fd`, `posix`,
-`cube` (the kernel's spinning cube), `tmpfs` (the phase 3.3 RAM file
-system, exercised from ring 3), `init` (the session keeper the kernel
-starts as pid 1) and `sh` (the console shell it respawns).
+the builder.  Eight packages live here: `hello`, `fork`, `fd`, `posix`
+(stat, mmap, directories, uname, termios and the phase 3.3.4 session
+scenario: setsid, setpgid, `kill(-pgrp)`, lstat on a symlink), `cube`
+(the kernel's spinning cube), `tmpfs` (the phase 3.3 RAM file system,
+exercised from ring 3), `init` (the session keeper the kernel starts as
+pid 1: it mounts `/proc` and `/tmp`, then respawns a shell on the
+console and a getty on `/dev/ttyS0`) and `sh` (the shell each of those
+terminals gets: builtins, PATH exec, and the session / foreground-group
+setup of 3.3.4 before its first prompt).
 
 ## The five-minute tour
 

@@ -48,18 +48,25 @@ const MOUNTS: u64 = 7;
 const SELF: u64 = 8;
 
 /// First inode of a pid's block: `pid_base(pid) + n`, n = 0 the directory,
-/// 1 cmdline, 2 stat, 3 status, 4 exe.
+/// 1 cmdline, 2 stat, 3 status, 4 exe, 5 cwd, 6 the fd directory,
+/// 7 + N the fd/N symlink.  The stride leaves room for every descriptor
+/// number (64 = MAX_FDS) inside the block.
 fn pid_base(pid: u64) -> u64 {
-    0x1000 + pid * 16
+    0x1000 + pid * 0x100
 }
 
 /// The per-pid files, in readdir order.
-const PID_FILES: [(&str, u64, FileType); 4] = [
+const PID_FILES: [(&str, u64, FileType); 6] = [
     ("cmdline", 1, FileType::Regular),
     ("stat", 2, FileType::Regular),
     ("status", 3, FileType::Regular),
     ("exe", 4, FileType::Symlink),
+    ("cwd", 5, FileType::Symlink),
+    ("fd", 6, FileType::Dir),
 ];
+
+/// The largest fd number a block has symlinks for (MAX_FDS, fd.rs).
+const MAX_FD_ENTRIES: u64 = 64;
 
 // ------------------------------------------------------- the boot snapshot
 
@@ -185,8 +192,8 @@ fn content(ino: u64) -> Option<String> {
 
 /// The per-pid files.
 fn pid_content(ino: u64) -> Option<String> {
-    let pid = (ino - 0x1000) / 16;
-    let n = (ino - 0x1000) % 16;
+    let pid = (ino - 0x1000) / 0x100;
+    let n = (ino - 0x1000) % 0x100;
     let p = process::snapshot_table().into_iter().find(|p| p.pid == pid)?;
     Some(match n {
         1 => {
@@ -203,13 +210,16 @@ fn pid_content(ino: u64) -> Option<String> {
         2 => {
             // The first fields of the classic line (what `ps` parses).
             let state = state_char(p.state);
-            format!("{} ({}) {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", p.pid, p.name, state, p.ppid)
+            format!(
+                "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+                p.pid, p.name, state, p.ppid, p.pgid, p.sid
+            )
         }
         3 => {
             let state = state_word(p.state);
             format!(
-                "Name:\t{}\nState:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t0 0 0 0\nGid:\t0 0 0 0\nThreads:\t1\n",
-                p.name, state, p.pid, p.ppid
+                "Name:\t{}\nState:\t{}\nPid:\t{}\nPPid:\t{}\nPGrp:\t{}\nSid:\t{}\nUid:\t0 0 0 0\nGid:\t0 0 0 0\nThreads:\t1\n",
+                p.name, state, p.pid, p.ppid, p.pgid, p.sid
             )
         }
         _ => return None,
@@ -273,7 +283,7 @@ impl ProcFs {
         if ino < pid_base(0) {
             return None;
         }
-        let pid = (ino - 0x1000) / 16;
+        let pid = (ino - 0x1000) / 0x100;
         process::snapshot_table().iter().any(|p| p.pid == pid).then_some(pid)
     }
 }
@@ -313,10 +323,13 @@ impl FileSystem for ProcFs {
             SELF => Ok(stat_of(SELF, FileType::Symlink)),
             _ => {
                 let pid = Self::pid_of(ino).ok_or(FsError::NotFound)?;
-                match (ino - pid_base(pid)) % 16 {
-                    0 => Ok(stat_of(ino, FileType::Dir)),
+                match (ino - pid_base(pid)) % 0x100 {
+                    0 | 6 => Ok(stat_of(ino, FileType::Dir)),
                     1 | 2 | 3 => Ok(stat_of(ino, FileType::Regular)),
-                    4 => Ok(stat_of(ino, FileType::Symlink)),
+                    4 | 5 => Ok(stat_of(ino, FileType::Symlink)),
+                    n if (7..7 + MAX_FD_ENTRIES).contains(&n) => {
+                        Ok(stat_of(ino, FileType::Symlink))
+                    }
                     _ => Err(FsError::NotFound),
                 }
             }
@@ -349,15 +362,26 @@ impl FileSystem for ProcFs {
         }
         // A pid directory.
         let pid = Self::pid_of(dir).ok_or(FsError::NotDir)?;
-        if dir != pid_base(pid) {
-            return Err(FsError::NotDir);
-        }
-        for (n, off, _) in PID_FILES {
-            if name == n {
-                return Ok(pid_base(pid) + off);
+        if dir == pid_base(pid) {
+            for (n, off, _) in PID_FILES {
+                if name == n {
+                    return Ok(pid_base(pid) + off);
+                }
             }
+            return Err(FsError::NotFound);
         }
-        Err(FsError::NotFound)
+        // Its fd directory: one symlink per open number.
+        if dir == pid_base(pid) + 6 {
+            let fd: u64 = match name.parse() {
+                Ok(f) if f < MAX_FD_ENTRIES => f,
+                _ => return Err(FsError::NotFound),
+            };
+            if crate::user::fd::fd_names(pid).iter().any(|(n, _)| *n as u64 == fd) {
+                return Ok(pid_base(pid) + 7 + fd);
+            }
+            return Err(FsError::NotFound);
+        }
+        Err(FsError::NotDir)
     }
 
     fn readdir(&mut self, dir: u64) -> FsResult<Vec<DirEntry>> {
@@ -386,16 +410,30 @@ impl FileSystem for ProcFs {
             return Ok(out);
         }
         let pid = Self::pid_of(dir).ok_or(FsError::NotDir)?;
-        if dir != pid_base(pid) {
-            return Err(FsError::NotDir);
+        if dir == pid_base(pid) {
+            let mut out = Vec::new();
+            out.push(DirEntry { ino: dir, ftype: FileType::Dir, name: String::from(".") });
+            out.push(DirEntry { ino: ROOT, ftype: FileType::Dir, name: String::from("..") });
+            for (name, off, ftype) in PID_FILES {
+                out.push(DirEntry { ino: pid_base(pid) + off, ftype, name: String::from(name) });
+            }
+            return Ok(out);
         }
-        let mut out = Vec::new();
-        out.push(DirEntry { ino: dir, ftype: FileType::Dir, name: String::from(".") });
-        out.push(DirEntry { ino: ROOT, ftype: FileType::Dir, name: String::from("..") });
-        for (name, off, ftype) in PID_FILES {
-            out.push(DirEntry { ino: pid_base(pid) + off, ftype, name: String::from(name) });
+        // Its fd directory: the open numbers, in order.
+        if dir == pid_base(pid) + 6 {
+            let mut out = Vec::new();
+            out.push(DirEntry { ino: dir, ftype: FileType::Dir, name: String::from(".") });
+            out.push(DirEntry { ino: pid_base(pid), ftype: FileType::Dir, name: String::from("..") });
+            for (n, _) in crate::user::fd::fd_names(pid) {
+                out.push(DirEntry {
+                    ino: pid_base(pid) + 7 + n as u64,
+                    ftype: FileType::Symlink,
+                    name: n.to_string(),
+                });
+            }
+            return Ok(out);
         }
-        Ok(out)
+        Err(FsError::NotDir)
     }
 
     /// Generate the whole content, serve the slice at `off` (the seq_file
@@ -419,18 +457,34 @@ impl FileSystem for ProcFs {
         Ok(n)
     }
 
-    /// The two magic symlinks: /proc/self -> the caller's pid,
-    /// /proc/<pid>/exe -> the binary it executed.
+    /// The magic symlinks: /proc/self -> the caller's pid,
+    /// /proc/<pid>/exe -> the binary it executed, /proc/<pid>/cwd -> the
+    /// working directory it resolves its paths against, and
+    /// /proc/<pid>/fd/N -> the description behind that number (phase
+    /// 3.3.6: the path a file was opened from, the device's node, "pipe").
     fn readlink(&mut self, ino: u64) -> FsResult<String> {
         match ino {
             SELF => Ok(process::getpid().to_string()),
             _ => {
                 let pid = Self::pid_of(ino).ok_or(FsError::Invalid)?;
-                if (ino - pid_base(pid)) % 16 == 4 {
+                let n = (ino - pid_base(pid)) % 0x100;
+                if n == 4 {
                     let p = process::snapshot_table().into_iter().find(|p| p.pid == pid);
                     match p {
                         Some(p) if !p.exe.is_empty() => Ok(p.exe),
                         _ => Ok(String::from("/")),
+                    }
+                } else if n == 5 {
+                    let p = process::snapshot_table().into_iter().find(|p| p.pid == pid);
+                    match p {
+                        Some(p) if !p.cwd.is_empty() => Ok(p.cwd),
+                        _ => Ok(String::from("/")),
+                    }
+                } else if (7..7 + MAX_FD_ENTRIES).contains(&n) {
+                    let fd = n - 7;
+                    match crate::user::fd::fd_names(pid).into_iter().find(|(k, _)| *k as u64 == fd) {
+                        Some((_, name)) => Ok(name),
+                        None => Err(FsError::NotFound), // closed between the look and the read
                     }
                 } else {
                     Err(FsError::Invalid) // not a symlink

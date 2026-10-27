@@ -6,9 +6,13 @@ import sys
 import time
 
 def run(image, cmds, timeout=60, extra=None, prompt=b"prism# "):
+    # The disk on AHCI port 0 like the Makefile's run target: the kernel
+    # only speaks AHCI, a bare -drive lands on IDE and boots nothing.
     base = ["qemu-system-x86_64", "-m", "256M", "-display", "none", "-no-reboot",
             "-chardev", "stdio,id=ser,signal=off", "-serial", "chardev:ser",
-            "-drive", f"file={image},format=raw"]
+            "-device", "ahci,id=ahci0",
+            "-drive", "id=boot,file=%s,format=raw,if=none" % image,
+            "-device", "ide-hd,drive=boot,bus=ahci0.0"]
     if extra:
         base += extra
     proc = subprocess.Popen(base, stdin=subprocess.PIPE, stdout=subprocess.PIPE,

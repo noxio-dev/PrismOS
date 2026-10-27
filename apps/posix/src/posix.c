@@ -452,6 +452,114 @@ static int sc_sigpipe(void)
 	return bad;
 }
 
+/* ---- sessions and process groups (phase 3.3.4) --------------------------- */
+
+static volatile sig_atomic_t usr1_hit;
+
+static void usr1_catch(int sig)
+{
+	(void)sig;
+	usr1_hit = 1;
+}
+
+/* The session ladder, in a process that is guaranteed *not* to be a
+ * session leader: whoever exec'd this program may already be one (the
+ * kernel shell's exec makes every process its own session), and a
+ * forked child never is.  Returns the failure count as the exit code. */
+static int session_ladder(void)
+{
+	int bad = 0;
+
+	/* setsid (59): a session and a group of my own, both led by me. */
+	errno = 0;
+	pid_t sid = setsid();
+	bad += !expect(sid, (long)getpid());
+	bad += !expect(getpgrp(), sid);
+	/* A session leader is pinned into its group (POSIX). */
+	bad += !expect(ec(setpgid(0, 0)), -EPERM);
+	/* And nobody setsids twice. */
+	bad += !expect(ec(setsid()), -EPERM);
+
+	/* A forked child makes a group of its own inside my session (60),
+	 * the group kill spelling reaches it (kill(-pgrp)), and it answers
+	 * through the signal that cuts its parked read short: the pipe's
+	 * read end never answers, the SIGUSR1 through the group does. */
+	int p[2], q[2];
+	bad += !expect(ec(pipe(p)), 0);
+	bad += !expect(ec(pipe(q)), 0);
+	pid_t pid = fork();
+	if (pid == 0) {
+		if (setpgid(0, 0) < 0 || getpgrp() != getpid())
+			_exit(9);
+		close(p[0]);
+		close(q[1]);
+		signal(SIGUSR1, usr1_catch);
+		if (write(p[1], "R", 1) != 1)
+			_exit(8); /* the ready byte: my group exists */
+		char c;
+		ssize_t r = read(q[0], &c, 1); /* parks until the group kill */
+		_exit(r < 0 && errno == EINTR && usr1_hit ? 0 : 7);
+	}
+	close(p[1]);
+	close(q[0]);
+	char c;
+	bad += !expect(ec(read(p[0], &c, 1)), 1); /* wait for its group */
+	/* q[1] stays open: the child's read must park, not see EOF. */
+	bad += !expect(ec(kill(-pid, 0)), 0);      /* the group exists */
+	bad += !expect(ec(kill(-pid, SIGUSR1)), 0);
+	int status = 0;
+	bad += !expect(ec(waitpid(pid, &status, 0)), pid);
+	close(p[0]);
+	close(q[1]);
+	bad += !expect(WIFEXITED(status), 1);
+	bad += !expect(WEXITSTATUS(status), 0);
+
+	return bad;
+}
+
+static int sc_session(void)
+{
+	char d[96];
+	int bad = 0;
+
+	/* lstat (58): the usr-merge symlink answers as itself, not as the
+	 * directory it points at -- its own type, its own length. */
+	struct stat st;
+	bad += !expect(ec(lstat("/bin", &st)), 0);
+	bad += !expect(S_ISLNK(st.st_mode), 1);
+	char target[64];
+	ssize_t n = readlink("/bin", target, sizeof target - 1);
+	bad += !expect(n > 0, 1);
+	if (n > 0)
+		target[n] = 0;
+	bad += !expect(strcmp(target, "usr/bin"), 0);
+	bad += !expect(ec(lstat("/no/such/link", &st)), -ENOENT);
+
+	/* The shell parked this program's group in the foreground before
+	 * exec'ing it (TIOCSPGRP): the terminal agrees.  Without a session
+	 * (the kernel shell's exec -- nobody claimed the terminal) the
+	 * foreground is unclaimed, 0, and the check does not apply. */
+	int fg = 0;
+	if (isatty(0)) {
+		bad += !expect(ec(prism_ioctl(0, TIOCGPGRP, &fg)), 0);
+		if (fg != 0)
+			bad += !expect((pid_t)fg, getpgrp());
+	}
+
+	/* The session ladder in a forked worker, for whoever exec'd us. */
+	pid_t worker = fork();
+	if (worker == 0)
+		_exit(session_ladder());
+	int status = 0;
+	bad += !expect(ec(waitpid(worker, &status, 0)), worker);
+	bad += !expect(WIFEXITED(status), 1);
+	bad += !expect(WEXITSTATUS(status), 0);
+
+	fmt(d, sizeof d, "setsid + setpgid + kill(-pgrp) + lstat, %d checks", (fg ? 10 : 9) - bad);
+	check("session", bad == 0, d);
+	return bad;
+}
+
 /* ---- the directories (opendir / readdir) ---------------------------------- */
 
 /* One name seen in a directory, with its type. */
@@ -584,7 +692,9 @@ static int sc_uname(void)
 	 * 80 columns come back through tcgetwinsize. */
 	bad += !expect(ec(tcgetattr(1, &t)), 0);
 	bad += !expect(ec(tcgetwinsize(1, &ws)), 0);
-	bad += !expect(ws.ws_col, 80);
+	/* The real geometry, whatever the console is: 80 columns in VGA
+	 * text mode, 160 on the QEMU framebuffer's text grid. */
+	bad += !expect(ws.ws_col != 0, 1);
 	long f = open("/bin/hello", O_RDONLY);
 	bad += !expect(ec(tcgetattr(f, &t)), -ENOTTY);
 	close(f);
@@ -617,8 +727,9 @@ int main(int argc, char **argv, char **envp)
 	sc_getdents();
 	sc_fsops();
 	sc_uname();
+	sc_session();
 	if (fails == 0)
-		printf("posix: all 10 passed\n");
+		printf("posix: all 11 passed\n");
 	else
 		printf("posix: %d FAILURE(S)\n", fails);
 	return fails == 0 ? 0 : 1;

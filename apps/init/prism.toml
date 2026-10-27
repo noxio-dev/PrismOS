@@ -7,7 +7,7 @@
 [package]
 name = "init"
 version = "0.1.0"
-description = "the session keeper: respawns the console shell, reaps the orphans"
+description = "the session keeper: mounts /proc and /tmp, respawns a shell per terminal, reaps the orphans"
 
 [build]
 sources = ["src/init.c"]
@@ -16,8 +16,11 @@ sources = ["src/init.c"]
 path = "/usr/bin/init"
 
 # verify.sh's init diet: every syscall the program makes (printf rides
-# write 1; signal() is mlibc's sigaction wrapper, hence 38; the respawn
-# loop never exits, hence no syscall 0).
+# write 1; signal() is mlibc's sigaction wrapper, hence 38; the getty
+# opens its terminal and dup2's the trio over stdio, hence 14 / 15 / 26;
+# the mounts are the raw 55; the respawn loop never exits, hence no
+# syscall 0).
 [verify]
-syscalls = [1, 5, 7, 8, 9, 38]
-symbols = ["fork", "execve", "waitpid", "signal", "sleep", "printf", "perror"]
+syscalls = [1, 5, 7, 8, 9, 14, 15, 26, 38, 55]
+symbols = ["fork", "execve", "waitpid", "signal", "sleep", "printf",
+        "open", "dup2", "close", "getenv"]

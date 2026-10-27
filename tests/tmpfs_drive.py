@@ -37,11 +37,11 @@ def main():
     ], timeout=180, prompt=b"prism$ ")
     print(out)
     want = [
-        "tmpfs on /tmp",                      # the boot-time mount
-        "procfs on /proc",                    # the same step's other half
+        "init: /tmp mounted (tmpfs)",         # pid 1's mount (phase 3.3.7)
+        "init: /proc mounted (procfs, read-only)",  # its other half
         "user     : /sbin/init as pid 1",      # the session hand-over
-        "-> usr/bin",                         # bin, sbin symlinks
-        "-> usr/lib",                         # lib, lib64 symlinks
+        "-> usr/bin",                         # bin, sbin symlinks (lstat)
+        "-> usr/lib",                         # lib, lib64 symlinks (lstat)
         "tmpfs: 37/37 checks passed",         # the package, first run
         "written by the shell",               # the shell's own write
     ]

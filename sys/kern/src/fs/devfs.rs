@@ -4,10 +4,16 @@
 // devfs (phase 2.6): a tiny in-memory file system mounted on /dev, holding
 // the device nodes the kernel knows how to serve:
 //
-//   /dev/console  the merged keyboard + serial input, the text console
-//                 output (the same path fd 0/1/2 point at)
+//   /dev/console  the kernel console: writes mirror to the text screen
+//                 *and* the serial line (what kernel messages do)
+//   /dev/tty      the controlling terminal of the opening session
+//                 (TIOCSCTTY claims it; without one: ENXIO)
+//   /dev/tty0     the console terminal: keyboard in, text screen out
+//   /dev/ttyS0    the serial terminal: COM1's own queue in, COM1 out
+//                 (phase 3.3.5 -- its own line discipline)
 //   /dev/null     reads are an immediate EOF, writes are swallowed
 //   /dev/zero     reads produce zeroes, writes are swallowed
+//   /dev/full     writes answer ENOSPC
 //
 // It only provides the *namespace* half of a device: lookup / readdir /
 // stat answer with `FileType::Dev(id)` nodes (the inode number *is* the
@@ -31,14 +37,16 @@ pub const DEV_ZERO: u32 = 3;
 pub const DEV_TTY: u32 = 4;
 pub const DEV_TTY0: u32 = 5;
 pub const DEV_FULL: u32 = 6;
+pub const DEV_TTYS0: u32 = 7;
 
 /// Name and permission bits of each device node, in readdir order.
-const NODES: [(&str, u32, u16); 6] = [
+const NODES: [(&str, u32, u16); 7] = [
     ("console", DEV_CONSOLE, 0o620), // crw--w---- like every real unix
     ("null", DEV_NULL, 0o666),
     ("zero", DEV_ZERO, 0o666),
     ("tty", DEV_TTY, 0o666),   // the controlling terminal of a session
-    ("tty0", DEV_TTY0, 0o620), // the console itself, by its other name
+    ("tty0", DEV_TTY0, 0o620), // the console terminal, by its other name
+    ("ttyS0", DEV_TTYS0, 0o620), // COM1, a queue of its own (phase 3.3.5)
     ("full", DEV_FULL, 0o666), // writes answer ENOSPC (phase 3.3)
 ];
 

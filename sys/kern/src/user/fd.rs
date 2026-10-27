@@ -76,7 +76,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 
-use crate::fs::devfs::{DEV_CONSOLE, DEV_FULL, DEV_NULL, DEV_TTY, DEV_TTY0, DEV_ZERO};
+use crate::fs::devfs::{DEV_CONSOLE, DEV_FULL, DEV_NULL, DEV_TTYS0, DEV_TTY, DEV_TTY0, DEV_ZERO};
 use crate::fs::vfs::{
     DirEntry, FsError, FileType, O_APPEND, O_CLOEXEC, O_CREATE, O_EXCL, O_NONBLOCK, O_READ,
     O_TRUNC, O_WRITE, Opened, Whence,
@@ -113,6 +113,8 @@ const EAGAIN: i64 = 11;
 const EEXIST: i64 = 17;
 const EXDEV: i64 = 18;
 const ENODEV: i64 = 19;
+const ENXIO: i64 = 6; // no controlling terminal (/dev/tty without a claim)
+const EPERM: i64 = 1;
 const ENOTDIR: i64 = 20;
 const EISDIR: i64 = 21;
 const EMFILE: i64 = 24;
@@ -154,12 +156,30 @@ pub(crate) fn fs_errno(e: FsError) -> i64 {
 /// What one description is connected to (see the header).
 enum Kind {
     Vfs(usize),
+    /// /dev/console: the kernel console -- writes mirror to the text
+    /// screen *and* the serial line, like the kernel's own messages.
     Console,
+    /// /dev/tty0 (and a claimed /dev/tty): the console terminal -- same
+    /// line discipline as Console, but writes stay on the text screen (the
+    /// serial line carries the serial session of phase 3.3.5).
+    VgaTty,
+    /// /dev/ttyS0: the serial terminal -- COM1's own receive queue in,
+    /// COM1 out (the queue of its own that 3.3.5 promised).
+    Serial,
     DevNull,
     DevZero,
     DevFull,
     PipeRead(Rc<RefCell<Pipe>>),
     PipeWrite(Rc<RefCell<Pipe>>),
+}
+
+/// Which terminal a descriptor talks to, if it is a terminal at all.
+fn term_of(kind: &Kind) -> Option<tty::Term> {
+    match kind {
+        Kind::Console | Kind::VgaTty => Some(tty::Term::Console),
+        Kind::Serial => Some(tty::Term::Serial),
+        _ => None,
+    }
 }
 
 /// One open file description: Rc-shared by the fd tables that reference it.
@@ -169,11 +189,21 @@ pub struct FileDesc {
     /// readable and writable are checked here, uniformly for every kind.
     /// A `Cell` because fcntl(F_SETFL) rewrites what every sharer sees.
     flags: Cell<u32>,
+    /// The path a VFS description was opened from (phase 3.3.6): the
+    /// string /proc/<pid>/fd/N points at.  Devices and pipes describe
+    /// themselves through their Kind; nothing else stores one.
+    path: Option<String>,
 }
 
 impl FileDesc {
     fn new(kind: Kind, flags: u32) -> FileDesc {
-        FileDesc { kind, flags: Cell::new(flags) }
+        FileDesc { kind, flags: Cell::new(flags), path: None }
+    }
+
+    /// A VFS description with its open path recorded (phase 3.3.6): the
+    /// string /proc/<pid>/fd/N points at.
+    fn with_path(kind: Kind, flags: u32, path: String) -> FileDesc {
+        FileDesc { kind, flags: Cell::new(flags), path: Some(path) }
     }
 
     pub(crate) fn flags(&self) -> u32 {
@@ -259,6 +289,32 @@ impl FdTable {
     /// The description behind `fd`, if the slot is occupied.
     fn get(&self, fd: usize) -> Option<Rc<FileDesc>> {
         self.slots.get(fd).and_then(|s| s.as_ref().map(|x| x.desc.clone()))
+    }
+
+    /// (number, what it is) for every occupied slot (phase 3.3.6): the
+    /// /proc/<pid>/fd listing and its fd/N symlinks.  A file answers the
+    /// path it was opened from, a device its node, a pipe end "pipe".
+    fn snapshot_names(&self) -> Vec<(usize, String)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                let s = s.as_ref()?;
+                let name = match &s.desc.kind {
+                    Kind::Vfs(_) => {
+                        s.desc.path.clone().unwrap_or_else(|| String::from("?"))
+                    }
+                    Kind::Console => String::from("/dev/console"),
+                    Kind::VgaTty => String::from("/dev/tty0"),
+                    Kind::Serial => String::from("/dev/ttyS0"),
+                    Kind::DevNull => String::from("/dev/null"),
+                    Kind::DevZero => String::from("/dev/zero"),
+                    Kind::DevFull => String::from("/dev/full"),
+                    Kind::PipeRead(_) | Kind::PipeWrite(_) => String::from("pipe"),
+                };
+                Some((i, name))
+            })
+            .collect()
     }
 
     /// Install at the lowest free number (like every unix); -EMFILE's worth
@@ -431,7 +487,8 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> i64 {
     }
     match &desc.kind {
         Kind::Vfs(slot) => read_vfs(*slot, buf, len),
-        Kind::Console => read_console(&desc, buf, len),
+        Kind::Console | Kind::VgaTty => read_tty(tty::Term::Console, &desc, buf, len),
+        Kind::Serial => read_tty(tty::Term::Serial, &desc, buf, len),
         Kind::DevNull => 0, // EOF: the buffer is not even looked at
         Kind::DevZero | Kind::DevFull => read_zero(buf, len),
         Kind::PipeRead(p) => read_pipe(p, &desc, buf, len),
@@ -479,36 +536,36 @@ fn console_deliver(buf: u64, chunk: &[u8], got: usize) -> i64 {
     }
 }
 
-fn read_console(desc: &Rc<FileDesc>, buf: u64, len: usize) -> i64 {
+fn read_tty(which: tty::Term, desc: &Rc<FileDesc>, buf: u64, len: usize) -> i64 {
     let nonblock = desc.flags() & O_NONBLOCK != 0;
     let start = uptime_ms();
     let want = len.min(CHUNK);
     let mut chunk = [0u8; CHUNK];
     // The tty's ^C fallback target while we are the parked reader.
-    tty::set_reader(process::getpid());
+    tty::set_reader(which, process::getpid());
     loop {
         // Drain what arrived (echo, line assembly, ISIG) and take one
         // completed piece: a canonical read answers a whole line, a raw
         // read whatever is queued (user/tty.rs, phase 3.3).
-        tty::pump();
-        if let Some(got) = tty::take(&mut chunk[..want]) {
-            tty::set_reader(0);
+        tty::pump_term(which);
+        if let Some(got) = tty::take(which, &mut chunk[..want]) {
+            tty::set_reader(which, 0);
             return console_deliver(buf, &chunk, got); // got == 0: the ^D end of file
         }
         if signal::interrupt_pending() {
             // A deliverable signal came in: hand the wait back (the
             // dispatcher runs the handler right after this return).
-            tty::set_reader(0);
+            tty::set_reader(which, 0);
             return -EINTR;
         }
         if nonblock {
-            tty::set_reader(0);
+            tty::set_reader(which, 0);
             return -EAGAIN;
         }
         if uptime_ms() - start >= WAIT_MAX_MS {
             // A way out, not a wedge: the caller re-reads (a shell prompt
             // idles for hours this way, ten seconds at a time).
-            tty::set_reader(0);
+            tty::set_reader(which, 0);
             return -EAGAIN;
         }
         park_once();
@@ -584,6 +641,8 @@ pub fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
     match &desc.kind {
         Kind::Vfs(slot) => write_vfs(*slot, buf, len),
         Kind::Console => write_console(buf, len),
+        Kind::VgaTty => write_vga(buf, len),
+        Kind::Serial => write_serial(buf, len),
         // The sinks still validate the buffer (an unreadable pointer is
         // -EFAULT, like on any unix) before reporting success.
         Kind::DevNull | Kind::DevZero => write_sink(buf, len),
@@ -628,6 +687,53 @@ fn write_console(buf: u64, len: usize) -> i64 {
             return if done > 0 { done as i64 } else { -EFAULT };
         }
         crate::console::write_bytes(&chunk[..n]);
+        done += n;
+    }
+    done as i64
+}
+
+/// The console terminal's writes (phase 3.3.5): the text screen and
+/// only it -- the sanitised write_bytes path minus its serial tee, which
+/// is what keeps a console session's prompt off ttyS0 (the serial session
+/// is busy answering the same keystrokes there itself).
+fn write_vga(buf: u64, len: usize) -> i64 {
+    let mut chunk = [0u8; CHUNK];
+    let mut done = 0usize;
+    while done < len {
+        let n = (len - done).min(CHUNK);
+        if !copy_in(buf, done, &mut chunk[..n]) {
+            return if done > 0 { done as i64 } else { -EFAULT };
+        }
+        crate::console::write_local(&chunk[..n]);
+        done += n;
+    }
+    done as i64
+}
+
+/// The serial terminal's writes (phase 3.3.5): raw bytes to COM1 with
+/// the one output translation a terminal needs -- OPOST / ONLCR, newline
+/// as CR LF (what the line's own termios asks for).  No sanitiser: a real
+/// terminal is exactly where a program may send its escapes.
+fn write_serial(buf: u64, len: usize) -> i64 {
+    let onlcr = {
+        let mut t = [0u8; tty::TERMIOS_LEN];
+        tty::get_termios(tty::Term::Serial, &mut t);
+        let oflag = u32::from_le_bytes(t[4..8].try_into().unwrap());
+        oflag & 0o1 != 0 && oflag & 0o4 != 0
+    };
+    let mut chunk = [0u8; CHUNK];
+    let mut done = 0usize;
+    while done < len {
+        let n = (len - done).min(CHUNK);
+        if !copy_in(buf, done, &mut chunk[..n]) {
+            return if done > 0 { done as i64 } else { -EFAULT };
+        }
+        for &b in &chunk[..n] {
+            if b == b'\n' && onlcr {
+                crate::hw::serial::write_byte(b'\r');
+            }
+            crate::hw::serial::write_byte(b);
+        }
         done += n;
     }
     done as i64
@@ -719,14 +825,35 @@ pub fn sys_open(path_p: u64, flags: u64) -> i64 {
     let kind = match opened {
         Opened::File(slot) => Kind::Vfs(slot),
         Opened::Dev(id) => match id {
-            DEV_CONSOLE | DEV_TTY | DEV_TTY0 => Kind::Console, // the same terminal by any name
+            // /dev/console: the kernel console, serial tee and all.
+            DEV_CONSOLE => Kind::Console,
+            // /dev/tty: the controlling terminal of the caller's session
+            // (phase 3.3.4).  A session without one gets -ENXIO, POSIX's
+            // answer -- the claim is TIOCSCTTY's to make.
+            DEV_TTY => {
+                let Some(cur) = process::current() else { return -EFAULT };
+                match cur.ctty {
+                    0 => return -ENXIO,
+                    2 => Kind::Serial,
+                    _ => Kind::VgaTty,
+                }
+            }
+            // /dev/tty0: the console terminal itself (the serial line
+            // carries its own session through ttyS0 now, phase 3.3.5).
+            DEV_TTY0 => Kind::VgaTty,
+            // /dev/ttyS0: the serial terminal, a line discipline of its
+            // own on COM1's receive queue (phase 3.3.5).
+            DEV_TTYS0 => Kind::Serial,
             DEV_NULL => Kind::DevNull,
             DEV_ZERO => Kind::DevZero,
             DEV_FULL => Kind::DevFull,
             _ => return -ENODEV, // a node without a device behind it
         },
     };
-    let desc = Rc::new(FileDesc::new(kind, flagbits));
+    let desc = match kind {
+        Kind::Vfs(_) => Rc::new(FileDesc::with_path(kind, flagbits, abs)),
+        _ => Rc::new(FileDesc::new(kind, flagbits)),
+    };
     let Some(cur) = process::current() else { return -EFAULT };
     match cur.fds.install(desc, cloexec) {
         Some(fd) => fd as i64,
@@ -914,6 +1041,28 @@ pub fn sys_stat(path_p: u64, buf: u64) -> i64 {
     }
 }
 
+/// `lstat(path, buf)` (syscall 58, phase 3.3.4): like `stat` but the
+/// final symlink is answered as itself -- its own type, mode and length
+/// (the target string's), what an `ls -l` needs to show a usr-merge
+/// /bin -> usr/bin as the link it is.
+pub fn sys_lstat(path_p: u64, buf: u64) -> i64 {
+    let abs = match user_path(path_p) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    match crate::fs::fsys::vfs().lstat(&abs) {
+        Ok(st) => {
+            let times = (st.atime, st.mtime, st.ctime);
+            if put_stat(buf, st.ino, st.mode, &st.ftype, st.size, st.nlink, dev_rdev(&st.ftype), st.blocks, times) {
+                0
+            } else {
+                -EFAULT
+            }
+        }
+        Err(e) => -fs_errno(e),
+    }
+}
+
 /// `rdev` of a devfs node (major 1, like Linux's mem devices: /dev/zero
 /// and friends -- the id is the minor).
 fn dev_rdev(ftype: &FileType) -> u64 {
@@ -945,6 +1094,8 @@ pub fn sys_fstat(fd: u64, buf: u64) -> i64 {
             Err(e) => -fs_errno(e),
         },
         Kind::Console => put_dev_stat(buf, DEV_CONSOLE, 0o620),
+        Kind::VgaTty => put_dev_stat(buf, DEV_TTY0, 0o620),
+        Kind::Serial => put_dev_stat(buf, DEV_TTYS0, 0o620),
         Kind::DevNull => put_dev_stat(buf, DEV_NULL, 0o666),
         Kind::DevZero => put_dev_stat(buf, DEV_ZERO, 0o666),
         Kind::DevFull => put_dev_stat(buf, DEV_FULL, 0o666),
@@ -1130,34 +1281,42 @@ pub fn sys_getdents(fd: u64, buf: u64, len: u64) -> i64 {
 
 // ------------------------------------------------- ioctl (phase 3.1 + 3.3)
 
-/// `ioctl(fd, req, arg)` (syscall 29): the tty side of the console
-/// descriptors (the only terminals there are).  TCGETS / TCSETS read and
-/// install the termios state (TCSETSW / TCSETSF agree with it -- the
+/// `ioctl(fd, req, arg)` (syscall 29): the tty side of the terminal
+/// descriptors.  TCGETS / TCSETS read and install the termios state of
+/// the descriptor's terminal (TCSETSW / TCSETSF agree with it -- the
 /// output queue is never deep enough to drain), TIOCGWINSZ answers the
-/// text grid's real geometry, and TIOCGPGRP / TIOCSPGRP exchange the
-/// foreground pid of the terminal -- a plain pid, not a process group
-/// (sessions land with the busybox job control, roadmap 3.3.4).
-/// Everything else, and every non-console descriptor, is -ENOTTY.
+/// text grid's real geometry (zeros on the serial line, which has none),
+/// and TIOCGPGRP / TIOCSPGRP exchange the foreground *process group* of
+/// that terminal -- the number a ^C is delivered to as a group (phase
+/// 3.3.4).  TIOCSCTTY is the claim: a session leader takes the terminal
+/// as its controlling terminal, which is what /dev/tty resolves to
+/// afterwards.  Everything else, and every non-terminal descriptor, is
+/// -ENOTTY.
 pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> i64 {
     const TCGETS: u64 = 0x5401;
     const TCSETS: u64 = 0x5402;
     const TCSETSW: u64 = 0x5403;
     const TCSETSF: u64 = 0x5404;
+    const TIOCSCTTY: u64 = 0x540E;
     const TIOCGPGRP: u64 = 0x540F;
     const TIOCSPGRP: u64 = 0x5410;
     const TIOCGWINSZ: u64 = 0x5413;
-    let desc = {
+    let (which, term_id) = {
         let Some(cur) = process::current() else { return -EFAULT };
         let Some(d) = cur.fds.get(fd as usize) else { return -EBADF };
-        d
+        let Some(w) = term_of(&d.kind) else { return -ENOTTY };
+        // The terminal's device number for the ctty bookkeeping: 1 the
+        // console tty, 2 the serial one (the Pcb's spelling).
+        let id = match w {
+            tty::Term::Console => 1u8,
+            tty::Term::Serial => 2u8,
+        };
+        (w, id)
     };
-    if !matches!(desc.kind, Kind::Console) {
-        return -ENOTTY; // files, pipes and sinks are not terminals
-    }
     match req {
         TCGETS => {
             let mut t = [0u8; tty::TERMIOS_LEN];
-            tty::get_termios(&mut t);
+            tty::get_termios(which, &mut t);
             if arg == 0 || copy_out(arg, 0, &t) {
                 0
             } else {
@@ -1169,12 +1328,29 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> i64 {
             if !copy_in(arg, 0, &mut t) {
                 return -EFAULT;
             }
-            tty::set_termios(&t);
+            tty::set_termios(which, &t);
+            0
+        }
+        TIOCSCTTY => {
+            // The session leader's claim (phase 3.3.4).  POSIX: only a
+            // session leader may make it, and arg 1 is the "steal it from
+            // another session" force nobody here needs yet.
+            let Some(cur) = process::current() else { return -EFAULT };
+            if cur.sid != cur.pid {
+                return -EPERM;
+            }
+            let sid = cur.sid;
+            let _ = process::with_pid_mut(cur.pid, |p| p.ctty = term_id);
+            // The claim belongs to the session: every live member of it
+            // resolves /dev/tty to this terminal from here on.
+            for pid in process::session_pids(sid) {
+                let _ = process::with_pid_mut(pid, |p| p.ctty = term_id);
+            }
             0
         }
         TIOCGPGRP => {
-            // pid_t (i32): the foreground claim, 0 = unclaimed.
-            let fg = tty::fg_pid() as u32;
+            // pid_t (i32): the foreground group, 0 = unclaimed.
+            let fg = tty::fg_pgrp(which) as u32;
             if arg == 0 || copy_out(arg, 0, &fg.to_le_bytes()) {
                 0
             } else {
@@ -1186,15 +1362,29 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> i64 {
             if !copy_in(arg, 0, &mut w) {
                 return -EFAULT;
             }
-            let pgrp = u32::from_le_bytes(w);
-            tty::set_fg(pgrp as u64);
+            let pgrp = u32::from_le_bytes(w) as u64;
+            if pgrp == 0 {
+                // POSIX: 0 is not a group; unclaiming is done by the
+                // session leader's death (the SIGHUP path), not by this.
+                return -EINVAL;
+            }
+            let Some(cur) = process::current() else { return -EFAULT };
+            // Only the session the terminal belongs to may move its
+            // foreground, and only onto one of its own groups.
+            if cur.ctty != term_id {
+                return -EPERM;
+            }
+            if !process::group_exists_in_session(pgrp, cur.sid) {
+                return -EPERM;
+            }
+            tty::set_fg(which, pgrp);
             0
         }
         TIOCGWINSZ => {
             // struct winsize { u16 row, col, xpixel, ypixel; } -- the
             // text grid is the console's own geometry; the pixel pair is
             // not tracked separately (0, like many terminals report).
-            let (cols, rows) = tty::text_dims();
+            let (cols, rows) = tty::text_dims(which);
             let ws: [u8; 8] = [
                 (rows & 0xFFFF) as u8,
                 (rows >> 8) as u8,
@@ -1216,6 +1406,14 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> i64 {
 }
 
 // ------------------------------------------------- name space (phase 3.1)
+
+/// The open descriptors of `pid` as (number, description) pairs (phase
+/// 3.3.6): what /proc/<pid>/fd lists and what its fd/N symlinks point at.
+/// The table walk is the masked one every process-table question uses;
+/// the caller formats.
+pub fn fd_names(pid: u64) -> Vec<(usize, String)> {
+    process::with_pid_mut(pid, |p| p.fds.snapshot_names()).unwrap_or_default()
+}
 
 /// `unlink(path)` (syscall 30): remove a name.  A directory is refused
 /// (-EISDIR, that is rmdir's job); devfs and other read-only mounts answer
@@ -1423,9 +1621,13 @@ fn desc_ready(desc: &Rc<FileDesc>) -> Ready {
         Kind::Vfs(_) => Ready { read: f & O_READ != 0, write: f & O_WRITE != 0, err: false, hup: false },
         // The terminal decides (phase 3.3): drain what arrived first, so
         // a line just completed counts, then ask for completed input.
-        Kind::Console => {
-            tty::pump();
-            Ready { read: tty::readable(), write: f & O_WRITE != 0, err: false, hup: false }
+        Kind::Console | Kind::VgaTty => {
+            tty::pump_term(tty::Term::Console);
+            Ready { read: tty::readable(tty::Term::Console), write: f & O_WRITE != 0, err: false, hup: false }
+        }
+        Kind::Serial => {
+            tty::pump_term(tty::Term::Serial);
+            Ready { read: tty::readable(tty::Term::Serial), write: f & O_WRITE != 0, err: false, hup: false }
         }
         Kind::DevNull | Kind::DevZero | Kind::DevFull => {
             Ready { read: f & O_READ != 0, write: f & O_WRITE != 0, err: false, hup: false }

@@ -361,7 +361,10 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     }
 
     // The rescue kernel shell: the console input belongs to it alone
-    // (the tty's queues go, the tick stops pumping).
+    // (the tty's queues go, the tick stops pumping).  It also gets the
+    // /tmp and /proc a session would have mounted (phase 3.3.7: with no
+    // init above it, the kernel is the one left holding the mount(2)).
+    crate::fs::fsys::mount_proc_and_tmp();
     process::set_init(0);
     tty::reset_input();
     kprintln!("dropping to the shell");
@@ -382,13 +385,24 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 /// and the tick's tty pump key off it).
 fn spawn_init(path: &str) -> Result<u64, &'static str> {
     let argv = alloc::vec![path.as_bytes().to_vec()];
-    let env = [
+    let mut env = [
         "PATH=/usr/bin:/bin",
         "HOME=/",
         "TERM=prism",
         concat!("PRISMOS=", env!("CARGO_PKG_VERSION")),
     ];
-    let envp: Vec<Vec<u8>> = env.iter().map(|e| e.as_bytes().to_vec()).collect();
+    let mut extra: Vec<&str> = Vec::new();
+    if crate::hw::serial::present() {
+        // The serial UART is there (phase 3.3.5): init reads this and
+        // puts a getty on /dev/ttyS0 -- a second session, the one the
+        // headless machines and the boot tests talk to.
+        extra.push("PRISM_TTYS0=1");
+    }
+    let envp: Vec<Vec<u8>> = env
+        .iter()
+        .chain(extra.iter())
+        .map(|e| e.as_bytes().to_vec())
+        .collect();
     let loaded = user::elf::load_path(path, &argv, &envp).map_err(|e| e.what())?;
     let name = user::elf::base_name(path);
     let flat = process::argv_flat(&argv);

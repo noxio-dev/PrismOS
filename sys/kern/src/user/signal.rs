@@ -59,6 +59,7 @@ use crate::user::usermode::EFAULT;
 /// Number of signals the state tracks (bits 1..31; 0 is not a signal).
 pub const NSIG: usize = 32;
 
+pub const SIGHUP: u64 = 1;
 pub const SIGINT: u64 = 2;
 pub const SIGILL: u64 = 4;
 pub const SIGFPE: u64 = 8;
@@ -104,9 +105,11 @@ const EINVAL: i64 = 22;
 const EPIPE: i64 = 32;
 
 /// Signals whose default action terminates the process (SIGPIPE joined the
-/// set in phase 3.1: a readerless pipe write is a death sentence by POSIX).
+/// set in phase 3.1: a readerless pipe write is a death sentence by POSIX;
+/// SIGHUP in 3.3.4: a session leader's death reaches its foreground group
+/// through it).
 fn terminates_by_default(sig: u64) -> bool {
-    sig == SIGKILL || sig == SIGTERM || sig == SIGINT || sig == SIGPIPE
+    sig == SIGHUP || sig == SIGKILL || sig == SIGTERM || sig == SIGINT || sig == SIGPIPE
 }
 
 /// Wait flags (the part wait() understands).
@@ -342,31 +345,26 @@ pub fn sys_kill(pid: u64, sig: u64) -> i64 {
     if sig >= NSIG as u64 {
         return -EINVAL;
     }
+    // The group and broadcast spellings (phase 3.3.4): a negative `pid`
+    // names the process group |pid|, -1 everybody the caller may signal.
+    // The bit pattern arrives unsigned -- the syscall ABI's i64 in a u64.
+    if pid > i64::MAX as u64 {
+        let target = (pid as i64).unsigned_abs();
+        if target == 0 {
+            // kill(-1): every live process but the caller and pid 1.
+            let me = process::getpid();
+            let n = broadcast_but_self(me, sig);
+            return if n > 0 { 0 } else { -ESRCH };
+        }
+        let n = signal_pgrp(target, sig);
+        return if n > 0 { 0 } else { -ESRCH };
+    }
     let me = process::getpid();
     if pid == me {
         // A self-kill with a default disposition acts right away; with a
         // handler it goes the pending route and the delivery happens at the
         // end of this very syscall.
-        if sig == SIGKILL {
-            process::exit_current(process::Outcome::Signaled(SIGKILL));
-        }
-        return match with_current(|s| {
-            if sig != 0 && s.handler_of(sig) != 0 {
-                s.pending |= 1 << sig;
-                true
-            } else {
-                false
-            }
-        }) {
-            Some(true) => 0,
-            Some(false) => {
-                if terminates_by_default(sig) {
-                    process::exit_current(process::Outcome::Signaled(sig));
-                }
-                0 // SIGCHLD and the rest are ignored by default
-            }
-            None => -EFAULT,
-        };
+        return self_signal(sig);
     }
 
     // Another process: it cannot be running (single CPU, we are), so the
@@ -387,6 +385,86 @@ pub fn sys_kill(pid: u64, sig: u64) -> i64 {
         }
     }
     0 // everything else is ignored by default (no core dumps)
+}
+
+/// The `kill(getpid(), sig)` path, shared with the group delivery below
+/// (the caller may be a member of its own target group).  A default
+/// disposition acts right away (this call never returns then); a handler
+/// takes the pending route; the rest is ignored.
+fn self_signal(sig: u64) -> i64 {
+    if sig == SIGKILL {
+        process::exit_current(process::Outcome::Signaled(SIGKILL));
+    }
+    match with_current(|s| {
+        if sig != 0 && s.handler_of(sig) != 0 {
+            s.pending |= 1 << sig;
+            true
+        } else {
+            false
+        }
+    }) {
+        Some(true) => 0,
+        Some(false) => {
+            if terminates_by_default(sig) {
+                process::exit_current(process::Outcome::Signaled(sig));
+            }
+            0 // SIGCHLD and the rest are ignored by default
+        }
+        None => -EFAULT,
+    }
+}
+
+/// Deliver a signal to one *other* live process (a group member): the
+/// same ladder `sys_kill` walks -- sig 0 checks, a handler takes the
+/// pending bit, the default action applies at once.  Returns true when
+/// the process heard it (alive).
+fn deliver_other(pid: u64, sig: u64) -> bool {
+    if !process::has_live(pid) {
+        return false;
+    }
+    if sig == 0 {
+        return true;
+    }
+    if process::post_signal(pid, sig) {
+        return true;
+    }
+    if terminates_by_default(sig) && !process::signal_target(pid, sig) {
+        return false; // gone between the look and the hit
+    }
+    true
+}
+
+/// The live pids of process group `pgrp` (phase 3.3.4): what a ^C through
+/// the terminal's foreground claim reaches, and what `kill(-pgrp)` spells.
+fn pgrp_members(pgrp: u64) -> alloc::vec::Vec<u64> {
+    process::group_pids(pgrp)
+}
+
+/// Deliver `sig` to every live process of group `pgrp` (phase 3.3.4).  The
+/// caller may itself be a member -- a self-delivery follows the
+/// `kill(getpid())` rules (which never returns when the default action is
+/// termination).  Returns how many processes heard it.
+pub fn signal_pgrp(pgrp: u64, sig: u64) -> usize {
+    let me = process::getpid();
+    let mut n = 0;
+    for pid in pgrp_members(pgrp) {
+        if pid == me {
+            n += 1;
+            let _ = self_signal(sig); // may not return
+        } else if deliver_other(pid, sig) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// `kill(-1)`: every live process but the caller and init (pid 1), the
+/// same ladder member by member.
+fn broadcast_but_self(me: u64, sig: u64) -> usize {
+    process::all_pids_but(me)
+        .iter()
+        .filter(|&&pid| deliver_other(pid, sig))
+        .count()
 }
 
 // ---------------------------------------------------------------- sigreturn

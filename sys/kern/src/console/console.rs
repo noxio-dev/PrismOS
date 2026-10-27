@@ -129,6 +129,54 @@ pub fn write_bytes(mut b: &[u8]) {
     }
 }
 
+/// The console session's own output (phase 3.3.5): the text screen and
+/// only it -- no serial copy.  Kernel messages and /dev/console writes
+/// keep the serial tee (write_bytes above); what the console terminal
+/// (/dev/tty0) and its line discipline echo would land on ttyS0 twice,
+/// because the serial session echoes the same keystrokes there itself.
+pub fn write_local(mut b: &[u8]) {
+    while !b.is_empty() {
+        let (valid, skip, bad) = match core::str::from_utf8(b) {
+            Ok(s) => (s, b.len(), false),
+            Err(e) => {
+                let v = e.valid_up_to();
+                // SAFETY: from_utf8 vouches for the prefix.
+                let s = unsafe { core::str::from_utf8_unchecked(&b[..v]) };
+                (s, v + e.error_len().unwrap_or(b.len() - v), true)
+            }
+        };
+        for ch in valid.chars() {
+            local_char(ch);
+        }
+        if bad {
+            local_char('?');
+        }
+        b = &b[skip.min(b.len())..];
+    }
+}
+
+/// One character on the text screens only (the serial tee skipped).
+fn local_char(mut ch: char) {
+    // Keep IRQ-context prints from interleaving, like _print does; the
+    // ring buffer flush below needs the same single-flight discipline.
+    let _guard = crate::arch::io::IrqGuard::new();
+    let _cross = PRINT_LOCK.lock();
+    // SAFETY: single CPU; the guard serializes output paths.
+    let c = unsafe { &mut *addr_of_mut!(CONSOLE) };
+    if ch.is_control() && ch != '\n' && ch != '\t' && ch != '\x08' {
+        ch = '?';
+    }
+    if let Some(v) = c.vga.as_mut() {
+        v.put_char(ch);
+    }
+    if let Some(f) = c.fb.as_mut() {
+        f.put_char(ch);
+    }
+    if let Some(f) = c.fb.as_mut() {
+        f.flush();
+    }
+}
+
 impl Default for LogBuf {
     fn default() -> Self {
         LogBuf { buf: [0; 1024], len: 0 }

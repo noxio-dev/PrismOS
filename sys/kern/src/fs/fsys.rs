@@ -210,15 +210,33 @@ pub fn init() {
     // root mount there is nothing to hang it on either.
     if vfs().is_mounted() {
         match vfs().mount("/dev", Box::new(DevFs::new())) {
-            Ok(()) => crate::kprintln!("vfs      : devfs on /dev (console, tty, null, zero, full)"),
+            Ok(()) => crate::kprintln!("vfs      : devfs on /dev (console, tty, tty0, ttyS0, null, zero, full)"),
             Err(e) => crate::kprintln!("vfs      : cannot mount devfs on /dev: {}", e.as_str()),
         }
     }
+    // What the kernel does NOT mount anymore (phase 3.3.7): /tmp and
+    // /proc are pid 1's to set up -- init mounts them through
+    // `mount(2)` like on a real unix (the kernel keeps / and /dev, the
+    // devtmpfs split).  The rescue shell asks for the same two through
+    // `mount_proc_and_tmp` below, because with init gone there is nobody
+    // else to do it.
+}
+
+/// The rescue mode's mounts (phase 3.3.7): the kernel shell has no init
+/// above it, so the kernel hands it the /tmp and /proc a session would
+/// have mounted -- same file systems, same log lines as init's boot.
+pub fn mount_proc_and_tmp() {
+    if !vfs().is_mounted() {
+        return;
+    }
+    // Idempotent: a second call (a rescue hand-over after a session, a
+    // restart) leaves the working mounts alone.
+    let mounted = |p: &str| vfs().mounts().iter().any(|m| m.path == p);
     // /tmp is a tmpfs (phase 3.3): RAM-backed, everything the VFS can do
     // to a file system, bounded by a 16 MiB / 4096-file quota (fs/tmpfs.rs).
     // The mount needs an existing /tmp directory in the root -- the build
     // creates one (1777); mkdir_p keeps older images working.
-    if vfs().is_mounted() {
+    if !mounted("/tmp") {
         match vfs().mkdir_p("/tmp", 0o1777) {
             Ok(()) => match vfs().mount("/tmp", Box::new(TmpFs::new())) {
                 Ok(()) => crate::kprintln!(
@@ -234,7 +252,7 @@ pub fn init() {
     // /proc is the generated kernel / process state (phase 3.3,
     // fs/procfs.rs): version, uptime, meminfo, cpuinfo, cmdline, mounts,
     // self and one directory per live process.  Read-only by construction.
-    if vfs().is_mounted() {
+    if !mounted("/proc") {
         match vfs().mkdir_p("/proc", 0o555) {
             Ok(()) => match vfs().mount("/proc", Box::new(ProcFs::new())) {
                 Ok(()) => crate::kprintln!("vfs      : procfs on /proc (generated, read-only)"),
@@ -264,6 +282,15 @@ pub fn sys_mount(src_p: u64, tgt_p: u64, type_p: u64, flags: u64) -> i64 {
     }
     if fstype == "tmpfs" {
         return vfs().mkdir_p(&tgt, 0o1777).and_then(|_| vfs().mount(&tgt, Box::new(TmpFs::new()))).map_or_else(
+            |e| -crate::user::fd::fs_errno(e),
+            |_| 0,
+        );
+    }
+    // The process state file system, read-only and generated on read --
+    // what init mounts on /proc (phase 3.3.7; the fstype name is the one
+    // the mount table's fs_name column shows).
+    if fstype == "procfs" {
+        return vfs().mkdir_p(&tgt, 0o555).and_then(|_| vfs().mount(&tgt, Box::new(ProcFs::new()))).map_or_else(
             |e| -crate::user::fd::fs_errno(e),
             |_| 0,
         );

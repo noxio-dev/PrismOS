@@ -1,34 +1,38 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 noxio-dev
 //
-// The console terminal (phase 3.3): one tty sitting between the merged
-// keyboard + serial input and whichever process reads the console.  This
-// is the ring 3 half of lib/line.rs -- the kernel shell's reader does its
-// own editing on the raw queues, a userland session gets it done here.
+// The terminals (phase 3.3): two ttys, each with its own line
+// discipline -- the console one fed by the keyboard and echoing to the
+// text screen, the serial one fed by COM1's receive queue and echoing
+// to the serial line (that is what 3.3.5 means: /dev/ttyS0 has a queue
+// of its own, the console merge is over).
 //
-//   * `termios` state, exchanged with ring 3 through the TCGETS / TCSETS
-//     pair (the Linux x86-64 struct layout, 60 bytes) -- mlibc's
-//     tcgetattr / tcsetattr / isatty ride on those;
-//   * a line discipline: canonical mode (ICANON) assembles a line, echoes
-//     (ECHO), erases whole characters (ECHOE -- a wide CJK glyph loses
-//     both of its cells, like the kernel reader), kills the line (^U) and
-//     answers ^D with an end of file.  ISIG turns ^C into SIGINT for the
-//     foreground process (the shell owns that number through TIOCSPGRP,
-//     see fd.rs) and ^\ into SIGQUIT; without a foreground the reader
-//     parked on the tty gets it.  Raw mode (ICANON clear) hands bytes
-//     through as they come -- what a program like cube puts the terminal
-//     into for its keyboard;
+//   * `termios` state per terminal, exchanged with ring 3 through the
+//     TCGETS / TCSETS pair (the Linux x86-64 struct layout, 60 bytes) --
+//     mlibc's tcgetattr / tcsetattr / isatty ride on those;
+//   * a line discipline each: canonical mode (ICANON) assembles a line,
+//     echoes (ECHO), erases whole characters (ECHOE -- a wide CJK glyph
+//     loses both of its cells), kills the line (^U) and answers ^D with
+//     an end of file.  ISIG turns ^C into SIGINT for the foreground
+//     process group of that terminal (the shell owns that number
+//     through TIOCSPGRP, see fd.rs) and ^\ into SIGQUIT; without a
+//     foreground the reader parked on the tty gets it.  Raw mode
+//     (ICANON clear) hands bytes through as they come -- what a program
+//     like cube puts the terminal into for its keyboard;
 //   * the input is drained by `pump()`: from the read paths (syscall
 //     context) and from the tick (so a ^C typed while nothing reads is
 //     still acted on within one tick).  Every entry into the discipline
 //     runs with interrupts masked: the two callers must not interleave
 //     their queue pops, and the keyboard / serial rings are SPSC.
 //
-// Not here (README roadmap 3.3.4): sessions and process groups.  The
-// foreground number is a plain pid (TIOCSPGRP), not a pgrp -- setsid /
-// setpgid / kill(-pgrp) come with the busybox job control.
+// Sessions (roadmap 3.3.4): the foreground number is a process group
+// (what TIOCSPGRP exchanges); a ^C is delivered to the whole group.  A
+// session claims its controlling terminal with TIOCSCTTY, and /dev/tty
+// routes to it (fd.rs).
 
 use alloc::collections::VecDeque;
+use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -42,6 +46,7 @@ use crate::user::signal;
 const ICRNL: u32 = 0o400;
 // c_oflag
 const OPOST: u32 = 0o1;
+const ONLCR: u32 = 0o4;
 // c_cflag
 const CS8: u32 = 0o60;
 const CREAD: u32 = 0o200;
@@ -68,7 +73,17 @@ const NCCS: usize = 32;
 /// tty looks at; everything else is stored and handed back untouched.
 const KNOWN_LFLAG: u32 = ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN;
 
-/// The state of the one terminal.  Everything below is touched only under
+// ------------------------------------------------------------ the two ttys
+
+/// Which terminal: the console one (keyboard in, text screen out) or the
+/// serial one (COM1's queue in, COM1 out) -- /dev/ttyS0's own discipline.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Term {
+    Console,
+    Serial,
+}
+
+/// The state of one terminal.  Everything below is touched only under
 /// masked interrupts (see the header): the discipline is not re-entrant.
 struct Tty {
     iflag: u32,
@@ -83,14 +98,17 @@ struct Tty {
     lines: VecDeque<Vec<u8>>,
     /// Raw mode's byte queue.
     raw: VecDeque<u8>,
-    /// The foreground process (TIOCSPGRP): who a ^C is for.
+    /// The foreground process group (TIOCSPGRP): who a ^C is for.
     fg: AtomicU64,
-    /// The process parked in a console read, if any (the ^C fallback when
-    /// nobody claimed the foreground).
+    /// The process parked in a read of this tty, if any (the ^C fallback
+    /// when nobody claimed the foreground).
     reader: AtomicU64,
     /// Bytes of a multi-byte character being echoed: the tty sees input one
     /// byte at a time, the console wants whole characters.
     echo_utf8: Vec<u8>,
+    /// How many screen cells the character the last erase dropped occupied
+    /// (1 or 2 -- the erase echo repeats the sequence that many times).
+    echo_width: usize,
 }
 
 impl Tty {
@@ -106,7 +124,7 @@ impl Tty {
         cc[VSUSP] = 0x1A; // ^Z
         Tty {
             iflag: ICRNL,
-            oflag: OPOST,
+            oflag: OPOST | ONLCR,
             cflag: CS8 | CREAD,
             lflag: ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN,
             cc,
@@ -116,37 +134,76 @@ impl Tty {
             fg: AtomicU64::new(0),
             reader: AtomicU64::new(0),
             echo_utf8: Vec::new(),
+            echo_width: 1,
         }
     }
 }
 
-static mut TTY: Tty = Tty::new();
+static mut CONSOLE_TTY: Tty = Tty::new();
+static mut SERIAL_TTY: Tty = Tty::new();
+
+/// The tty of `which`, under the masked-interrupt contract of the
+/// discipline (the caller has the flags saved).
+///
+/// # Safety
+/// Interrupts must be masked by the caller.
+unsafe fn tty_of(which: Term) -> &'static mut Tty {
+    // SAFETY: as the contract; the two statics never alias a live caller.
+    unsafe {
+        match which {
+            Term::Console => &mut *addr_of_mut!(CONSOLE_TTY),
+            Term::Serial => &mut *addr_of_mut!(SERIAL_TTY),
+        }
+    }
+}
 
 /// Longest canonical line (like the kernel's line reader buffer).
 const LINE_MAX: usize = 1024;
 
 // ------------------------------------------------------------- discipline
 
-/// Next input byte from the keyboard or the serial line (the same merge the
-/// kernel shell's reader does), or None when idle.
-fn get_input_byte() -> Option<u8> {
-    if let Some(c) = crate::hw::kbd::pop_char() {
-        return Some(c);
+/// Next input byte of `which`, or None when idle.  The console tty reads
+/// the keyboard, the serial tty COM1's receive ring -- a queue of its
+/// own (the pre-3.3.5 merge, where the serial line fed the console, is
+/// what this split replaces).
+fn get_input_byte(which: Term) -> Option<u8> {
+    match which {
+        Term::Console => {
+            if let Some(c) = crate::hw::kbd::pop_char() {
+                return Some(c);
+            }
+            // The rescue merge (no userland session -- the kernel shell
+            // owns the console): the serial line feeds the console tty
+            // the way it always did, so a program the kernel shell execs
+            // answers a keyboard typed over the null-modem cable.  With a
+            // session up the two terminals stay strangers: ttyS0's queue
+            // is its getty's, and the console is the keyboard's.
+            if process::init_pid().is_none() {
+                return crate::hw::serial::pop_rx();
+            }
+            None
+        }
+        Term::Serial => crate::hw::serial::pop_rx(),
     }
-    crate::hw::serial::pop_rx()
 }
 
-/// Drain whatever is pending through the discipline (echo, line assembly,
-/// ISIG).  Called from the console read paths and, when a userland session
-/// is up, from the tick -- a ^C typed while the foreground process renders
-/// is acted on within one tick, not at its next read.
+/// Drain whatever is pending through both disciplines (echo, line
+/// assembly, ISIG).  Called from the tick and from the read paths -- a
+/// ^C typed while the foreground process renders is acted on within one
+/// tick, not at its next read.
 pub fn pump() {
+    pump_term(Term::Console);
+    pump_term(Term::Serial);
+}
+
+/// Drain one terminal's pending input.
+pub fn pump_term(which: Term) {
     let flags = crate::arch::io::cli_save();
     // SAFETY: interrupts masked; the discipline is single-threaded by this
     // guard (the tick and a read path can never interleave a pop).
     unsafe {
-        while let Some(b) = get_input_byte() {
-            feed(b);
+        while let Some(b) = get_input_byte(which) {
+            feed(which, b);
         }
     }
     // SAFETY: flags came from cli_save on this stack.
@@ -158,29 +215,29 @@ pub fn pump() {
 ///
 /// # Safety
 /// Only under the `pump` / masked-interrupt contract; touches the tty state.
-unsafe fn feed(mut b: u8) {
+unsafe fn feed(which: Term, mut b: u8) {
     // SAFETY: as the contract.
-    let tty = unsafe { &mut *addr_of_mut!(TTY) };
+    let tty = unsafe { tty_of(which) };
     if tty.lflag & ISIG != 0 {
         if b == tty.cc[VINTR] {
             tty.canon.clear();
             if tty.lflag & ECHO != 0 {
-                echo("^C\n");
+                echo(which, "^C\n");
             }
-            raise(signal::SIGINT);
+            raise(which, signal::SIGINT);
             return;
         }
         if b == tty.cc[VQUIT] {
             tty.canon.clear();
             if tty.lflag & ECHO != 0 {
-                echo("^\\\n");
+                echo(which, "^\\\n");
             }
-            raise(3); // SIGQUIT
+            raise(which, 3); // SIGQUIT
             return;
         }
         if b == tty.cc[VSUSP] {
-            // No stop / continue yet (roadmap 3.3.4): swallow it rather
-            // than inject a control byte into the stream.
+            // No stop / continue yet: swallow it rather than inject a
+            // control byte into the stream.
             return;
         }
     }
@@ -195,19 +252,12 @@ unsafe fn feed(mut b: u8) {
             // Erase the last character -- a whole character: a wide glyph
             // loses both of its cells (the same walk the kernel reader
             // does in lib/line.rs).
-            let mut start = tty.canon.len() - 1;
-            while start > 0 && tty.canon[start] & 0xC0 == 0x80 {
-                start -= 1;
-            }
-            let w = core::str::from_utf8(&tty.canon[start..])
-                .ok()
-                .and_then(|s| s.chars().next())
-                .map_or(1, crate::console::char_width);
-            tty.canon.truncate(start);
+            erase_tail(tty);
             if tty.lflag & (ECHO | ECHOE) == (ECHO | ECHOE) {
-                for _ in 0..w {
-                    echo("\u{8} \u{8}");
+                for _ in 0..tty.echo_width {
+                    echo(which, "\u{8} \u{8}");
                 }
+                tty.echo_width = 1;
             }
             return;
         }
@@ -215,26 +265,19 @@ unsafe fn feed(mut b: u8) {
             // Kill the line: erase it cell by cell (ECHOK, like ^U in the
             // kernel reader).
             while !tty.canon.is_empty() {
-                let mut start = tty.canon.len() - 1;
-                while start > 0 && tty.canon[start] & 0xC0 == 0x80 {
-                    start -= 1;
-                }
-                let w = core::str::from_utf8(&tty.canon[start..])
-                    .ok()
-                    .and_then(|s| s.chars().next())
-                    .map_or(1, crate::console::char_width);
-                tty.canon.truncate(start);
+                erase_tail(tty);
                 if tty.lflag & (ECHO | ECHOE) == (ECHO | ECHOE) {
-                    for _ in 0..w {
-                        echo("\u{8} \u{8}");
+                    for _ in 0..tty.echo_width {
+                        echo(which, "\u{8} \u{8}");
                     }
                 }
             }
+            tty.echo_width = 1;
             return;
         }
         if b == tty.cc[VEOF] {
             // The line is complete as it stands; an empty one is the end
-            // of file the next read reports as a 0 count.
+            // of the file the next read reports as a 0 count.
             tty.lines.push_back(core::mem::take(&mut tty.canon));
             return;
         }
@@ -254,19 +297,40 @@ unsafe fn feed(mut b: u8) {
         tty.raw.push_back(b);
     }
     if tty.lflag & ECHO != 0 {
-        echo_char(tty, b);
+        echo_char(which, b);
     }
 }
 
-/// Deliver `sig` to whoever owns the terminal right now: the foreground
-/// process when one claimed it (TIOCSPGRP), the parked reader otherwise.
-/// Nobody -- drop it.
+/// Drop the last character of the line under assembly and remember how
+/// many screen cells it occupied (the erase echo needs the width).
+///
+/// # Safety
+/// Under the masked-interrupt discipline contract; `tty` is the caller's.
+unsafe fn erase_tail(tty: &mut Tty) {
+    let mut start = tty.canon.len() - 1;
+    while start > 0 && tty.canon[start] & 0xC0 == 0x80 {
+        start -= 1;
+    }
+    let w = core::str::from_utf8(&tty.canon[start..])
+        .ok()
+        .and_then(|s| s.chars().next())
+        .map_or(1, crate::console::char_width);
+    tty.canon.truncate(start);
+    tty.echo_width = w;
+}
+
+/// Deliver `sig` to the foreground process group of `which`, or to the
+/// parked reader when nobody claimed it.  Nobody -- drop it.
 ///
 /// # Safety
 /// Under the `pump` masked-interrupt contract (may end the caller).
-unsafe fn raise(sig: u64) {
-    let fg = fg_pid();
-    let target = if fg != 0 { fg } else { reader_pid() };
+unsafe fn raise(which: Term, sig: u64) {
+    let fg = fg_pgrp(which);
+    if fg != 0 {
+        signal::signal_pgrp(fg, sig);
+        return;
+    }
+    let target = reader_pid(which);
     if target == 0 {
         return;
     }
@@ -289,54 +353,83 @@ unsafe fn raise(sig: u64) {
     }
 }
 
-/// The tty's own output: straight to the console, *not* through
-/// `console::write_bytes`.  That one is the sanitiser for ring 3 programs
-/// (every control character but `\n` / `\t` becomes '?'), which is exactly
-/// what turned the erase sequence `\b \b` into `? ?` on screen.  What the
-/// discipline echoes is the kernel's own text -- trusted.
-fn echo(s: &str) {
-    crate::kprint!("{}", s);
-}
-
-/// Echo one input byte the way a terminal does (ECHOCTL): newline and tab as
-/// themselves, any other control character as `^X`, printable ASCII as is,
-/// and multi-byte UTF-8 once the whole character has arrived.
-fn echo_char(tty: &mut Tty, b: u8) {
-    if b >= 0x80 || !tty.echo_utf8.is_empty() {
-        if b < 0x80 {
-            // A sequence cut short by an ASCII byte: show the damage once,
-            // then carry on with the byte itself.
-            tty.echo_utf8.clear();
-            echo("?");
-        } else {
-            tty.echo_utf8.push(b);
-            // 0 = a whole character, 1 = still incomplete, 2 = invalid.
-            let state = match core::str::from_utf8(&tty.echo_utf8) {
-                Ok(_) => 0,
-                Err(e) if e.error_len().is_none() && tty.echo_utf8.len() < 4 => 1,
-                Err(_) => 2,
+/// The tty's own output.  The console tty writes the text screen and
+// only it (the serial line carries the serial session, kernel messages
+// and whatever a program sends to /dev/console -- a console session
+// echoing over ttyS0 would make two prompts per keystroke); the serial
+/// tty writes COM1, newline expanded the way the OPOST / ONLCR flag
+/// pair says (the line's own idea of oflag).
+fn echo(which: Term, s: &str) {
+    match which {
+        Term::Console => crate::console::write_local(s.as_bytes()),
+        Term::Serial => {
+            let onlcr = {
+                // SAFETY: an atomic-less read of a u32 the discipline owns
+                // under masked interrupts; echo is only called from there.
+                unsafe { tty_of(Term::Serial).oflag & (OPOST | ONLCR) == (OPOST | ONLCR) }
             };
-            match state {
-                0 => {
-                    if let Ok(s) = core::str::from_utf8(&tty.echo_utf8) {
-                        crate::kprint!("{}", s);
-                    }
-                    tty.echo_utf8.clear();
+            for &b in s.as_bytes() {
+                if b == b'\n' && onlcr {
+                    crate::hw::serial::write_byte(b'\r');
                 }
-                1 => {}
-                _ => {
-                    tty.echo_utf8.clear();
-                    echo("?");
-                }
+                crate::hw::serial::write_byte(b);
             }
-            return;
         }
     }
-    match b {
-        b'\n' => echo("\n"),
-        b'\t' => echo("\t"),
-        0x00..=0x1F | 0x7F => crate::kprint!("^{}", (b ^ 0x40) as char),
-        _ => crate::kprint!("{}", b as char),
+}
+
+/// Echo one input byte the way a terminal does (ECHOCTL): newline and tab
+/// as themselves, any other control character as `^X`, printable ASCII
+/// as is, and multi-byte UTF-8 once the whole character has arrived.
+fn echo_char(which: Term, b: u8) {
+    // SAFETY: the echo_utf8 staging belongs to the discipline; echo_char
+    // is only called from feed (interrupts masked).
+    // What the terminal shows for the byte: a whole string (the
+    // multi-byte case), or nothing while a sequence is still arriving.
+    let shown: Option<String> = unsafe {
+        let tty = tty_of(which);
+        if b >= 0x80 || !tty.echo_utf8.is_empty() {
+            if b < 0x80 {
+                // A sequence cut short by an ASCII byte: show the damage
+                // once, then carry on with the byte itself.
+                tty.echo_utf8.clear();
+                Some(String::from("?"))
+            } else {
+                tty.echo_utf8.push(b);
+                // 0 = a whole character, 1 = still incomplete, 2 = invalid.
+                let state = match core::str::from_utf8(&tty.echo_utf8) {
+                    Ok(_) => 0,
+                    Err(e) if e.error_len().is_none() && tty.echo_utf8.len() < 4 => 1,
+                    Err(_) => 2,
+                };
+                match state {
+                    0 => {
+                        let s = core::str::from_utf8(&tty.echo_utf8)
+                            .map_or_else(|_| String::from("?"), String::from);
+                        tty.echo_utf8.clear();
+                        Some(s)
+                    }
+                    1 => None,
+                    _ => {
+                        tty.echo_utf8.clear();
+                        Some(String::from("?"))
+                    }
+                }
+            }
+        } else {
+            match b {
+                b'\n' => Some(String::from("\n")),
+                b'\t' => Some(String::from("\t")),
+                0x00..=0x1F | 0x7F => {
+                    Some(format!("^{}", (b ^ 0x40) as char))
+                }
+                // Printable ASCII: the byte itself.
+                _ => Some(String::from((b as char).encode_utf8(&mut [0u8; 4]))),
+            }
+        }
+    };
+    if let Some(s) = shown {
+        echo(which, &s);
     }
 }
 
@@ -345,11 +438,11 @@ fn echo_char(tty: &mut Tty, b: u8) {
 /// Take up to `out.len()` bytes of completed input.  A canonical read
 /// answers at most one line (an empty one is the end of file); a raw read
 /// takes whatever is queued.  None = nothing complete yet.
-pub fn take(out: &mut [u8]) -> Option<usize> {
+pub fn take(which: Term, out: &mut [u8]) -> Option<usize> {
     let flags = crate::arch::io::cli_save();
     // SAFETY: interrupts masked; the queues are ours for the duration.
     let r = unsafe {
-        let tty = &mut *addr_of_mut!(TTY);
+        let tty = tty_of(which);
         if tty.lflag & ICANON != 0 {
             let mut line = tty.lines.pop_front()?;
             let n = out.len().min(line.len());
@@ -376,18 +469,22 @@ pub fn take(out: &mut [u8]) -> Option<usize> {
     r
 }
 
-/// Whether a console read has something to answer right now (poll /
+/// Whether a read of `which` has something to answer right now (poll /
 /// select's probe).  Raw mode also counts undrained hardware bytes: the
 /// read path pumps before it takes.
-pub fn readable() -> bool {
+pub fn readable(which: Term) -> bool {
     let flags = crate::arch::io::cli_save();
     // SAFETY: read-only look under masked interrupts.
     let r = unsafe {
-        let tty = &*addr_of_mut!(TTY);
+        let tty = tty_of(which);
         if tty.lflag & ICANON != 0 {
             !tty.lines.is_empty()
         } else {
-            !tty.raw.is_empty() || crate::hw::kbd::has_char() || crate::hw::serial::has_byte()
+            !tty.raw.is_empty()
+                || match which {
+                    Term::Console => crate::hw::kbd::has_char(),
+                    Term::Serial => crate::hw::serial::has_byte(),
+                }
         }
     };
     // SAFETY: as cli_save.
@@ -395,49 +492,54 @@ pub fn readable() -> bool {
     r
 }
 
-/// Record who is parked in a console read (the ^C fallback target).  The
-/// read paths call this on entry and clear it (`0`) on the way out.
-pub fn set_reader(pid: u64) {
+/// Record who is parked in a read of `which` (the ^C fallback target).
+/// The read paths call this on entry and clear it (`0`) on the way out.
+pub fn set_reader(which: Term, pid: u64) {
     // SAFETY: the tty is only touched under masked interrupts; this is an
     // atomic store on a static.
-    unsafe { (*addr_of_mut!(TTY)).reader.store(pid, Ordering::Relaxed) };
+    unsafe { tty_of(which).reader.store(pid, Ordering::Relaxed) };
 }
 
-/// Drop everything the discipline holds (phase 3.3's rescue hand-over:
+/// Drop everything both disciplines hold (phase 3.3's rescue hand-over:
 /// what was typed during a dying session belongs to nobody).  The
-/// foreground claim goes with it -- the kernel shell owns the console.
+/// foreground claims go with them -- the kernel shell owns the console
+/// input again (and COM1's ring drains to nobody until the next serial
+/// session opens).
 pub fn reset_input() {
     let flags = crate::arch::io::cli_save();
-    // SAFETY: the discipline is ours under masked interrupts.
+    // SAFETY: the disciplines are ours under masked interrupts.
     unsafe {
-        let t = &mut *addr_of_mut!(TTY);
-        t.canon.clear();
-        t.lines.clear();
-        t.raw.clear();
-        t.reader.store(0, Ordering::Relaxed);
-        t.fg.store(0, Ordering::Relaxed);
+        for which in [Term::Console, Term::Serial] {
+            let t = tty_of(which);
+            t.canon.clear();
+            t.lines.clear();
+            t.raw.clear();
+            t.reader.store(0, Ordering::Relaxed);
+            t.fg.store(0, Ordering::Relaxed);
+        }
     }
     // SAFETY: flags came from cli_save on this stack.
     unsafe { crate::arch::io::restore_flags(flags) };
 }
 
-/// The parked reader, if any.
-pub fn reader_pid() -> u64 {
+/// The parked reader of `which`, if any.
+pub fn reader_pid(which: Term) -> u64 {
     // SAFETY: atomic load of a static.
-    unsafe { (*addr_of_mut!(TTY)).reader.load(Ordering::Relaxed) }
+    unsafe { tty_of(which).reader.load(Ordering::Relaxed) }
 }
 
-/// The foreground process (TIOCSPGRP), 0 when unclaimed.
-pub fn fg_pid() -> u64 {
+/// The foreground process group of `which` (TIOCSPGRP), 0 when unclaimed.
+pub fn fg_pgrp(which: Term) -> u64 {
     // SAFETY: atomic load of a static.
-    unsafe { (*addr_of_mut!(TTY)).fg.load(Ordering::Relaxed) }
+    unsafe { tty_of(which).fg.load(Ordering::Relaxed) }
 }
 
-/// Claim the foreground (TIOCSPGRP): the shell parks its own pid at the
-/// prompt and the pid of the command it runs while it waits.
-pub fn set_fg(pid: u64) {
+/// Claim the foreground of `which` (TIOCSPGRP): the shell parks its own
+/// process group at the prompt and the group of the command it runs
+/// while it waits.
+pub fn set_fg(which: Term, pgrp: u64) {
     // SAFETY: atomic store on a static.
-    unsafe { (*addr_of_mut!(TTY)).fg.store(pid, Ordering::Relaxed) };
+    unsafe { tty_of(which).fg.store(pgrp, Ordering::Relaxed) };
 }
 
 // -------------------------------------------------------------- the ioctls
@@ -447,12 +549,13 @@ pub fn set_fg(pid: u64) {
 /// bytes exactly, the size the pre-3.3 TCGETS used to zero out.
 pub const TERMIOS_LEN: usize = 60;
 
-/// Serialize the termios state into `out` (exactly TERMIOS_LEN bytes).
-pub fn get_termios(out: &mut [u8; TERMIOS_LEN]) {
+/// Serialize the termios state of `which` into `out` (exactly
+/// TERMIOS_LEN bytes).
+pub fn get_termios(which: Term, out: &mut [u8; TERMIOS_LEN]) {
     let flags = crate::arch::io::cli_save();
     // SAFETY: read-only copy under masked interrupts.
     let (iflag, oflag, cflag, lflag, cc) = unsafe {
-        let t = &*addr_of_mut!(TTY);
+        let t = tty_of(which);
         (t.iflag, t.oflag, t.cflag, t.lflag, t.cc)
     };
     // SAFETY: as cli_save.
@@ -468,12 +571,13 @@ pub fn get_termios(out: &mut [u8; TERMIOS_LEN]) {
     out[56..60].copy_from_slice(&38400u32.to_le_bytes()); // ospeed
 }
 
-/// Install a termios state (TCSETS / TCSETSW / TCSETSF -- the three differ
-/// only in flushing rules we cannot wait for; the input queue is flushed
-/// when ICANON is toggled, the honest part of TCSAFLUSH).
-pub fn set_termios(bytes: &[u8; TERMIOS_LEN]) {
+/// Install a termios state of `which` (TCSETS / TCSETSW / TCSETSF -- the
+/// three differ only in flushing rules we cannot wait for; the input
+/// queue is flushed when ICANON is toggled, the honest part of
+/// TCSAFLUSH).
+pub fn set_termios(which: Term, bytes: &[u8; TERMIOS_LEN]) {
     let read_u32 = |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
-    let oflag = read_u32(4) & OPOST;
+    let oflag = read_u32(4) & (OPOST | ONLCR);
     let cflag = read_u32(8) & (CS8 | CREAD);
     let lflag = read_u32(12) & KNOWN_LFLAG;
     let mut cc = [0u8; NCCS];
@@ -481,7 +585,7 @@ pub fn set_termios(bytes: &[u8; TERMIOS_LEN]) {
     let flags = crate::arch::io::cli_save();
     // SAFETY: the discipline is ours under masked interrupts.
     unsafe {
-        let t = &mut *addr_of_mut!(TTY);
+        let t = tty_of(which);
         let was_canon = t.lflag & ICANON != 0;
         // Input translations: CR -> NL stays on whatever a program asks
         // for -- the serial terminals send CR, and the other directions
@@ -525,8 +629,12 @@ pub fn set_termios(bytes: &[u8; TERMIOS_LEN]) {
     unsafe { crate::arch::io::restore_flags(flags) };
 }
 
-/// Text grid of the active console (TIOCGWINSZ): the framebuffer's own
-/// geometry, 80x25 in VGA text mode.
-pub fn text_dims() -> (usize, usize) {
-    crate::console::text_dims()
+/// Text grid of a terminal (TIOCGWINSZ): the framebuffer's own geometry,
+/// 80x25 in VGA text mode.  The serial line has no geometry -- the
+/// zeros a real unix answers for ttyS0 before anything sets it.
+pub fn text_dims(which: Term) -> (usize, usize) {
+    match which {
+        Term::Console => crate::console::text_dims(),
+        Term::Serial => (0, 0),
+    }
 }
