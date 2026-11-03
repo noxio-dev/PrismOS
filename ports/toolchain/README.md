@@ -11,6 +11,11 @@ loader dynamic linking (step 5): the sysroot's shared half (`libc.so` +
 `ld.so`) and a dynamically linked `hello` whose `PT_INTERP` the kernel
 honours.
 
+Phase 4.1 builds on this tree: `ports/binutils` cross-builds the utilities
+themselves -- `ar`, `ranlib`, `strip`, `objdump`, `nm` as PrismOS programs,
+through the same two paths below and the same tarball + triplet patch —
+see `ports/binutils/README.md`.
+
 ```
 ports/toolchain/
 ├── bootstrap.sh               the pipeline: wrappers → mlibc (headers, library) → progs → verify

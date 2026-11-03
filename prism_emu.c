@@ -12,9 +12,24 @@
  * register order and errno convention line up) or a neutralized getpid
  * whose exit rax is overwritten with the emulated answer.
  *
- * Usage: prism_emu <static-pie> [args...]
+ * Phase 4.1 grew it from the cube's demo harness into the binutils port's
+ * test bench: the utilities are argument-driven programs (ar rc lib.a
+ * file.o, objdump -d, strip -o out in), so the full argv travels now, and
+ * the file surface they exercise -- the stat pair, unlink / rename (ar's
+ * and strip's temp-file dance), umask, munmap / mprotect, a real lseek --
+ * is rewritten to the matching Linux calls, the way the kernel answers
+ * them.  The stack is the kernel's own size (ELF_STACK_SIZE, 16 pages):
+ * what fits here fits there.  The PrismOS open() carries no mode (the
+ * kernel's O_CREATE files are 0o644); the rewritten call plants exactly
+ * that, so an ar creating an archive under emulation creates it with the
+ * permissions the kernel would give it.
+ *
+ * Usage: prism_emu [-v] <static-pie> [args...]
  * Output: the program's stdout, cube_emu.ppm when it blitted anything, and
- * a PrismOS-style crash line (rip / cr2) when it faults.
+ * a PrismOS-style crash line (rip / cr2) when it faults.  The child's exit
+ * status becomes this process' exit status; 42 marks a fault instead.
+ * PRISM_EMU_ALARM caps the run (seconds, default 12 -- the cube spins
+ * forever; the binutils utilities finish long before).
  */
 
 #define _GNU_SOURCE
@@ -40,6 +55,9 @@
 #define PRISM_USER_BASE   0x8000000000ULL          /* vmm.rs: USER_BASE */
 #define PRISM_STACK_TOP   0x400000000000ULL        /* vmm.rs: USER_END */
 #define PRISM_MMAP_BASE   0x9000000000ULL          /* vmm.rs: USER_MMAP_BASE */
+/* the kernel's initial stack (elf.rs: ELF_STACK_SIZE, 16 pages) -- the
+ * emulator runs the tools on exactly what the kernel gives them */
+#define PRISM_STACK_SIZE  (256 * 4096ULL)   /* 1 MiB -- see elf.rs */
 /* the child's scratch spot for planted strings */
 #define PRISM_SCRATCH     (PRISM_STACK_TOP - 8192)
 
@@ -47,7 +65,11 @@ enum {                                  /* prismos/syscall.h */
         P_EXIT = 0, P_WRITE = 1, P_GETPID = 2, P_UPTIME_MS = 3, P_YIELD = 4,
         P_SLEEP = 5, P_READ = 13, P_OPEN = 14, P_CLOSE = 15, P_BRK = 21,
         P_MMAP = 22, P_IOCTL = 29, P_ARCH_PRCTL = 36, P_FB_INFO = 44,
-        P_FB_BLIT = 45, P_LSEEK = 16,
+        P_FB_BLIT = 45, P_LSEEK = 16, P_STAT = 19, P_FSTAT = 20,
+        P_MUNMAP = 23, P_GETCWD = 25, P_DUP = 17, P_DUP2 = 26, P_FCNTL = 27,
+        P_UNLINK = 30, P_RENAME = 33, P_MPROTECT = 40, P_UMASK = 52,
+        P_GETTIMEOFDAY = 53, P_CLOCK_GETTIME = 43, P_LSTAT = 58,
+        P_GETPPID = 49, P_GETUID = 50, P_GETGID = 51,
 };
 
 struct prism_fb_info {                  /* prism_raw.h, packed the same */
@@ -176,7 +198,7 @@ static void dump_ppm(const char *path)
 
 /* ---- the child ---------------------------------------------------------- */
 
-static void run_child(struct image *im, char *arg0)
+static void run_child(struct image *im, int argc, char **argv)
 {
         /* map the image span at USER_BASE (RW, then protect) */
         uint64_t lo = im->ph[0].vaddr, hi = 0;
@@ -219,28 +241,40 @@ static void run_child(struct image *im, char *arg0)
                 }
         }
 
-        /* the stack, mapped to PRISM_STACK_TOP like the kernel's exec */
-        uint64_t stack_lo = PRISM_STACK_TOP - (8ULL << 20);
-        if (mmap((void *)stack_lo, PRISM_STACK_TOP - stack_lo, PROT_READ | PROT_WRITE,
+        /* the stack, mapped to PRISM_STACK_TOP like the kernel's exec -- and
+         * the kernel's size (ELF_STACK_SIZE): the binutils utilities have to
+         * live within it here if they are to live within it there */
+        uint64_t stack_lo = PRISM_STACK_TOP - PRISM_STACK_SIZE;
+        if (mmap((void *)stack_lo, PRISM_STACK_SIZE, PROT_READ | PROT_WRITE,
              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) {
                 perror("emu: mmap stack"); _exit(1);
         }
 
-        /* build the initial stack (the kernel's build_stack layout) */
-        uint64_t sp = PRISM_STACK_TOP - 4096;
+        /* build the initial stack (the kernel's build_stack layout): the
+         * strings (AT_EXECFN first, then the argv strings), AT_RANDOM's
+         * sixteen bytes, then -- 16-byte aligned -- argc, the argv pointers,
+         * a NULL, the envp pointers, a NULL, and the auxiliary vector */
+        uint64_t sp = PRISM_STACK_TOP;
         uint64_t scratch = PRISM_SCRATCH;
         memcpy((void *)scratch, "/dev/null", 10); /* the child plants it itself */
+
+        uint64_t execfn_p = sp - (strlen(argv[0]) + 1);
+        memcpy((void *)execfn_p, argv[0], strlen(argv[0]) + 1);
+        sp = execfn_p;
+
+        uint64_t *arg_p = malloc(argc * sizeof *arg_p);
+        for (int i = argc - 1; i >= 0; i--) {
+                sp -= strlen(argv[i]) + 1;
+                memcpy((void *)sp, argv[i], strlen(argv[i]) + 1);
+                arg_p[i] = sp;
+        }
+
         uint64_t rnd = sp - 16; sp -= 16;           /* AT_RANDOM bytes */
         unsigned char rndb[16];
         for (int i = 0; i < 16; i++) rndb[i] = rand();
         memcpy((void *)rnd, rndb, 16);
-        uint64_t astr = sp; sp -= strlen(arg0) + 1; /* argv[0] */
-        memcpy((void *)astr, arg0, strlen(arg0) + 1);
-        char execfn[] = "/emu";
-        uint64_t fstr = sp; sp -= sizeof execfn;
-        memcpy((void *)fstr, execfn, sizeof execfn);
-
         sp &= ~15ULL;
+
         uint64_t auxv[] = {
                 3 /*AT_PHDR*/,    PRISM_USER_BASE + im->phoff,
                 4 /*AT_PHENT*/,   im->phentsize,
@@ -254,15 +288,17 @@ static void run_child(struct image *im, char *arg0)
                 17 /*AT_CLKTCK*/, 100,
                 23 /*AT_SECURE*/, 0,
                 25 /*AT_RANDOM*/, rnd,
-                31 /*AT_EXECFN*/, fstr,
+                31 /*AT_EXECFN*/, execfn_p,
                 0, 0,
         };
-        uint64_t words[128];
         int nw = 0;
-        words[nw++] = 1;                    /* argc */
-        words[nw++] = astr;                 /* argv[0] */
-        words[nw++] = 0;                    /* argv end */
-        words[nw++] = 0;                    /* envp end */
+        int nwords = 1 + argc + 1 + 1 + (int)(sizeof auxv / 8);
+        uint64_t *words = malloc(nwords * sizeof *words);
+        words[nw++] = argc;                  /* argc */
+        for (int i = 0; i < argc; i++)       /* argv */
+                words[nw++] = arg_p[i];
+        words[nw++] = 0;                     /* argv end */
+        words[nw++] = 0;                     /* envp end (the empty envp) */
         for (unsigned i = 0; i < sizeof auxv / 8; i++)
                 words[nw++] = auxv[i];
         sp -= (uint64_t)nw * 8;
@@ -317,6 +353,26 @@ static void serve_entry(struct user_regs_struct *r)
         case P_CLOSE:      r->orig_rax = 3;   break;   /* close(fd) */
         case P_ARCH_PRCTL: r->orig_rax = 158; break;   /* arch_prctl: same regs */
         case P_GETPID:     r->orig_rax = 39;  break;   /* getpid() */
+        case P_GETPPID:    r->orig_rax = 110; break;   /* getppid() */
+        case P_GETUID:     r->orig_rax = 102; break;   /* getuid() */
+        case P_GETGID:     r->orig_rax = 104; break;   /* getgid() */
+        /* the stat pair (and lstat): the x86-64 Linux struct stat is what
+         * the kernel fills and the ABI's abi-bits/stat.h asserts */
+        case P_STAT:       r->orig_rax = 4;   break;   /* stat(path, buf) */
+        case P_FSTAT:      r->orig_rax = 5;   break;   /* fstat(fd, buf) */
+        case P_LSTAT:      r->orig_rax = 6;   break;   /* lstat(path, buf) */
+        case P_LSEEK:      r->orig_rax = 8;   break;   /* lseek(fd, off, whence) */
+        case P_MUNMAP:     r->orig_rax = 11;  break;   /* munmap(addr, len) */
+        case P_MPROTECT:   r->orig_rax = 10;  break;   /* mprotect(addr, len, prot) */
+        case P_DUP:        r->orig_rax = 32;  break;   /* dup(fd) */
+        case P_DUP2:       r->orig_rax = 33;  break;   /* dup2(old, new) */
+        case P_FCNTL:      r->orig_rax = 72;  break;   /* fcntl(fd, cmd, arg) */
+        case P_UNLINK:     r->orig_rax = 87;  break;   /* unlink(path) */
+        case P_RENAME:     r->orig_rax = 82;  break;   /* rename(old, new) */
+        case P_UMASK:      r->orig_rax = 95;  break;   /* umask(mask) */
+        case P_GETCWD:     r->orig_rax = 79;  break;   /* getcwd(buf, size) */
+        case P_GETTIMEOFDAY: r->orig_rax = 96; break;  /* gettimeofday(tv, tz) */
+        case P_CLOCK_GETTIME: r->orig_rax = 228; break;/* clock_gettime(clk, ts) */
         case P_OPEN: {                          /* open(path, flags): no mode! */
                 char path[256];
                 if (rd_mem(r->rdi, path, sizeof path - 1) == 0) {
@@ -324,6 +380,27 @@ static void serve_entry(struct user_regs_struct *r)
                         if (!strcmp(path, "/dev/console"))
                                 r->rdi = scratch_addr;  /* the planted "/dev/null" */
                 }
+                /* The O_* bits are the kernel's own values (vfs.rs), not
+                 * Linux's: translate what the ABI defines -- the access
+                 * pair, the create / truncate / append / excl set, and the
+                 * description-level nonblocking / close-on-exec bits. */
+                uint64_t pf = r->rsi, lf = 0;
+                switch (pf & 3) {
+                case 1: lf = O_RDONLY; break;         /* 0 */
+                case 2: lf = O_WRONLY; break;         /* 1 */
+                case 3: lf = O_RDWR;   break;         /* 2 */
+                }
+                if (pf & 0x04) lf |= O_CREAT;
+                if (pf & 0x08) lf |= O_TRUNC;
+                if (pf & 0x10) lf |= O_APPEND;
+                if (pf & 0x20) lf |= O_EXCL;
+                if (pf & 0x40) lf |= O_NONBLOCK;
+                if (pf & 0x80) lf |= O_CLOEXEC;
+                r->rsi = lf;
+                /* the kernel's O_CREATE files are 0o644 (vfs.rs); plant that
+                 * mode so an ar creating an archive creates the same file */
+                if (lf & O_CREAT)
+                        r->rdx = 0644;
                 r->orig_rax = 2;
                 break;
         }
@@ -343,9 +420,6 @@ static void serve_entry(struct user_regs_struct *r)
         case P_IOCTL:     /* isatty's TCGETS: "not a tty" is the honest answer,
                              * and what makes mlibc's stdio go fully buffered */
                           pending_answer = (uint64_t)-25; neutralized = 1; r->orig_rax = 39; break;
-        case P_LSEEK:     /* stdio's seekability probe: the offset asked for,
-                             * as if the console were a regular file */
-                          pending_answer = r->rsi;    neutralized = 1; r->orig_rax = 39; break;
         case P_FB_INFO:
                 wr_mem(r->rdi, &FB, sizeof FB);
                 pending_answer = 0; neutralized = 1; r->orig_rax = 39; break;
@@ -381,7 +455,8 @@ int main(int argc, char **argv)
         struct sigaction sa = {0};
         sa.sa_handler = on_alrm;
         sigaction(SIGALRM, &sa, NULL); /* no SA_RESTART: the wait unwinds */
-        alarm(12);                     /* the cube spins forever: 12 s of frames */
+        alarm(getenv("PRISM_EMU_ALARM") ? atoi(getenv("PRISM_EMU_ALARM"))
+                                        : 12); /* the cube spins: 12 s of frames */
         if (argc < 2) {
                 fprintf(stderr, "usage: %s [-v] <static-pie> [args...]\n", argv[0]);
                 return 2;
@@ -398,7 +473,7 @@ int main(int argc, char **argv)
 
         pid = fork();
         if (pid == 0)
-                run_child(&im, argv[1]);
+                run_child(&im, argc - 1, argv + 1);
 
         int st;
         waitpid(pid, &st, 0);                    /* the SIGSTOP after setup */
@@ -422,6 +497,7 @@ int main(int argc, char **argv)
                 }
                 if (WIFEXITED(st)) {
                         fprintf(stderr, "emu: exited %d\n", WEXITSTATUS(st));
+                        rc = WEXITSTATUS(st);    /* the program's own status */
                         break;
                 }
                 if (WIFSIGNALED(st)) {

@@ -56,6 +56,18 @@ READELF=${READELF:-readelf}
 OBJDUMP=${OBJDUMP:-objdump}
 NM=${NM:-nm}
 
+# The cross binutils, when the toolchain has them (phase 4.1's wiring: the
+# builds verify against the same tools that will run on the target).  The
+# prefixed names answer as bootstrap wrappers on the fast path and as
+# build.sh's real cross tools on the real one, so the disassembly the diet
+# checks below parse is produced by binutils either way; without a
+# toolchain the host's own answer.  Explicit READELF / OBJDUMP / NM in the
+# environment still win.
+XBIN=$(cd "$(dirname "$0")/../.." && pwd)/build/toolchain/usr/bin
+[ -x "$XBIN/x86_64-prismos-readelf" ] && READELF=$XBIN/x86_64-prismos-readelf
+[ -x "$XBIN/x86_64-prismos-objdump" ] && OBJDUMP=$XBIN/x86_64-prismos-objdump
+[ -x "$XBIN/x86_64-prismos-nm" ] && NM=$XBIN/x86_64-prismos-nm
+
 fail=0
 ok()   { printf '  ok   %s\n' "$1"; }
 bad()  { printf '  FAIL %s\n' "$1"; fail=$((fail + 1)); }

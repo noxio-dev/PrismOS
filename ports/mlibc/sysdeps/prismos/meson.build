@@ -7,6 +7,15 @@
 
 sysdep_supported_options = {
         'posix': true,
+        # The glibc-compat option (phase 4.1): the GNU extensions the ported
+        # software parses its flags with -- getopt_long lives there (options/
+        # glibc/generic/getopt.cpp, on top of the internal getopt the posix
+        # option already builds), and error()/err() -- what binutils'
+        # utilities report through.  The ABI is deliberately Linux-shaped
+        # (the gcc patch's glibc-stdint.h / gnu-user.h); the option set
+        # follows it now.  Found by the binutils port: the utilities call
+        # getopt_long, mlibc answers it only with this option on.
+        'glibc': true,
 }
 
 # The kernel's ELF loader links statically, full stop: it refuses DT_JMPREL

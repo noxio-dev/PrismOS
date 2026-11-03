@@ -155,4 +155,6 @@ it) runs any static PIE of this shape on the host under ptrace: it maps
 the segments at USER_BASE, applies the RELATIVE relocations, builds the
 SysV stack + auxv, and answers the PrismOS syscall ABI (rewriting to the
 Linux numbers).  It is how `cube`'s frames and `demo`'s printf were
-checked here without QEMU.
+checked here without QEMU — and how, since phase 4.1, the whole binutils
+utilities run: it passes the full argv now and answers the file surface
+(`tests/binutils_test.py`, `make bintest`).

@@ -69,7 +69,7 @@ EFI_OBJS  := $(patsubst %.c,$B/efi/%.o,$(COMMON_SRCS) boot/loader/ext4.c $(wildc
 
 # ---- default target ----------------------------------------------------
 
-.PHONY: all clean run run-uefi run-iso test kernel esp root iso run-kvm run-uefi-kvm data fstest apps
+.PHONY: all clean run run-uefi run-iso test kernel esp root iso run-kvm run-uefi-kvm data fstest bintest apps binutils
 all: $B/$(NAME).img
 
 # ---- compile rules -------------------------------------------------------
@@ -163,6 +163,29 @@ $B/apps.stamp: $B/toolchain/usr/.stamp $(APP_DEPS) tools/prism.py \
 	$(PYTHON) tools/prism.py build --all
 	@touch $@
 
+# ---- phase 4.1: the binutils utilities as PrismOS programs --------------------
+# ports/binutils cross-builds ar, ranlib, strip, objdump and nm for
+# x86_64-prismos (binutils 2.44, --host=x86_64-prismos, the same triplet
+# the toolchain teaches it) and links each one as the static PIE the
+# kernel's loader expects.  The build runs on the cross binutils itself:
+# AR / RANLIB archive libbfd and friends, the cross strip stages the five,
+# and verify.sh disassembles them through the prefixed objdump / nm /
+# readelf.  The mlibc port checksum is a dependency because the port owns
+# the libc surface the tools need (the glibc option's getopt_long, phase
+# 4.1's addition) -- an edited sysdep rebuilds the library, and this
+# stamp follows.
+#
+#   make binutils   the five into build/binutils-out, verified
+#   make root       installs them into the image's /usr/bin below
+
+BINUTILS_PORT_FILES := $(shell find ports/binutils -type f | sort)
+
+binutils: $B/binutils.stamp
+$B/binutils.stamp: $B/toolchain/usr/.stamp $B/mlibc-port.md5 $(BINUTILS_PORT_FILES)
+	@mkdir -p $(@D)
+	sh ports/binutils/build.sh
+	@touch $@
+
 # ---- mlibc toolchain + sysroot (phase 3.2, steps 3 + 4) ---------------------
 # ports/toolchain drives the phase's third and fourth steps: the
 # x86_64-prismos cross toolchain (binutils + gcc, patched for the triplet),
@@ -194,7 +217,7 @@ MLIBC_SRC ?= build/mlibc
 TOOLCHAIN  := $B/toolchain/usr
 SYSROOT    := $(TOOLCHAIN)/x86_64-prismos
 
-.PHONY: mlibc apps hello-dyn
+.PHONY: mlibc apps hello-dyn bintest
 mlibc: $B/toolchain/usr/.stamp
 
 # Any change under ports/mlibc -- the sysdeps tree, not just the
@@ -259,7 +282,7 @@ root: $B/root.stamp
 # reads whole files (MAX_ELF_FILE is 4 MiB) and the debug sections buy
 # it nothing.
 $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
-	$(HELLO_DYN) $B/apps.stamp
+	$(HELLO_DYN) $B/apps.stamp $B/binutils.stamp
 	rm -rf $B/root
 	mkdir -p $B/root/boot/lua $B/root/boot/defaults $B/root/boot/kernel \
                  $B/root/dev $B/root/etc $B/root/proc $B/root/tmp \
@@ -280,6 +303,12 @@ $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
 	$(PYTHON) tools/prism.py install --all --dest $B/root
 	cp $(HELLO_DYN) $B/root/usr/bin/hello-dyn
 	printf '#!/bin/sh\necho "not an ELF file"\n' > $B/root/usr/bin/notelf
+	# Phase 4.1: the binutils utilities, cross-built for x86_64-prismos --
+	# the first tools the target itself owns, the seed of phase 5's
+	# self-hosting (as and ld stay 5.1's).  Stripped already: the cross
+	# strip did it at staging (the kernel reads whole files, 4 MiB cap).
+	cp $B/binutils-out/ar $B/binutils-out/ranlib $B/binutils-out/nm \
+	   $B/binutils-out/objdump $B/binutils-out/strip $B/root/usr/bin/
 	chmod 755 $B/root/usr/bin/*
 	$(TOOLCHAIN)/bin/x86_64-prismos-strip --strip-all \
 		-o $B/root/usr/lib/ld.so $(SYSROOT)/usr/lib/ld.so
@@ -383,6 +412,13 @@ test: $B/$(NAME).img
 # VFS + ext4 against real images, checked with e2fsck (no QEMU needed).
 fstest:
 	$(PYTHON) tests/fs_test.py
+
+# The binutils port (phase 4.1), judged by the host's own binutils: the
+# five utilities run under prism_emu -- archives and stripped objects
+# byte for byte, nm listings and objdump disassembly text for text (no
+# QEMU needed either).
+bintest:
+	$(PYTHON) tests/binutils_test.py
 
 clean:
 	rm -rf $B sys/kern/target apps/*/build
