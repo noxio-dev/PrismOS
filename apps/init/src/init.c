@@ -43,6 +43,7 @@
 #include <sys/mount.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
 
 #define SHELL "/usr/bin/sh"
 
@@ -89,24 +90,42 @@ static pid_t spawn_shell(const char *tty)
                 return -1;
         }
         if (pid == 0) {
-                /* The child: back to signal defaults, then the terminal,
-                 * then the shell.  execve would reset the caught ones
-                 * anyway; this keeps the failed-exec path honest too. */
                 signal(SIGINT, SIG_DFL);
                 signal(SIGQUIT, SIG_DFL);
                 signal(SIGTERM, SIG_DFL);
                 signal(SIGHUP, SIG_DFL);
+
+                if (setsid() < 0) {
+                        dprintf(2, "init: setsid: %s\n", strerror(errno));
+                        _exit(126);
+                }
+
                 int fd = open(tty, O_RDWR);
-                if (fd < 0)
-                        _exit(126); /* no terminal, no session */
-                dup2(fd, 0);
-                dup2(fd, 1);
-                dup2(fd, 2);
+                if (fd < 0) {
+                        dprintf(2, "init: open %s: %s\n", tty, strerror(errno));
+                        _exit(126);
+                }
+
+                if (ioctl(fd, TIOCSCTTY, 0) < 0) {
+                        dprintf(2, "init: TIOCSCTTY: %s\n", strerror(errno));
+                        _exit(126);
+                }
+
+                for (int i = 0; i < 3; i++) {
+                        if (dup2(fd, i) < 0) {
+                                dprintf(2, "init: dup2(%d): %s\n", i, strerror(errno));
+                                _exit(126);
+                        }
+                }
+
                 if (fd > 2)
                         close(fd);
-                char *argv[] = { (char *)"-sh", NULL };
+
+                char *argv[] = {(char *)"-sh", NULL};
                 execve(SHELL, argv, envp);
-                _exit(127); /* not reached on success */
+
+                dprintf(2, "init: execve: %s\n", strerror(errno));
+                _exit(127);
         }
         return pid;
 }

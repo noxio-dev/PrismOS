@@ -832,6 +832,10 @@ pub fn sys_open(path_p: u64, flags: u64) -> i64 {
             // answer -- the claim is TIOCSCTTY's to make.
             DEV_TTY => {
                 let Some(cur) = process::current() else { return -EFAULT };
+                crate::kprintln!(
+                    "[ctty] open /dev/tty pid={} sid={} ctty={}",
+                    cur.pid, cur.sid, cur.ctty
+                );
                 match cur.ctty {
                     0 => return -ENXIO,
                     2 => Kind::Serial,
@@ -1322,7 +1326,7 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> i64 {
             } else {
                 -EFAULT
             }
-        }
+            }
         TCSETS | TCSETSW | TCSETSF => {
             let mut t = [0u8; tty::TERMIOS_LEN];
             if !copy_in(arg, 0, &mut t) {
@@ -1332,20 +1336,27 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> i64 {
             0
         }
         TIOCSCTTY => {
-            // The session leader's claim (phase 3.3.4).  POSIX: only a
-            // session leader may make it, and arg 1 is the "steal it from
-            // another session" force nobody here needs yet.
             let Some(cur) = process::current() else { return -EFAULT };
             if cur.sid != cur.pid {
                 return -EPERM;
             }
+
+            let pid = cur.pid;
             let sid = cur.sid;
-            let _ = process::with_pid_mut(cur.pid, |p| p.ctty = term_id);
-            // The claim belongs to the session: every live member of it
-            // resolves /dev/tty to this terminal from here on.
-            for pid in process::session_pids(sid) {
-                let _ = process::with_pid_mut(pid, |p| p.ctty = term_id);
+
+            let _ = process::with_pid_mut(pid, |p| p.ctty = term_id);
+
+            for member_pid in process::session_pids(sid) {
+                let _ = process::with_pid_mut(member_pid, |p| p.ctty = term_id);
             }
+
+            let current_ctty = process::current().map_or(0, |p| p.ctty);
+            
+            crate::kprintln!(
+                "[ctty] claim pid={} sid={} term={} current_ctty={}",
+                pid, sid, term_id, current_ctty
+            );
+
             0
         }
         TIOCGPGRP => {
