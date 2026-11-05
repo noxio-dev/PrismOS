@@ -1515,6 +1515,197 @@ pub fn sys_readlink(path_p: u64, buf_p: u64, bufsz: u64) -> i64 {
     }
 }
 
+// ------------------------------------- fchdir / fsync / chmod / utimensat
+//                                        (phase 3.4 -- the busybox step)
+//
+// The syscall gaps the BusyBox port found (the roadmap's own words):
+// fchdir, fsync, chmod / fchmod, utimensat -- the calls a shell's cd,
+// a cp that flushes, a chmod / touch and an ls -l of a re-touched file
+// lean on.  All four ride machinery that already existed: the VFS calls
+// (chmod since the kernel shell, sync since the write-back cache, the
+// inode time setters since phase 1.4) only needed their syscall numbers
+// and the fd bridges.
+
+/// The descriptor behind `fd`, or the errno answer for a bad number.
+fn desc_of_or_errno(fd: u64) -> Result<Rc<FileDesc>, i64> {
+    let Some(cur) = process::current() else { return Err(-EFAULT) };
+    match cur.fds.get(fd as usize) {
+        Some(d) => Ok(d),
+        None => Err(-EBADF),
+    }
+}
+
+/// `fchdir(fd)` (syscall 62): the cwd becomes the directory `fd` is open
+/// on.  The path is the one `open` recorded for the description --
+/// absolute, the same walk's answer -- and the directory check goes
+/// through the table (the slot's own fstat), not a second walk; a renamed
+/// directory keeps its recorded spelling, the same trade every
+/// path-holding description here makes.
+pub fn sys_fchdir(fd: u64) -> i64 {
+    let desc = match desc_of_or_errno(fd) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    let Kind::Vfs(slot) = &desc.kind else {
+        return -ENOTDIR; // a pipe / device is nobody's directory
+    };
+    match crate::fs::fsys::vfs().fstat(*slot) {
+        Ok(st) if st.ftype == FileType::Dir => {}
+        Ok(_) => return -ENOTDIR,
+        Err(e) => return -fs_errno(e),
+    }
+    let Some(path) = desc.path.clone() else { return -ENOENT };
+    let Some(cur) = process::current() else { return -EFAULT };
+    cur.cwd = path;
+    0
+}
+
+/// `fsync(fd)` (syscall 63): push the open file's dirty state to the
+/// device.  The block cache is mount-wide (write-back, phase 1.5), so
+/// the flush is the mount's -- what a `sync`-shaped future can lean on
+/// too.  A pipe never had data on a device (-EINVAL, the Linux answer);
+/// the kernel-side devices (consoles, null / zero / full) hold no state
+/// a disk owns, so theirs is an honest 0.
+pub fn sys_fsync(fd: u64) -> i64 {
+    let desc = match desc_of_or_errno(fd) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    match &desc.kind {
+        Kind::Vfs(slot) => {
+            crate::fs::fsys::vfs().fsync_fd(*slot).map_or_else(|e| -fs_errno(e), |_| 0)
+        }
+        Kind::PipeRead(_) | Kind::PipeWrite(_) => -EINVAL,
+        _ => 0,
+    }
+}
+
+/// `chmod(path, mode)` (syscall 64): the permission bits of a file the
+/// walk finds -- the VFS call the kernel shell's `chmod` command already
+/// speaks, on ext4 through the journal, on tmpfs in memory.
+pub fn sys_chmod(path_p: u64, mode: u64) -> i64 {
+    let abs = match user_path(path_p) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    crate::fs::fsys::vfs().chmod(&abs, (mode & 0o7777) as u16).map_or_else(|e| -fs_errno(e), |_| 0)
+}
+
+/// `fchmod(fd, mode)` (syscall 65): the same call through an open file --
+/// the fd bridge to the VFS's chmod, what a `cp -p` or an `install`
+/// uses on the file it just wrote.
+pub fn sys_fchmod(fd: u64, mode: u64) -> i64 {
+    let desc = match desc_of_or_errno(fd) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    let Kind::Vfs(slot) = &desc.kind else {
+        // No inode behind a pipe or a kernel-side device to chmod (devfs
+        // nodes are fixed; phase 3.5 owns permissions for real).
+        return -EINVAL;
+    };
+    crate::fs::fsys::vfs().chmod_fd(*slot, (mode & 0o7777) as u16).map_or_else(|e| -fs_errno(e), |_| 0)
+}
+
+/// `utimensat(dirfd, path, times, flags)` (syscall 68): set atime / mtime
+/// -- what `touch`, `cp -p` and `tar -x` all do.  The POSIX spellings the
+/// port serves:
+///   * `times == NULL` (or every field UTIME_NOW): both times become now;
+///   * `tv_nsec == UTIME_OMIT`: that time keeps its value;
+///   * an empty `path` with a real `dirfd`: futimens() -- the open file
+///     itself takes the pair (mlibc's utimes family lands here);
+///   * `AT_SYMLINK_NOFOLLOW`: the link's own times, not the target's.
+/// The times are second-granular (the inode's precision); anything past
+/// u32 seconds saturates rather than wraps.  Only the AT_FDCWD walk
+/// exists -- the kernel has no *at calls (the sysdeps spell that
+/// honestly), so another dirfd is -EINVAL.
+pub fn sys_utimensat(dirfd: u64, path_p: u64, times_p: u64, flags: u64) -> i64 {
+    const AT_FDCWD: i64 = -100;
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const UTIME_NOW: i64 = (1 << 30) - 1;
+    const UTIME_OMIT: i64 = (1 << 30) - 2;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return -EINVAL;
+    }
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+
+    // The pair to apply: None = keep (UTIME_OMIT), Some(second) = set.
+    // A NULL `times` is "both now" (POSIX), which is also the default.
+    let now = crate::fs::vfs::now() as u64;
+    let mut atime = Some(now);
+    let mut mtime = Some(now);
+    if times_p != 0 {
+        let mut buf = [0u8; 32]; // two struct timespec { tv_sec, tv_nsec }
+        if !copy_in(times_p, 0, &mut buf) {
+            return -EFAULT;
+        }
+        let field = |i: usize, half: usize| {
+            let o = i * 16 + half * 8;
+            i64::from_le_bytes(buf[o..o + 8].try_into().unwrap())
+        };
+        let one = |sec: i64, nsec: i64| -> Result<Option<u64>, i64> {
+            match nsec {
+                UTIME_OMIT => Ok(None),
+                UTIME_NOW => Ok(Some(now)),
+                _ if sec >= 0 && sec <= u32::MAX as i64 => Ok(Some(sec as u64)),
+                _ => Err(-EINVAL), // a negative or > u32-seconds time is refused
+            }
+        };
+        atime = match one(field(0, 0), field(0, 1)) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        mtime = match one(field(1, 0), field(1, 1)) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+    }
+
+    // The fd side (futimens): a NULL or empty path with a real fd.
+    let path = if path_p == 0 {
+        None
+    } else {
+        match user_string(path_p) {
+            Ok(s) => Some(s),
+            Err(e) => return e,
+        }
+    };
+    let by_fd = || -> i64 {
+        let desc = match desc_of_or_errno(dirfd) {
+            Ok(d) => d,
+            Err(e) => return e,
+        };
+        let Kind::Vfs(slot) = &desc.kind else {
+            return -EINVAL; // a pipe / device carries no times to set
+        };
+        crate::fs::fsys::vfs().utimens_fd(*slot, atime, mtime).map_or_else(|e| -fs_errno(e), |_| 0)
+    };
+    match path {
+        // A NULL path with AT_FDCWD is the POSIX -EINVAL; with a real fd
+        // it is futimens() (mlibc also spells futimens as an empty path).
+        None => {
+            if dirfd as i64 == AT_FDCWD {
+                return -EINVAL;
+            }
+            by_fd()
+        }
+        Some(p) if p.is_empty() => {
+            if dirfd as i64 == AT_FDCWD {
+                return -ENOENT; // the empty path is no file, like everywhere
+            }
+            by_fd()
+        }
+        Some(p) => {
+            if dirfd as i64 != AT_FDCWD {
+                return -EINVAL; // no *at walks in this kernel (yet)
+            }
+            let abs = process::abs_current(&p);
+            crate::fs::fsys::vfs().utimens(&abs, follow, atime, mtime).map_or_else(|e| -fs_errno(e), |_| 0)
+        }
+    }
+}
+
 // ------------------------------------------------------- statfs (phase 3.3)
 
 /// The Linux x86-64 `struct statfs` this fills (120 bytes): f_type,

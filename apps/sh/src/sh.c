@@ -1,8 +1,11 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (c) 2026 noxio-dev
  *
- * sh -- the userland shell (phase 3.3.7): what init respawns on the
- * console.
+ * minish -- the bootstrap shell (phase 3.3.7), kept as the test rig it
+ * always was: since 3.4.5 what init respawns on the terminals is
+ * /usr/bin/sh, the busybox symlink (ash), and this stays installed as
+ * /usr/bin/minish -- the honest fallback a session can always exec,
+ * and the rig the phase 3.3 scenarios ran on.
  *
  * The split of labour is the unix one: the kernel's tty owns the line
  * (user/tty.rs -- ICANON assembles, ECHO answers, backspace and ^U

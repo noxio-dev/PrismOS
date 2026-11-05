@@ -81,6 +81,14 @@ enum {
         PRISM_SYS_SETSID = 59,      /* setsid() -> the new sid */
         PRISM_SYS_SETPGID = 60,     /* setpgid(pid, pgid) */
         PRISM_SYS_GETPGID = 61,     /* getpgid(pid) -- 0 = the caller */
+        /* Phase 3.4 -- the BusyBox step, the gaps the port revealed. */
+        PRISM_SYS_FCHDIR = 62,      /* fchdir(fd) -- the open directory */
+        PRISM_SYS_FSYNC = 63,       /* fsync(fd) -- flush the mount */
+        PRISM_SYS_CHMOD = 64,       /* chmod(path, mode) */
+        PRISM_SYS_FCHMOD = 65,      /* fchmod(fd, mode) */
+        PRISM_SYS_WAIT4 = 66,       /* wait4(pid, &status, flags, &rusage) */
+        PRISM_SYS_GETRUSAGE = 67,   /* getrusage(who, &rusage) */
+        PRISM_SYS_UTIMENSAT = 68,   /* utimensat(dirfd, path, &times[2], flags) */
 };
 
 /* arch_prctl() codes -- the Linux x86-64 values the kernel expects. */

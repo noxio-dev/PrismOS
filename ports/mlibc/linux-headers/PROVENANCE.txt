@@ -1,0 +1,32 @@
+The minimal Linux UAPI header set mlibc's linux option needs (phase 3.4).
+
+mlibc gates its linux option on real kernel headers (-Dlinux_kernel_headers):
+options/internal/include/mlibc/sysdep-signatures.hpp pulls <linux/capability.h>
+for the capability tags the option declares, and meson refuses to build the
+option without a directory to point at -- not the system's own include paths,
+a deliberate guard against host headers leaking into a cross build.
+
+These headers are that directory: the closure of <linux/capability.h>,
+<linux/rtnetlink.h> and <asm/ioctls.h> exactly -- linux/{capability,types,
+posix_types,const,socket,netlink,rtnetlink,if_link,if_addr,neighbour,ioctl,
+stddef}.h, the x86_64 asm set {types,posix_types,posix_types_64,bitsperlong,
+ioctl,ioctls}.h, and asm-generic/{types,int-ll64,posix_types,bitsperlong,
+ioctl,ioctls}.h -- carried verbatim from the Linux UAPI (GPL-2.0 WITH
+Linux-syscall-note, the syscall-note clause that makes them usable as an
+interface), the same arrangement the abi-bits/ tree has with mlibc's own
+Linux ABI headers.  capability.h is what mlibc's own sysdep-signatures
+includes with the option on; rtnetlink.h is what the generic netlink helper
+pulls (options/posix/generic/net-if.cpp compiles its if_nameindex through it
+when __MLIBC_LINUX_OPTION -- the port's SysdepTraits::usesRtNetlink stays
+false, so nothing ever *sends* one, the include only has to resolve); the
+asm/ioctls.h pair is what mlibc's glibc-option <sys/ioctl.h> pulls for the
+same reason.  (net/if_ppp.h, the one other linux-including header the glibc
+option installs, stays uninstallable-to-use on purpose: nothing enabled
+includes it.)
+
+Nothing else lives here on purpose: the kernel has no capability story
+(the tags stay ENOSYS through the port's contract), and BusyBox's own
+applet set -- the phase that needs the option -- parses its flags through
+mlibc's <sys/mount.h> and <sys/statfs.h>, not the kernel UAPI.  The day a
+port needs more of the UAPI, the honest move is a `make headers_install`
+of a real kernel tree, not a bigger hand-carried set.

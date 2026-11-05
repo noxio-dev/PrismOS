@@ -1061,6 +1061,15 @@ impl FileSystem for Ext4 {
         self.finish(r)
     }
 
+    /// utimensat's payload (phase 3.4): atime / mtime by inode, ctime
+    /// refreshed, the inode written back through the journal like every
+    /// metadata change.
+    fn utimens(&mut self, ino: u64, atime: Option<u64>, mtime: Option<u64>) -> FsResult<()> {
+        self.begin_op();
+        let r = self.op_utimens(ino32(ino)?, atime, mtime);
+        self.finish(r)
+    }
+
     /// fallocate-style preallocation: unwritten extents covering
     /// [start, start+len); the size grows past EOF unless keep_size.
     fn fallocate(&mut self, ino: u64, start: u64, len: u64, keep_size: bool) -> FsResult<()> {

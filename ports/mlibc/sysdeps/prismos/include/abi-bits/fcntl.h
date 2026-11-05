@@ -104,10 +104,21 @@
 #define AT_EACCESS 0x200
 #define AT_EMPTY_PATH 0x1000
 
+/* The statx() flag set (the Linux values): the linux option's
+ * options/linux/generic/sys-statx.cpp parses these off `flags` before it
+ * falls back to the plain stat the kernel serves (phase 3.4 -- the busybox
+ * step turned the option on, and this file is the ABI it compiles
+ * against).  Nothing reaches the kernel: statx itself answers ENOSYS. */
+#define AT_NO_AUTOMOUNT 0x800
+#define AT_STATX_SYNC_AS_STAT 0x0000
+#define AT_STATX_FORCE_SYNC 0x2000
+#define AT_STATX_DONT_SYNC 0x4000
+#define AT_STATX_SYNC_TYPE 0x6000
+
 #if defined(_GNU_SOURCE) || __MLIBC_POSIX2024
 struct f_owner_ex {
-	int type;
-	pid_t pid;
+        int type;
+        pid_t pid;
 };
 #endif /* defined(_GNU_SOURCE) || __MLIBC_POSIX2024 */
 

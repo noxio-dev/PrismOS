@@ -5,15 +5,16 @@
 Boot-time proof of phase 3.3: the /tmp tmpfs and the usr-merge, driven
 through the *userland shell* of a freshly booted image (needs qemu,
 like tests/shell_drive.py whose run() this reuses -- phase 3.3.7: the
-boot goes through init, the prompt is prism$).
+boot goes through init, and since 3.4.5 the prompt is busybox ash's,
+the prism$ /etc/profile plants).
 
     tests/tmpfs_drive.py build/prismos.img
 
 Checks: the boot log mounts tmpfs on /tmp and starts init as pid 1;
 /bin, /sbin, /lib and /lib64 are the usr-merge symlinks; the tmpfs
 package passes its own scenarios from ring 3 -- twice, because a good
-/tmp citizen leaves the tree clean -- and the shell can write /tmp
-itself.
+/tmp citizen leaves the tree clean -- and the shell (ash's
+redirections, phase 3.4) can write /tmp itself.
 """
 import os
 import sys
@@ -31,7 +32,7 @@ def main():
         "hello",
         "tmpfs",
         "tmpfs",
-        "write /tmp/from-shell written by the shell",
+        "echo written by the shell > /tmp/from-shell",
         "cat /tmp/from-shell",
         "df",
     ], timeout=180, prompt=b"prism$ ")

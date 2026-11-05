@@ -12,7 +12,19 @@
  * register order and errno convention line up) or a neutralized getpid
  * whose exit rax is overwritten with the emulated answer.
  *
- * Usage: prism_emu <static-pie> [args...]
+ * Phase 4.1 grew it from the cube's demo harness into the binutils port's
+ * test bench: the utilities are argument-driven programs (ar rc lib.a
+ * file.o, objdump -d, strip -o out in), so the full argv travels now, and
+ * the file surface they exercise -- the stat pair, unlink / rename (ar's
+ * and strip's temp-file dance), umask, munmap / mprotect, a real lseek --
+ * is rewritten to the matching Linux calls, the way the kernel answers
+ * them.  The stack is the kernel's own size (ELF_STACK_SIZE, 16 pages):
+ * what fits here fits there.  The PrismOS open() carries no mode (the
+ * kernel's O_CREATE files are 0o644); the rewritten call plants exactly
+ * that, so an ar creating an archive under emulation creates it with the
+ * permissions the kernel would give it.
+ *
+ * Usage: prism_emu [-v] <static-pie> [args...]
  * Output: the program's stdout, cube_emu.ppm when it blitted anything, and
  * a PrismOS-style crash line (rip / cr2) when it faults.
  */
@@ -47,7 +59,11 @@ enum {                                  /* prismos/syscall.h */
         P_EXIT = 0, P_WRITE = 1, P_GETPID = 2, P_UPTIME_MS = 3, P_YIELD = 4,
         P_SLEEP = 5, P_READ = 13, P_OPEN = 14, P_CLOSE = 15, P_BRK = 21,
         P_MMAP = 22, P_IOCTL = 29, P_ARCH_PRCTL = 36, P_FB_INFO = 44,
-        P_FB_BLIT = 45, P_LSEEK = 16,
+        P_FB_BLIT = 45, P_LSEEK = 16, P_STAT = 19, P_FSTAT = 20,
+        P_MUNMAP = 23, P_GETCWD = 25, P_DUP = 17, P_DUP2 = 26, P_FCNTL = 27,
+        P_UNLINK = 30, P_RENAME = 33, P_MPROTECT = 40, P_UMASK = 52,
+        P_GETTIMEOFDAY = 53, P_CLOCK_GETTIME = 43, P_LSTAT = 58,
+        P_GETPPID = 49, P_GETUID = 50, P_GETGID = 51,
 };
 
 struct prism_fb_info {                  /* prism_raw.h, packed the same */
@@ -317,6 +333,26 @@ static void serve_entry(struct user_regs_struct *r)
         case P_CLOSE:      r->orig_rax = 3;   break;   /* close(fd) */
         case P_ARCH_PRCTL: r->orig_rax = 158; break;   /* arch_prctl: same regs */
         case P_GETPID:     r->orig_rax = 39;  break;   /* getpid() */
+        case P_GETPPID:    r->orig_rax = 110; break;   /* getppid() */
+        case P_GETUID:     r->orig_rax = 102; break;   /* getuid() */
+        case P_GETGID:     r->orig_rax = 104; break;   /* getgid() */
+        /* the stat pair (and lstat): the x86-64 Linux struct stat is what
+         * the kernel fills and the ABI's abi-bits/stat.h asserts */
+        case P_STAT:       r->orig_rax = 4;   break;   /* stat(path, buf) */
+        case P_FSTAT:      r->orig_rax = 5;   break;   /* fstat(fd, buf) */
+        case P_LSTAT:      r->orig_rax = 6;   break;   /* lstat(path, buf) */
+        case P_LSEEK:      r->orig_rax = 8;   break;   /* lseek(fd, off, whence) */
+        case P_MUNMAP:     r->orig_rax = 11;  break;   /* munmap(addr, len) */
+        case P_MPROTECT:   r->orig_rax = 10;  break;   /* mprotect(addr, len, prot) */
+        case P_DUP:        r->orig_rax = 32;  break;   /* dup(fd) */
+        case P_DUP2:       r->orig_rax = 33;  break;   /* dup2(old, new) */
+        case P_FCNTL:      r->orig_rax = 72;  break;   /* fcntl(fd, cmd, arg) */
+        case P_UNLINK:     r->orig_rax = 87;  break;   /* unlink(path) */
+        case P_RENAME:     r->orig_rax = 82;  break;   /* rename(old, new) */
+        case P_UMASK:      r->orig_rax = 95;  break;   /* umask(mask) */
+        case P_GETCWD:     r->orig_rax = 79;  break;   /* getcwd(buf, size) */
+        case P_GETTIMEOFDAY: r->orig_rax = 96; break;  /* gettimeofday(tv, tz) */
+        case P_CLOCK_GETTIME: r->orig_rax = 228; break;/* clock_gettime(clk, ts) */
         case P_OPEN: {                          /* open(path, flags): no mode! */
                 char path[256];
                 if (rd_mem(r->rdi, path, sizeof path - 1) == 0) {

@@ -69,7 +69,7 @@ EFI_OBJS  := $(patsubst %.c,$B/efi/%.o,$(COMMON_SRCS) boot/loader/ext4.c $(wildc
 
 # ---- default target ----------------------------------------------------
 
-.PHONY: all clean run run-uefi run-iso test kernel esp root iso run-kvm run-uefi-kvm data fstest apps
+.PHONY: all clean run run-uefi run-iso test kernel esp root iso run-kvm run-uefi-kvm data fstest bintest apps binutils busybox busyboxtest
 all: $B/$(NAME).img
 
 # ---- compile rules -------------------------------------------------------
@@ -162,6 +162,66 @@ $B/apps.stamp: $B/toolchain/usr/.stamp $(APP_DEPS) tools/prism.py \
 	@mkdir -p $(@D)
 	$(PYTHON) tools/prism.py build --all
 	@touch $@
+
+# ---- phase 4.1: the binutils utilities as PrismOS programs --------------------
+# ports/binutils cross-builds ar, ranlib, strip, objdump and nm for
+# x86_64-prismos (binutils 2.44, --host=x86_64-prismos, the same triplet
+# the toolchain teaches it) and links each one as the static PIE the
+# kernel's loader expects.  The build runs on the cross binutils itself:
+# AR / RANLIB archive libbfd and friends, the cross strip stages the five,
+# and verify.sh disassembles them through the prefixed objdump / nm /
+# readelf.  The mlibc port checksum is a dependency because the port owns
+# the libc surface the tools need (the glibc option's getopt_long, phase
+# 4.1's addition) -- an edited sysdep rebuilds the library, and this
+# stamp follows.
+#
+#   make binutils   the five into build/binutils-out, verified
+#   make root       installs them into the image's /usr/bin below
+
+BINUTILS_PORT_FILES := $(shell find ports/binutils -type f | sort)
+
+binutils: $B/binutils.stamp
+$B/binutils.stamp: $B/toolchain/usr/.stamp $B/mlibc-port.md5 $(BINUTILS_PORT_FILES)
+	@mkdir -p $(@D)
+	sh ports/binutils/build.sh
+	@touch $@
+
+# ---- phase 3.4: BusyBox and a userspace shell ------------------------------
+# ports/busybox cross-builds busybox 1.37.0 (the committed minimal config:
+# ash + the roadmap's applet list) as one static PIE against the mlibc
+# sysroot -- which this phase turned the linux + bsd options on for
+# (mount(2) / statfs(2) / the mntent family, the tags the `mount` and `df`
+# applets speak through), and taught the seven syscalls the applets found
+# missing (fchdir fsync chmod fchmod wait4 getrusage utimensat, numbers
+# 62..68).  The mlibc port checksum is a dependency like binutils': an
+# edited sysdep rebuilds the library, and this stamp follows.
+#
+#   make busybox      the one binary into build/busybox-out, verified
+#   make root         installs it and the applet symlinks into /usr/bin
+#                     below; init spawns it as the session shell (3.4.5)
+#   make busyboxtest  the emulated proof: every single-process applet run
+#                     under prism_emu against a host busybox of the same
+#                     tarball and config (no QEMU needed)
+
+BUSYBOX_PORT_FILES := $(shell find ports/busybox -type f | sort)
+
+busybox: $B/busybox.stamp
+$B/busybox.stamp: $B/toolchain/usr/.stamp $B/mlibc-port.md5 $(BUSYBOX_PORT_FILES)
+	@mkdir -p $(@D)
+	sh ports/busybox/build.sh
+	@touch $@
+
+# The applets the image carries as /usr/bin symlinks to busybox: the
+# roadmap's own list (3.4.1's ash ls cat echo mkdir rm cp mv + 3.4.4's ps
+# mount df grep sed awk tar vi) plus the small utilities a session leans
+# on -- `time` among them: its report is the wait4 / rusage pair's proof,
+# the new syscall 66 answering with the child's own user / system ticks.
+# `sh` is in the list on purpose: busybox's ash owns the name now, what
+# every #!/bin/sh and every PATH walk means on this system.
+BUSYBOX_APPLETS := sh ash ls cat echo printf test mkdir rmdir rm cp mv ln \
+	           touch chmod readlink pwd true false env sleep uname wc \
+	           head tail id whoami basename dirname time ps mount \
+	           umount df grep sed awk tar vi
 
 # ---- mlibc toolchain + sysroot (phase 3.2, steps 3 + 4) ---------------------
 # ports/toolchain drives the phase's third and fourth steps: the
@@ -259,20 +319,23 @@ root: $B/root.stamp
 # reads whole files (MAX_ELF_FILE is 4 MiB) and the debug sections buy
 # it nothing.
 $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
-	$(HELLO_DYN) $B/apps.stamp
+	$(HELLO_DYN) $B/apps.stamp $B/binutils.stamp $B/busybox.stamp
 	rm -rf $B/root
 	mkdir -p $B/root/boot/lua $B/root/boot/defaults $B/root/boot/kernel \
                  $B/root/dev $B/root/etc $B/root/proc $B/root/tmp \
                  $B/root/usr/bin $B/root/usr/lib
 	chmod 1777 $B/root/tmp
-	# /etc for the session (phase 3.3): passwd + group -- the
-	# identity lookups a libc's getpwnam serves, root only -- and
-	# the motd init's shell greets with.  /proc is here as well:
+	# /etc for the session: passwd + group -- the identity lookups a
+	# libc's getpwnam serves, root only -- the motd, and (phase 3.4) the
+	# profile a login ash reads: the PATH walks the usr-merge first, the
+	# prompt is the session's own spelling.  /proc is here as well:
 	# the procfs the kernel mounts on it needs the directory.
 	printf 'root:x:0:0:root:/:/usr/bin/sh\n' > $B/root/etc/passwd
 	printf 'root:x:0:\n' > $B/root/etc/group
-	printf 'Welcome to PrismOS (init + tty + procfs, phase 3.3).\n' \
+	printf 'Welcome to PrismOS (busybox + ash, phase 3.4).\n' \
 		> $B/root/etc/motd
+	printf 'PATH=/usr/bin:/bin\nexport PATH\nPS1=prism$ \n' \
+		> $B/root/etc/profile
 	cp boot/lua/*.lua $B/root/boot/lua/
 	cp boot/conf/defaults-loader.conf $B/root/boot/defaults/loader.conf
 	cp boot/conf/loader.conf $B/root/boot/loader.conf
@@ -280,6 +343,20 @@ $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
 	$(PYTHON) tools/prism.py install --all --dest $B/root
 	cp $(HELLO_DYN) $B/root/usr/bin/hello-dyn
 	printf '#!/bin/sh\necho "not an ELF file"\n' > $B/root/usr/bin/notelf
+	# Phase 4.1: the binutils utilities, cross-built for x86_64-prismos --
+	# the first tools the target itself owns, the seed of phase 5's
+	# self-hosting (as and ld stay 5.1's).  Stripped already: the cross
+	# strip did it at staging (the kernel reads whole files, 4 MiB cap).
+	cp $B/binutils-out/ar $B/binutils-out/ranlib $B/binutils-out/nm \
+	   $B/binutils-out/objdump $B/binutils-out/strip $B/root/usr/bin/
+	# Phase 3.4: busybox, one static PIE, and the applets as symlinks --
+	# `sh` among them, the name ash owns now (apps/sh stays as the
+	# /usr/bin/minish test rig).  argv[0] is the whole dispatch: a
+	# symlink called `ls` runs ls, one called `sh` runs ash.
+	cp $B/busybox-out/busybox $B/root/usr/bin/busybox
+	for a in $(BUSYBOX_APPLETS); do \
+		ln -s busybox $B/root/usr/bin/$$a; \
+	done
 	chmod 755 $B/root/usr/bin/*
 	$(TOOLCHAIN)/bin/x86_64-prismos-strip --strip-all \
 		-o $B/root/usr/lib/ld.so $(SYSROOT)/usr/lib/ld.so
@@ -383,6 +460,21 @@ test: $B/$(NAME).img
 # VFS + ext4 against real images, checked with e2fsck (no QEMU needed).
 fstest:
 	$(PYTHON) tests/fs_test.py
+
+# The binutils port (phase 4.1), judged by the host's own binutils: the
+# five utilities run under prism_emu -- archives and stripped objects
+# byte for byte, nm listings and objdump disassembly text for text (no
+# QEMU needed either).
+bintest:
+	$(PYTHON) tests/binutils_test.py
+
+# The busybox port (phase 3.4), judged by a host busybox of the same
+# tarball and the same committed config: the single-process applets run
+# under prism_emu -- text for text, files byte for byte, archives byte
+# for byte, the mounts listed text for text (the shell itself is QEMU's:
+# fork stays ENOSYS under the emulator by design).
+busyboxtest:
+	$(PYTHON) tests/busybox_test.py
 
 clean:
 	rm -rf $B sys/kern/target apps/*/build

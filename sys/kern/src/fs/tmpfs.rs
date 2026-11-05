@@ -570,6 +570,20 @@ impl FileSystem for TmpFs {
         Ok(())
     }
 
+    /// utimensat's payload (phase 3.4): the in-memory pair, None keeps the
+    /// time (UTIME_OMIT), ctime refreshed.
+    fn utimens(&mut self, ino: u64, atime: Option<u64>, mtime: Option<u64>) -> FsResult<()> {
+        let n = self.node_mut(ino)?;
+        if let Some(t) = atime {
+            n.atime = t.min(u32::MAX as u64) as u32;
+        }
+        if let Some(t) = mtime {
+            n.mtime = t.min(u32::MAX as u64) as u32;
+        }
+        n.ctime = vfs::now();
+        Ok(())
+    }
+
     /// RAM has no preallocation to do: without keep_size the file simply
     /// grows to cover [start, start + len), zero-filled like everything
     /// else; with keep_size it is a size check and nothing more.
