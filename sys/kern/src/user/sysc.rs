@@ -388,25 +388,54 @@ pub fn sys_getcwd(buf: u64, size: u64) -> i64 {
 /// release, version, machine, domainname) -- "PrismOS 3.2" in the classic
 /// shape, what uname(1)-style tools print.
 pub fn sys_uname(buf: u64) -> i64 {
-    const FIELDS: [&str; 6] = [
-        "PrismOS",
-        "prismos",
-        "3.2",
-        "PrismOS 3.2 (phase 3.2: the mlibc prerequisites)",
-        "x86_64",
-        "(none)",
+    const SYSNAME: &str = "PrismOS";
+    const NODENAME: &str = "prismos";
+    const RELEASE: &str = env!("CARGO_PKG_VERSION");
+    const MACHINE: &str = "x86_64";
+    const DOMAINNAME: &str = "(none)";
+
+    // Build information can be injected by the build system.
+    const VERSION: &str = match option_env!("PRISMOS_BUILD") {
+        Some(build) => build,
+        None => concat!("PrismOS ", env!("CARGO_PKG_VERSION")),
+    };
+
+    // struct utsname: six fields of 65 bytes each.
+    const FIELD_SIZE: usize = 65;
+    const FIELD_COUNT: usize = 6;
+
+    let fields = [
+        SYSNAME,
+        NODENAME,
+        RELEASE,
+        VERSION,
+        MACHINE,
+        DOMAINNAME,
     ];
-    let mut out = [0u8; 6 * 65];
-    for (i, f) in FIELDS.iter().enumerate() {
-        let b = f.as_bytes();
-        let n = b.len().min(64);
-        out[i * 65..i * 65 + n].copy_from_slice(&b[..n]);
+
+    let mut out = [0u8; FIELD_SIZE * FIELD_COUNT];
+
+    for (i, field) in fields.iter().enumerate() {
+        let bytes = field.as_bytes();
+        let len = bytes.len().min(FIELD_SIZE - 1);
+
+        let offset = i * FIELD_SIZE;
+        out[offset..offset + len].copy_from_slice(&bytes[..len]);
+        // The remaining bytes are already zero, including the NUL terminator.
     }
-    let Some(cur) = process::current() else { return -EFAULT };
-    let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return -EFAULT };
+
+    let Some(cur) = process::current() else {
+        return -EFAULT;
+    };
+
+    let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else {
+        return -EFAULT;
+    };
+
     if !aspace.ensure_writable(buf) || !aspace.write(buf, &out, false) {
         return -EFAULT;
     }
+
     0
 }
 
