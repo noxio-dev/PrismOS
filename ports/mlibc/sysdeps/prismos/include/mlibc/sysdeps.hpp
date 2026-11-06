@@ -115,6 +115,7 @@ struct PrismOSSysdepTags :
         Fdatasync,
         Chmod,
         Fchmod,
+        Fchownat,
         Utimensat,
         GetRusage,
         Mount,

@@ -83,6 +83,9 @@ pub fn wait_ms_ch2(ms: u32) -> bool {
 pub fn on_tick(from_user: bool) {
     let t = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     BOOT_MS.store(t * 10, Ordering::Relaxed); // 100 Hz -> 10 ms per tick
+    if t % 250 == 0 { // TEMP heartbeat: proves IRQ0 + scheduling alive
+        // crate::kprintln!("[hb] t={} from_user={}", t * 10, from_user as u8);
+    }
     crate::user::process::on_tick(from_user);
 }
 

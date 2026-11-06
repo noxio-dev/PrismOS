@@ -23,6 +23,20 @@ import tempfile
 import time
 
 
+def kernel_version():
+    """The binary's own version (sys/kern/Cargo.toml) so checks that pin it
+    (the kernel-shell `env:` line) keep tracking the kernel when it bumps."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "sys/kern/Cargo.toml")) as f:
+        for line in f:
+            if line.startswith("version"):
+                return line.split("=", 1)[1].strip().strip('"')
+    return "unknown"
+
+
+KVER = kernel_version()
+
+
 def run_vm(cmd, steps, expect, timeout):
     """steps: list of (wait_for, send); expect: strings that must appear."""
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -210,7 +224,7 @@ def main():
           ("pid 5 hello -- exited with status 0", "exec hello fault\r"),
           ("pid 6 hello -- killed by exception 14", "exec hello exit 42\r"),
           ("pid 7 hello -- exited with status 42", "exec notelf\r")],
-         ['argv[2] = "alpha"', "env: PRISMOS=0.3.2", "main() runs at 0x80", "AT_PAGESZ = 4096",
+         ['argv[2] = "alpha"', "env: PRISMOS=" + KVER, "main() runs at 0x80", "AT_PAGESZ = 4096",
           "float check: ok",
           "hello chain: pid 2 calls execve()", 'argv[2] = "(after execve)"', 'argv[4] = "y"',
           "execve(/nonexistent)         -> -2", "execve(/boot/loader.conf)    -> -13",

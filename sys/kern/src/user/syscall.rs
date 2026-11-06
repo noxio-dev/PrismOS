@@ -246,6 +246,17 @@ fn sys_execve(frame: &mut IsrFrame, path_p: u64, argv_p: u64, envp_p: u64) -> i6
 /// frame on the current process's kernel stack.  `exit` never returns.
 pub extern "C" fn dispatch(frame: &mut IsrFrame) {
     let (a0, a1, a2) = (frame.rdi, frame.rsi, frame.rdx);
+    // TEMP: the ash exit(0) hunt -- every userland syscall trace.
+    
+    // crate::kprintln!(
+    //     "[sc] pid={} nr={} a=({:#x}, {:#x}, {:#x})",
+    //     process::getpid(),
+    //     frame.rax,
+    //     a0,
+    //     a1,
+    //     a2
+    // );
+    
     // r10 / r8 / r9 carry arguments 4..6 (the Linux order; mmap is the
     // only six-argument call so far).
     let ret: i64 = match frame.rax {

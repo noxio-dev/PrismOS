@@ -43,6 +43,7 @@
 #include <sys/user.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
+#include <sys/utsname.h>
 #include <time.h>
 #include <signal.h>
 #include <errno.h>
@@ -63,7 +64,9 @@ enum {                                  /* prismos/syscall.h */
         P_MUNMAP = 23, P_GETCWD = 25, P_DUP = 17, P_DUP2 = 26, P_FCNTL = 27,
         P_UNLINK = 30, P_RENAME = 33, P_MPROTECT = 40, P_UMASK = 52,
         P_GETTIMEOFDAY = 53, P_CLOCK_GETTIME = 43, P_LSTAT = 58,
-        P_GETPPID = 49, P_GETUID = 50, P_GETGID = 51,
+        P_GETPPID = 49, P_GETUID = 50, P_GETGID = 51, P_UNAME = 35,
+        P_MKDIR = 31, P_RMDIR = 32, P_LINK = 34, P_SYMLINK = 46,
+        P_READLINK = 47, P_CHMOD = 64, P_FCHMOD = 65, P_UTIMENSAT = 68,
 };
 
 struct prism_fb_info {                  /* prism_raw.h, packed the same */
@@ -192,7 +195,17 @@ static void dump_ppm(const char *path)
 
 /* ---- the child ---------------------------------------------------------- */
 
-static void run_child(struct image *im, char *arg0)
+static int trace;
+
+/* the past-the-last-'/' basename: what the kernel's exec names argv[0]
+ * after (the applet selection an argv[0]-multiplexer like busybox makes). */
+static char *base_name(char *path)
+{
+        char *slash = strrchr(path, '/');
+        return slash ? slash + 1 : path;
+}
+
+static void run_child(struct image *im, char **args, int nargs)
 {
         /* map the image span at USER_BASE (RW, then protect) */
         uint64_t lo = im->ph[0].vaddr, hi = 0;
@@ -250,11 +263,26 @@ static void run_child(struct image *im, char *arg0)
         unsigned char rndb[16];
         for (int i = 0; i < 16; i++) rndb[i] = rand();
         memcpy((void *)rnd, rndb, 16);
-        uint64_t astr = sp; sp -= strlen(arg0) + 1; /* argv[0] */
-        memcpy((void *)astr, arg0, strlen(arg0) + 1);
+        /* AT_EXECFN goes down first: the argv strings that follow grow
+         * downward and must not be overwritten by it (fstr = sp would
+         * trample the bottom-most argv string -- the applet name busybox
+         * reads argv[0] from became "/emu" and every run printed the
+         * multi-call banner instead of the applet). */
         char execfn[] = "/emu";
         uint64_t fstr = sp; sp -= sizeof execfn;
         memcpy((void *)fstr, execfn, sizeof execfn);
+        /* the guest argv: argv[0] spells the applet (basename), the rest
+         * travel verbatim (main hands us the ELF path itself when the
+         * runner got no extra arguments -- the plain unix exec spelling). */
+        uint64_t astr[64];
+        int argc = nargs;
+        if (argc > 64) argc = 64; /* the guest stack holds limits like the kernel's */
+        for (int i = 0; i < argc; i++) {
+                char *a = (i == 0) ? base_name(args[0]) : args[i];
+                sp -= strlen(a) + 1;
+                astr[i] = sp;
+                memcpy((void *)sp, a, strlen(a) + 1);
+        }
 
         sp &= ~15ULL;
         uint64_t auxv[] = {
@@ -275,8 +303,9 @@ static void run_child(struct image *im, char *arg0)
         };
         uint64_t words[128];
         int nw = 0;
-        words[nw++] = 1;                    /* argc */
-        words[nw++] = astr;                 /* argv[0] */
+        words[nw++] = (uint64_t)argc;       /* argc */
+        for (int i = 0; i < argc; i++)
+                words[nw++] = astr[i];      /* argv[0..argc-1] */
         words[nw++] = 0;                    /* argv end */
         words[nw++] = 0;                    /* envp end */
         for (unsigned i = 0; i < sizeof auxv / 8; i++)
@@ -313,10 +342,51 @@ static long now_ms(void)
         return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
 }
 
-static int trace;
-
-static void serve_entry(struct user_regs_struct *r)
+/* PrismOS open() flags (abi-bits/fcntl.h, the kernel's own values) to the
+ * x86-64 Linux open() flags the host speaks. */
+static unsigned long translate_open_flags(unsigned long pf)
 {
+        unsigned long mode = (pf & 3);        /* PrismOS O_RDONLY=1 .. O_RDWR=3 */
+        unsigned long f = mode ? (mode - 1) : 0;  /* Linux O_RDONLY=0 .. O_RDWR=2 */
+        pf &= ~3UL;
+        if (pf & 04)        f |= 0x40;        /* O_CREAT */
+        if (pf & 010)       f |= 0x200;       /* O_TRUNC */
+        if (pf & 020)       f |= 0x400;       /* O_APPEND */
+        if (pf & 040)       f |= 0x80;        /* O_EXCL */
+        if (pf & 0100)      f |= 0x800;       /* O_NONBLOCK */
+        if (pf & 0200)      f |= 0x80000;     /* O_CLOEXEC */
+        if (pf & 0x100)     f |= 0x100;       /* O_NOCTTY: same bit */
+        if (pf & 0x200)     f |= 0x101000;    /* O_SYNC */
+        if (pf & 0x400)     f |= 0x2000;      /* FASYNC */
+        if (pf & 0x800)     f |= 0x4000;      /* O_DIRECT */
+        if (pf & 0x2000)    f |= 0x10000;     /* O_DIRECTORY */
+        if (pf & 0x4000)    f |= 0x20000;     /* O_NOFOLLOW */
+        if (pf & 0x8000)    f |= 0x40000;     /* O_NOATIME */
+        if (pf & 0x10000)   f |= 0x200000;    /* O_PATH */
+        if (pf & 0x20000)   f |= 0x410000;    /* O_TMPFILE */
+        (void)0;
+        return f;
+}
+
+/* The utsname the bench compares against: the host's own kernel, served as
+ * the PrismOS uname struct (six fields of 65 bytes each, NUL-padded). */
+static void fill_utsname(uint64_t at)
+{
+        struct utsname hn;
+        char un[6][65];
+        memset(un, 0, sizeof un);
+        if (uname(&hn) == 0) {
+                snprintf(un[0], 64, "%s", hn.sysname);
+                snprintf(un[1], 64, "%s", hn.nodename);
+                snprintf(un[2], 64, "%s", hn.release);
+                snprintf(un[3], 64, "%s", hn.version);
+                snprintf(un[4], 64, "%s", hn.machine);
+                snprintf(un[5], 64, "%s", hn.domainname);
+        }
+        wr_mem(at, un, sizeof un);
+}
+
+static void serve_entry(struct user_regs_struct *r) {
         neutralized = 0;
         /* At an entry stop the syscall number lives in orig_rax; rax is
          * -ENOSYS until the call runs.  Redirecting the call = orig_rax. */
@@ -353,7 +423,27 @@ static void serve_entry(struct user_regs_struct *r)
         case P_GETCWD:     r->orig_rax = 79;  break;   /* getcwd(buf, size) */
         case P_GETTIMEOFDAY: r->orig_rax = 96; break;  /* gettimeofday(tv, tz) */
         case P_CLOCK_GETTIME: r->orig_rax = 228; break;/* clock_gettime(clk, ts) */
+        /* plain path ops, same argument order on both worlds */
+        case P_MKDIR:      r->orig_rax = 83;  break;   /* mkdir(path, mode) */
+        case P_RMDIR:      r->orig_rax = 84;  break;   /* rmdir(path) */
+        case P_LINK:       r->orig_rax = 86;  break;   /* link(old, new) */
+        case P_SYMLINK:    r->orig_rax = 88;  break;   /* symlink(tgt, path) */
+        case P_READLINK:   r->orig_rax = 89;  break;   /* readlink(path, buf, sz) */
+        case P_CHMOD:      r->orig_rax = 90;  break;   /* chmod(path, mode) */
+        case P_FCHMOD:     r->orig_rax = 91;  break;   /* fchmod(fd, mode) */
+        case P_UTIMENSAT:  r->orig_rax = 280; break;   /* utimensat */
         case P_OPEN: {                          /* open(path, flags): no mode! */
+                /* the PrismOS O_* bits are the kernel's own (O_RDONLY=1,
+                 * O_CREAT=4, O_TRUNC=8 ...); the host Linux open wants the
+                 * x86-64 layout (O_RDONLY=0, O_CREAT=0x40, O_TRUNC=0x200
+                 * ...).  Translate every bit; the access mode is 1..3 on
+                 * the PrismOS side, 0..2 on Linux. */
+                r->rsi = translate_open_flags(r->rsi);
+                if (r->rsi & 0x40)              /* O_CREAT: the kernel makes
+                        it 0o644 whatever the caller thinks (no mode arg in
+                        the Prism open ABI); the host open would stack a
+                        mode-0 file here (the caller's rdx is dead) */
+                        r->rdx = 0644;
                 char path[256];
                 if (rd_mem(r->rdi, path, sizeof path - 1) == 0) {
                         path[255] = 0;
@@ -379,9 +469,14 @@ static void serve_entry(struct user_regs_struct *r)
         case P_IOCTL:     /* isatty's TCGETS: "not a tty" is the honest answer,
                              * and what makes mlibc's stdio go fully buffered */
                           pending_answer = (uint64_t)-25; neutralized = 1; r->orig_rax = 39; break;
-        case P_LSEEK:     /* stdio's seekability probe: the offset asked for,
-                             * as if the console were a regular file */
-                          pending_answer = r->rsi;    neutralized = 1; r->orig_rax = 39; break;
+        case P_UNAME:     /* uname(buf): the 6 x 65-byte utsname the kernel
+                             fills; here it is the host's own kernel, since
+                             the bench compares byte for byte against a
+                             busybox run on the host */
+                fill_utsname(r->rdi);
+                pending_answer = 0;
+                neutralized = 1;
+                r->orig_rax = 39; break;
         case P_FB_INFO:
                 wr_mem(r->rdi, &FB, sizeof FB);
                 pending_answer = 0; neutralized = 1; r->orig_rax = 39; break;
@@ -434,7 +529,7 @@ int main(int argc, char **argv)
 
         pid = fork();
         if (pid == 0)
-                run_child(&im, argv[1]);
+                run_child(&im, &argv[2], argc > 2 ? argc - 2 : 1);
 
         int st;
         waitpid(pid, &st, 0);                    /* the SIGSTOP after setup */
@@ -457,11 +552,16 @@ int main(int argc, char **argv)
                         break;
                 }
                 if (WIFEXITED(st)) {
-                        fprintf(stderr, "emu: exited %d\n", WEXITSTATUS(st));
+                        rc = WEXITSTATUS(st);   /* the applet's own status --
+                                false/ls-nonexistent/applets matter for the
+                                bench comparing against the host run */
+                        fprintf(stderr, "emu: exited %d\n", rc);
                         break;
                 }
                 if (WIFSIGNALED(st)) {
-                        fprintf(stderr, "emu: killed by %d\n", WTERMSIG(st));
+                        int sig = WTERMSIG(st);
+                        rc = 128 + sig;         /* shell convention */
+                        fprintf(stderr, "emu: killed by %d\n", sig);
                         break;
                 }
                 int sig = WSTOPSIG(st);

@@ -1348,6 +1348,10 @@ pub fn exit_current(outcome: Outcome) -> ! {
         let pid = (*cur).pid;
         {
             let p = &mut *cur;
+            // crate::kprintln!(
+            //     "[exit] pid={} outcome={:?} (used {} user {} sys {})",
+            //     pid, outcome, p.used, p.user_used, p.sys_used
+            // );
             zombify_common(p, outcome);
         }
         after_death(pid);

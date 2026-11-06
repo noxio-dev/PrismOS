@@ -42,9 +42,12 @@
 
 #define O_TTY_INIT 0
 
-/* fcntl() commands: F_DUPFD .. F_SETFL are the ones the kernel's fcntl
- * (sys/kern/src/user/fd.rs) switches on; the rest are reference
- * constants -- the kernel answers EINVAL for an unknown command. */
+/* fcntl() commands: F_DUPFD .. F_SETFL plus F_DUPFD_CLOEXEC (1030) are the
+ * ones the kernel's fcntl (sys/kern/src/user/fd.rs) switches on; the rest
+ * are reference constants -- the kernel answers EINVAL for an unknown
+ * command.  (F_DUPFD_CLOEXEC joined when busybox ash's savefd / setjobctl
+ * walked every fd through it and the port's first session died on the
+ * EINVAL.) */
 #define F_DUPFD  0
 #define F_GETFD  1
 #define F_SETFD  2

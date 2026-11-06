@@ -334,7 +334,7 @@ $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
 	printf 'root:x:0:\n' > $B/root/etc/group
 	printf 'Welcome to PrismOS (busybox + ash, phase 3.4).\n' \
 		> $B/root/etc/motd
-	printf 'PATH=/usr/bin:/bin\nexport PATH\nPS1=prism$ \n' \
+	printf 'PATH=/usr/bin:/bin\nexport PATH\nPS1="prism$$ "\n' \
 		> $B/root/etc/profile
 	cp boot/lua/*.lua $B/root/boot/lua/
 	cp boot/conf/defaults-loader.conf $B/root/boot/defaults/loader.conf

@@ -651,6 +651,16 @@ int Sysdeps<Rmdir>::operator()(const char *path) {
         return 0;
 }
 
+int Sysdeps<Fchownat>::operator()(int dirfd, const char *path,
+                uid_t uid, gid_t gid, int flags) {
+        /* The kernel has no owner changes (chown* absent from its surface):
+         * ENOSYS, like the other absent classes -- and NOT the missing-
+         * sysdep __ensure, which mlibc guarantees from the generic fallback
+         * and which busied the tar extraction with one. */
+        (void)dirfd; (void)path; (void)uid; (void)gid; (void)flags;
+        return ENOSYS;
+}
+
 int Sysdeps<Unlinkat>::operator()(int dirfd, const char *path, int flags) {
         /* No *at syscalls in the kernel: only AT_FDCWD resolves, and of the
          * flags only AT_REMOVEDIR changes the call. */
