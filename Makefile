@@ -254,7 +254,7 @@ MLIBC_SRC ?= build/mlibc
 TOOLCHAIN  := $B/toolchain/usr
 SYSROOT    := $(TOOLCHAIN)/x86_64-prismos
 
-.PHONY: mlibc apps hello-dyn
+.PHONY: mlibc apps hello-dyn bintest
 mlibc: $B/toolchain/usr/.stamp
 
 # Any change under ports/mlibc -- the sysdeps tree, not just the
