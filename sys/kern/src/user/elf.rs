@@ -40,7 +40,14 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 /// Stack given to ELF programs (the guard page below stays unmapped).
-pub const ELF_STACK_SIZE: u64 = 16 * PAGE;
+///
+/// 1 MiB since phase 4.1: the binutils utilities are the first real
+/// programs on the system, and `objdump -d` walks a full binary on more
+/// stack than a hello world ever asked for -- 64 KiB (16 pages, the
+/// phase 2.4 number) faulted eight bytes below the stack on a 1.9 MiB
+/// input, measured under `prism_emu` (which runs on exactly this size).
+/// The cost is one anonymous megabyte per process.
+pub const ELF_STACK_SIZE: u64 = 256 * PAGE;
 /// Largest executable the loader reads.
 pub const MAX_ELF_FILE: usize = 4 * 1024 * 1024;
 /// Largest memory footprint of the loaded segments.

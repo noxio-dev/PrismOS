@@ -3,7 +3,8 @@
  *
  * /bin/cube -- the spinning cube of sys/kern/src/lib/cube.rs, ported off
  * the kernel console (phase 3.3): the same fixed-point maths, the same
- * faces, the same light, the same controls -- drawn by a process now.
+ * faces, the same light, the same controls -- drawn by a process now,
+ * and drawn as fast as the kernel's clock will let the pose move.
  *
  * The kernel original ran with the console surface in hand: its Surface
  * (console/gfx.rs), its keyboard queue, its tick counter.  This one owns
@@ -20,11 +21,10 @@
  *   prism_uptime_ms() the same tick counter the kernel cube timed with
  *
  * The renderer keeps its own back buffer (an anonymous mmap, exactly the
- * shape the kernel's would have), draws the cube into it with its own
- * rect / line / convex-fill code -- straight ports of Surface's -- and
- * sends only the dirty rectangle over per frame, the same bounding-box
- * trick the kernel cube used.  A per-frame blit of a few hundred KB is
- * the cost of there being no /dev/fb to mmap through yet.
+ * shape the kernel's would have), draws the cube into it and sends only
+ * the dirty rectangle over per frame, the same bounding-box trick the
+ * kernel cube used.  A per-frame blit of a few hundred KB is the cost
+ * of there being no /dev/fb to mmap through yet.
  *
  * The maths stays fixed point (Q14: 16384 = 1.0), line for line from
  * the kernel original: a Bhaskara sine table of one turn, the same
@@ -32,14 +32,58 @@
  * the same back-face culling on the signed screen area.  In ring 3 it
  * could all be doubles -- but then it would not be the same cube.
  *
+ * This is the frame-rate build.  The first thing it reworks is the
+ * loop itself: the old port paced itself at one frame per 20 ms, so
+ * half the ticks the kernel's clock could tell the cube apart went
+ * undrawn, and every one of them was rendered identically when nothing
+ * at all had moved.  This loop renders exactly when the cube's angles,
+ * its mode or the HUD text have changed, and parks on prism_sleep_ms(1)
+ * when they have not.  On the 100 Hz tick that is every tick the pose
+ * actually moves -- twice the old rate -- and holding a paused cube on
+ * the screen costs nothing at all: no pose change, no render, no blit,
+ * only the keyboard poll between parks.  The fps counter counts frames
+ * the screen really received, so a paused cube reads 0 fps and says so.
+ * On a machine where a frame outlasts the tick the same loop simply
+ * renders flat out, as fast as the frames themselves allow.
+ *
+ * The maths is untouched; everything between the maths and the
+ * framebuffer has been through the mill:
+ *
+ *   face colours   every lighting percentage of every face is packed
+ *                  for the framebuffer once at startup (light_pct()
+ *                  still says 30..100 exactly; the /100s, the clamps
+ *                  and the rgb_pack live in a table now)
+ *   face fills     the scanline walk carries pre-derived edges --
+ *                  span, start, step -- instead of re-deriving every
+ *                  intersection per scanline, and the division is the
+ *                  32-bit one: the products cannot leave int range for
+ *                  any panel this framebuffer describes (the projected
+ *                  corners stay within a thousand pixels of the screen,
+ *                  so |numerator| < 2^30)
+ *   pixel runs     fills write head-aligned 64-bit pairs, half the
+ *                  stores and half the loop overhead of a pixel-at-a-
+ *                  time walk
+ *   cube edges     drawn once per frame, not once per face: the twelve
+ *                  edges of the cube are numbered at startup and a
+ *                  bitmask drops the second visit of every edge two
+ *                  visible faces share; each Bresenham step drops one
+ *                  bounds-checked 2x2 block instead of a clipped
+ *                  fill_rect per pixel of it
+ *   the keyboard   drained in 64-byte reads: a syscall a batch, not a
+ *                  syscall a byte
+ *   the HUD        snprintf'd, drawn and blitted only when its text
+ *                  actually changed, compared against what is on
+ *                  screen before it is
+ *
  * Controls, as in the kernel: SPACE or P pause, + and - the speed,
  * M cycles solid+edges / solid / wire, ESC quits.
  *
- * The watchdog is the one kernel rule this program meets that the
- * kernel original did not: a process is killed after 3 s of charged
- * CPU.  Rendering twenty frames a second burns maybe a fifth of that,
- * so the default budget lasts a couple of minutes; 'exec -t 100000
- * cube' buys hours (ticks at 100 Hz, only CPU time is charged).
+ * The watchdog is still the kernel rule to meet: a process is killed
+ * after 3 s of charged CPU.  A frame costs a fraction of what the
+ * first port spent, and a paused cube charges nothing at all, so the
+ * default budget outlasts the first port's by a wide margin; 'exec -t
+ * 100000 cube' still buys hours (ticks at 100 Hz, only CPU time is
+ * charged).
  *
  *   cube                     run it (from the shell: exec cube)
  */
@@ -53,14 +97,24 @@
 #include <unistd.h>
 
 #include "prism_raw.h"
+#include "cube_tex.h" /* TEX_RGB: the dirt texture, generated from dirt.png */
+
+/* If the Makefile ever builds this file -O0 or -O1 somewhere, this
+ * keeps the hot paths optimized anyway.  Delete or -DCUBE_NO_OPT_PRAGMA
+ * if it offends the build. */
+#if defined(__GNUC__) && !defined(__clang__) && !defined(CUBE_NO_OPT_PRAGMA)
+#pragma GCC optimize ("O2")
+#endif
 
 /* ---- fixed point Q14: 16384 = 1.0 ----------------------------------- */
 
 #define TURN 1024        /* a full turn, in angle units */
 #define HALF 256         /* half an edge, cube units */
 #define Q14 16384        /* 1.0 */
-#define FRAME_MS 20      /* 50 fps */
 #define CAM_Z 1000       /* camera distance, cube units */
+/* No FRAME_MS: the loop renders when the pose moves and parks when it
+ * does not (run() below).  A fixed 20 ms gate was half the frame rate
+ * of a 100 Hz kernel gone for nothing. */
 
 static int16_t SIN[TURN];
 
@@ -117,6 +171,10 @@ static V3 vertex(int i)
         return v;
 }
 
+/* The eight corners, derived once at startup: rotate() is fed a table
+ * look-up instead of re-deriving the bit pattern per corner per frame. */
+static V3 VERTS[8];
+
 typedef struct {
         int verts[4];
         V3 normal;
@@ -149,6 +207,7 @@ typedef struct { int32_t x, y; } P2;
 /* Screen points of the 8 corners + the projected bounding box. */
 typedef struct {
         P2 pts[8];
+        int32_t w[8];        /* 1/z, Q28 / cube units: perspective-correct UVs */
         int bx0, by0, bx1, by1;
 } Frame;
 
@@ -159,10 +218,11 @@ static Frame project(int cx, int cy, int d, int ax, int ay, int az)
         fr.bx0 = fr.by0 = INT32_MAX;
         fr.bx1 = fr.by1 = INT32_MIN;
         for (int i = 0; i < 8; i++) {
-                V3 r = rotate(vertex(i), ax, ay, az);
+                V3 r = rotate(VERTS[i], ax, ay, az);
                 int z = r.z + CAM_Z; /* always > 0: |r.z| <= 443 < CAM_Z */
                 int sx = cx + (int)((int64_t)r.x * d / z);
                 int sy = cy - (int)((int64_t)r.y * d / z);
+                fr.w[i] = (int32_t)((1 << 28) / z);
                 fr.pts[i].x = sx;
                 fr.pts[i].y = sy;
                 if (sx < fr.bx0) fr.bx0 = sx;
@@ -226,14 +286,85 @@ static uint32_t rgb_pack(uint8_t r, uint8_t g, uint8_t b)
         return v;
 }
 
-static void put(int x, int y, uint32_t c)
+/* Every lighting percentage of every face, packed for the framebuffer
+ * once at startup: 71 entries a face.  light_pct() keeps answering
+ * 30..100 exactly as the kernel did; what that used to cost per face
+ * per frame -- the three /100s, the clamps, the rgb_pack -- lives in
+ * this table now. */
+static uint32_t FACE_LIT[6][71];
+
+static void build_face_colors(void)
 {
-        if (x < 0 || y < 0 || x >= CW || y >= CH)
-                return;
-        canvas[(size_t)y * CW + x] = c;
+        for (int f = 0; f < 6; f++)
+                for (int lit = 30; lit <= 100; lit++) {
+                        int r = (int)FACES[f].base[0] * lit / 100;
+                        int g = (int)FACES[f].base[1] * lit / 100;
+                        int b = (int)FACES[f].base[2] * lit / 100;
+
+                        if (r > 255) r = 255;
+                        if (g > 255) g = 255;
+                        if (b > 255) b = 255;
+                        FACE_LIT[f][lit - 30] =
+                            rgb_pack((uint8_t)r, (uint8_t)g, (uint8_t)b);
+                }
 }
 
-/* Fill a clipped rectangle (Surface::rect_raw). */
+/* The texture, packed for the framebuffer once per lighting percentage:
+ * 71 x 32 x 32 words (~290 KB), so a lit texel is one table read. */
+static uint32_t TEXLIT[71][TEX_W * TEX_H];
+
+static void build_texture(void)
+{
+        for (int lit = 30; lit <= 100; lit++)
+                for (int i = 0; i < TEX_W * TEX_H; i++) {
+                        int r = TEX_RGB[i * 3 + 0] * lit / 100;
+                        int g = TEX_RGB[i * 3 + 1] * lit / 100;
+                        int b = TEX_RGB[i * 3 + 2] * lit / 100;
+
+                        TEXLIT[lit - 30][i] =
+                            rgb_pack((uint8_t)r, (uint8_t)g, (uint8_t)b);
+                }
+}
+
+/* One pixel, one bounds check: the four comparisons of the kernel port
+ * folded into two unsigned ones (negatives wrap huge) and inlined. */
+static inline void put(int x, int y, uint32_t c)
+{
+        if ((unsigned)x < (unsigned)CW && (unsigned)y < (unsigned)CH)
+                canvas[(size_t)y * CW + x] = c;
+}
+
+/* A run of n pixels, written two at a time: the colour in both halves
+ * of a 64-bit pair (c | c<<32 reads back as c,c at any endianness),
+ * stored through memcpy so no aliasing rule is bent, head-aligned so
+ * no pair straddles.  Half the stores, half the loop overhead. */
+static inline void fill_row(uint32_t *p, int n, uint32_t c)
+{
+        if (n <= 0)
+                return;
+        if ((uintptr_t)p & 7) {         /* odd pixel: land on the pair */
+                *p++ = c;
+                if (--n == 0)
+                        return;
+        }
+        uint64_t pair = (uint64_t)c << 32 | c;
+        int pairs = n >> 1;
+
+        while (pairs >= 2) {
+                memcpy(p, &pair, 8);
+                memcpy(p + 2, &pair, 8);
+                p += 4;
+                pairs -= 2;
+        }
+        while (pairs-- > 0) {
+                memcpy(p, &pair, 8);
+                p += 2;
+        }
+        if (n & 1)
+                *p = c;
+}
+
+/* Fill a clipped rectangle (Surface::rect_raw), rows through fill_row. */
 static void fill_rect(int x, int y, int w, int h, uint32_t c)
 {
         int x0 = x > 0 ? x : 0;
@@ -244,15 +375,218 @@ static void fill_rect(int x, int y, int w, int h, uint32_t c)
 
         if (x0 >= x1 || y0 >= y1)
                 return;
+        uint32_t *row = canvas + (size_t)y0 * CW + x0;
         for (int yy = y0; yy < y1; yy++) {
-                uint32_t *row = canvas + (size_t)yy * CW + x0;
-                for (int i = 0; i < x1 - x0; i++)
-                        row[i] = c;
+                fill_row(row, x1 - x0, c);
+                row += CW;
         }
 }
 
-/* Bresenham line, `t` pixels thick (Surface::line). */
-static void draw_line(int x0, int y0, int x1, int y1, int t, uint32_t c)
+/* One slanted edge of a quad, pre-derived: everything the scanline walk
+ * needs, worked out once per edge instead of once per scanline.  x(y)
+ * is still the kernel's own intersection, xa + (y - ya) * dx / dy --
+ * division, truncation and all, so two faces sharing an edge still
+ * compute it identically and the silhouette tiles without slivers --
+ * but it is the machine's cheap 32-bit division: the projected corners
+ * stay within a thousand pixels or so of the panel, so the product
+ * cannot approach 2^31 for any screen a framebuffer will describe. */
+typedef struct {
+        int ylo, yhi;        /* the edge's y span, for the range test */
+        int ya, xa, dx, dy;  /* the kernel's orientation, for the x */
+} QEdge;
+
+/* Fill a convex quad (a face) with a scanline walk -- Surface::
+ * fill_convex for the n = 4 the cube ever asks, with the per-edge
+ * arithmetic hoisted out of the y loop and the rows written by
+ * fill_row.  Output is pixel for pixel what fill_convex produced. */
+static void fill_quad(P2 a, P2 b, P2 c, P2 d, uint32_t col)
+{
+        const P2 v[4] = { a, b, c, d };
+        QEdge e[4];
+        int ne = 0, nh = 0;
+        int hy[4], hx0[4], hx1[4];
+        int ymin = INT32_MAX, ymax = INT32_MIN;
+
+        for (int i = 0; i < 4; i++) {
+                const P2 *p = &v[i], *q = &v[(i + 1) & 3];
+
+                if (p->y < ymin) ymin = p->y;
+                if (p->y > ymax) ymax = p->y;
+                if (p->y == q->y) {
+                        /* horizontal: a span contributed at its y only */
+                        hy[nh] = p->y;
+                        hx0[nh] = p->x < q->x ? p->x : q->x;
+                        hx1[nh] = p->x < q->x ? q->x : p->x;
+                        nh++;
+                        continue;
+                }
+                e[ne].ya = p->y;
+                e[ne].xa = p->x;
+                e[ne].dx = q->x - p->x;
+                e[ne].dy = q->y - p->y;
+                e[ne].ylo = p->y < q->y ? p->y : q->y;
+                e[ne].yhi = p->y < q->y ? q->y : p->y;
+                ne++;
+        }
+
+        int y0 = ymin > 0 ? ymin : 0;
+        int y1 = ymax < CH - 1 ? ymax : CH - 1;
+        for (int y = y0; y <= y1; y++) {
+                int lo = INT32_MAX, hi = INT32_MIN;
+
+                for (int i = 0; i < ne; i++) {
+                        const QEdge *ed = &e[i];
+                        int x;
+
+                        if (y < ed->ylo || y > ed->yhi)
+                                continue;
+                        x = ed->xa + (y - ed->ya) * ed->dx / ed->dy;
+                        if (x < lo) lo = x;
+                        if (x > hi) hi = x;
+                }
+                for (int i = 0; i < nh; i++)
+                        if (hy[i] == y) {
+                                if (hx0[i] < lo) lo = hx0[i];
+                                if (hx1[i] > hi) hi = hx1[i];
+                        }
+                if (lo > hi)
+                        continue;
+                if (lo < 0) lo = 0;
+                if (hi >= CW) hi = CW - 1;
+                if (lo <= hi)
+                        fill_row(canvas + (size_t)y * CW + lo, hi - lo + 1, col);
+        }
+}
+
+/* ---- textured faces ----------------------------------------------------
+ * Perspective-correct: u/z, v/z and 1/z are interpolated linearly in
+ * screen space (edges per scanline, then across the span), and u, v are
+ * recovered with a division every TEX_RUN pixels, affine in between.
+ * Texture coordinates are Q8 texels (0..8191 for a 32-texel side), the
+ * edge x is still the kernel's truncated intersection, so the silhouette
+ * is exactly fill_quad's.  Corner i of a face maps to (0,0) (1,0) (1,1)
+ * (0,1) of the texture. */
+#define TEX_RUN 16
+
+typedef struct {
+        int ylo, yhi, ya, xa, dx, dy;
+        int64_t a0[3], da[3];   /* u/z, v/z, 1/z at the edge start, and delta */
+} TEdge;
+
+static inline void tedge_at(const TEdge *e, int y, int64_t out[3])
+{
+        for (int k = 0; k < 3; k++)
+                out[k] = e->a0[k] + e->da[k] * (y - e->ya) / e->dy;
+}
+
+static inline void span_uv(const int64_t AL[3], const int64_t dA[3], int off,
+        int *u, int *v)
+{
+        int64_t w = AL[2] + ((dA[2] * off) >> 16);
+        int64_t uu, vv;
+
+        if (w < 1)
+                w = 1;
+        uu = (AL[0] + ((dA[0] * off) >> 16)) / w;
+        vv = (AL[1] + ((dA[1] * off) >> 16)) / w;
+        *u = uu < 0 ? 0 : uu > 8191 ? 8191 : (int)uu;
+        *v = vv < 0 ? 0 : vv > 8191 ? 8191 : (int)vv;
+}
+
+static void fill_quad_tex(const P2 q[4], const int32_t w[4], const uint32_t *tex)
+{
+        static const int UC[4] = { 0, 8192, 8192, 0 };
+        static const int VC[4] = { 0, 0, 8192, 8192 };
+        TEdge e[4];
+        int ne = 0, ymin = INT32_MAX, ymax = INT32_MIN;
+
+        for (int i = 0; i < 4; i++) {
+                int j = (i + 1) & 3;
+                const P2 *p = &q[i], *r = &q[j];
+
+                if (p->y < ymin) ymin = p->y;
+                if (p->y > ymax) ymax = p->y;
+                if (p->y == r->y)
+                        continue;       /* its ends are on the neighbours */
+                e[ne].ya = p->y;
+                e[ne].xa = p->x;
+                e[ne].dx = r->x - p->x;
+                e[ne].dy = r->y - p->y;
+                e[ne].ylo = p->y < r->y ? p->y : r->y;
+                e[ne].yhi = p->y < r->y ? r->y : p->y;
+                e[ne].a0[0] = (int64_t)UC[i] * w[i];
+                e[ne].a0[1] = (int64_t)VC[i] * w[i];
+                e[ne].a0[2] = w[i];
+                e[ne].da[0] = (int64_t)UC[j] * w[j] - e[ne].a0[0];
+                e[ne].da[1] = (int64_t)VC[j] * w[j] - e[ne].a0[1];
+                e[ne].da[2] = (int64_t)w[j] - e[ne].a0[2];
+                ne++;
+        }
+
+        int y0 = ymin > 0 ? ymin : 0;
+        int y1 = ymax < CH - 1 ? ymax : CH - 1;
+        for (int y = y0; y <= y1; y++) {
+                int lo = INT32_MAX, hi = INT32_MIN, el = -1, eh = -1;
+
+                for (int i = 0; i < ne; i++) {
+                        const TEdge *ed = &e[i];
+                        int x;
+
+                        if (y < ed->ylo || y > ed->yhi)
+                                continue;
+                        x = ed->xa + (y - ed->ya) * ed->dx / ed->dy;
+                        if (x < lo) { lo = x; el = i; }
+                        if (x > hi) { hi = x; eh = i; }
+                }
+                if (el < 0)
+                        continue;
+
+                int xs = lo < 0 ? 0 : lo;
+                int xe = hi >= CW ? CW - 1 : hi;
+
+                if (xs > xe)
+                        continue;
+
+                int64_t AL[3], AH[3], dA[3] = { 0, 0, 0 };
+                int n = hi - lo;
+
+                tedge_at(&e[el], y, AL);
+                tedge_at(&e[eh], y, AH);
+                if (n > 0)
+                        for (int k = 0; k < 3; k++)
+                                dA[k] = (AH[k] - AL[k]) * 65536 / n;
+
+                uint32_t *row = canvas + (size_t)y * CW;
+                int x = xs, u0, v0;
+
+                span_uv(AL, dA, x - lo, &u0, &v0);
+                while (x <= xe) {
+                        int xend = x + TEX_RUN < xe + 1 ? x + TEX_RUN : xe + 1;
+                        int len = xend - x, u1, v1;
+
+                        span_uv(AL, dA, xend - lo, &u1, &v1);
+                        int du = (u1 - u0) * 256 / len;
+                        int dv = (v1 - v0) * 256 / len;
+                        int u = u0 * 256, v = v0 * 256;
+
+                        for (; x < xend; x++) {
+                                row[x] = tex[((v >> 16) & (TEX_H - 1)) * TEX_W +
+                                    ((u >> 16) & (TEX_W - 1))];
+                                u += du;
+                                v += dv;
+                        }
+                        u0 = u1;
+                        v0 = v1;
+                }
+        }
+}
+
+/* The cube's 2-pixel edge: Bresenham walked exactly as the kernel's
+ * draw_line(t = 2) walked it, but every step drops one 2x2 block with
+ * a single bounds check -- the four writes of fill_rect(x - 1, y - 1,
+ * 2, 2) without its per-pixel clipping ceremony, and put() for the
+ * blocks that straddle the edge of the screen. */
+static void draw_edge(int x0, int y0, int x1, int y1, uint32_t c)
 {
         int x = x0, y = y0;
         int dx = x1 > x0 ? x1 - x0 : x0 - x1;
@@ -261,13 +595,16 @@ static void draw_line(int x0, int y0, int x1, int y1, int t, uint32_t c)
         int sy = y0 < y1 ? 1 : -1;
         int err = dx + dy;
 
-        if (t < 1)
-                t = 1;
         for (;;) {
-                if (t == 1)
-                        put(x, y, c);
-                else
-                        fill_rect(x - t / 2, y - t / 2, t, t, c);
+                if (x >= 1 && x < CW && y >= 1 && y < CH) {
+                        uint32_t *p = canvas + (size_t)(y - 1) * CW + (x - 1);
+
+                        p[0] = c; p[1] = c;
+                        p[CW] = c; p[CW + 1] = c;
+                } else {
+                        put(x - 1, y - 1, c); put(x, y - 1, c);
+                        put(x - 1, y, c);     put(x, y, c);
+                }
                 if (x == x1 && y == y1)
                         break;
                 int e2 = 2 * err;
@@ -279,42 +616,6 @@ static void draw_line(int x0, int y0, int x1, int y1, int t, uint32_t c)
                         err += dx;
                         y += sy;
                 }
-        }
-}
-
-/* Fill a convex polygon with a scanline walk (Surface::fill_convex). */
-static void fill_convex(const P2 pts[], int n, uint32_t c)
-{
-        int ymin = INT32_MAX, ymax = INT32_MIN;
-
-        for (int i = 0; i < n; i++) {
-                if (pts[i].y < ymin) ymin = pts[i].y;
-                if (pts[i].y > ymax) ymax = pts[i].y;
-        }
-        for (int y = ymin > 0 ? ymin : 0; y <= (ymax < CH - 1 ? ymax : CH - 1); y++) {
-                int lo = INT32_MAX, hi = INT32_MIN;
-                for (int i = 0; i < n; i++) {
-                        P2 a = pts[i], b = pts[(i + 1) % n];
-                        if (a.y == b.y) {
-                                if (a.y == y) {
-                                        int xa = a.x < b.x ? a.x : b.x;
-                                        int xb = a.x < b.x ? b.x : a.x;
-                                        if (xa < lo) lo = xa;
-                                        if (xb > hi) hi = xb;
-                                }
-                                continue;
-                        }
-                        int top = a.y < b.y ? a.y : b.y;
-                        int bot = a.y < b.y ? b.y : a.y;
-                        if (y < top || y > bot)
-                                continue;
-                        int x = (int)((int64_t)a.x + (int64_t)(y - a.y) * (b.x - a.x) /
-                            (b.y - a.y));
-                        if (x < lo) lo = x;
-                        if (x > hi) hi = x;
-                }
-                if (lo <= hi)
-                        fill_rect(lo, y, hi - lo + 1, 1, c);
         }
 }
 
@@ -376,15 +677,27 @@ static const struct { char c; uint8_t rows[8]; } FONT[] = {
         { 's', { 0x00, 0x00, 0x7C, 0xC0, 0x78, 0x0C, 0xF8, 0x00 } },
         { 't', { 0x30, 0x30, 0xFC, 0x30, 0x30, 0x30, 0x1E, 0x00 } },
         { 'u', { 0x00, 0x00, 0xCC, 0xCC, 0xCC, 0xCC, 0x7C, 0x00 } },
+        { 'n', { 0x00, 0x00, 0xF8, 0xCC, 0xCC, 0xCC, 0xCC, 0x00 } },
         { 'w', { 0x00, 0x00, 0xCC, 0xCC, 0xD8, 0x78, 0x30, 0x00 } },
+        { 'x', { 0x00, 0x00, 0xCC, 0x78, 0x30, 0x78, 0xCC, 0x00 } },
 };
 
-static const uint8_t *glyph_of(int c)
+/* The glyphs behind a direct index: the kernel port walked the table
+ * per character; the HUD asked for the same few dozen a hundred times
+ * a second. */
+static const uint8_t *GLYPH[128];
+
+static void build_font(void)
 {
+        for (int i = 0; i < 128; i++)
+                GLYPH[i] = FONT[0].rows; /* the space: unlisted draws blank */
         for (size_t i = 0; i < sizeof FONT / sizeof FONT[0]; i++)
-                if (FONT[i].c == c)
-                        return FONT[i].rows;
-        return FONT[0].rows; /* the space: anything unlisted draws blank */
+                GLYPH[(unsigned char)FONT[i].c & 127] = FONT[i].rows;
+}
+
+static inline const uint8_t *glyph_of(int c)
+{
+        return c >= 0 && c < 128 ? GLYPH[c] : FONT[0].rows;
 }
 
 /* Pixel width of `s` at `scale`. */
@@ -417,39 +730,69 @@ static void draw_text(int x, int y, const char *s, int scale, uint32_t fg, uint3
 
 /* ---- the cube --------------------------------------------------------- */
 
-/* Draw the cube into the canvas; returns its bounding box.  The kernel's
- * draw_cube(): back-face culling on the rounded screen points (the
- * silhouette tiles exactly, no slivers), the lit face colour, the
- * edges unless solid mode. */
+/* The twelve edges of the cube, numbered once: every edge is shared by
+ * two faces, and drawing it on the second visible face's visit was a
+ * quarter of the edge work spent drawing the same pixels again. */
+static uint8_t EID[8][8];
+
+static void build_edges(void)
+{
+        int id = 0;
+
+        for (int f = 0; f < 6; f++)
+                for (int i = 0; i < 4; i++) {
+                        int a = FACES[f].verts[i];
+                        int b = FACES[f].verts[(i + 1) & 3];
+
+                        if (EID[a][b] == 0 && EID[b][a] == 0) {
+                                id++;
+                                EID[a][b] = EID[b][a] = (uint8_t)id;
+                        }
+                }
+}
+
+/* Draw the cube into the canvas; returns its bounding box.  The
+ * kernel's draw_cube(): back-face culling on the rounded screen points
+ * (the silhouette tiles exactly, no slivers), the lit face colour out
+ * of the startup table, every visible edge drawn exactly once. */
 static void draw_cube(int cx, int cy, int d, int ax, int ay, int az,
-        int mode, uint32_t edge, int *bb)
+        int mode, int textured, uint32_t edge, int *bb)
 {
         Frame fr = project(cx, cy, d, ax, ay, az);
+        uint16_t drawn = 0;
 
         for (int f = 0; f < 6; f++) {
+                const Face *fa = &FACES[f];
                 P2 q[4];
 
                 for (int i = 0; i < 4; i++) {
-                        q[i].x = fr.pts[FACES[f].verts[i]].x;
-                        q[i].y = fr.pts[FACES[f].verts[i]].y;
+                        q[i].x = fr.pts[fa->verts[i]].x;
+                        q[i].y = fr.pts[fa->verts[i]].y;
                 }
                 if (!visible(q))
                         continue;
                 if (mode != M_WIRE) {
-                        int lit = light_pct(&FACES[f], ax, ay, az);
-                        int r = (int)FACES[f].base[0] * lit / 100;
-                        int g = (int)FACES[f].base[1] * lit / 100;
-                        int b = (int)FACES[f].base[2] * lit / 100;
+                        int li = light_pct(fa, ax, ay, az) - 30;
 
-                        if (r > 255) r = 255;
-                        if (g > 255) g = 255;
-                        if (b > 255) b = 255;
-                        fill_convex(q, 4, rgb_pack((uint8_t)r, (uint8_t)g, (uint8_t)b));
+                        if (textured) {
+                                int32_t w[4];
+
+                                for (int i = 0; i < 4; i++)
+                                        w[i] = fr.w[fa->verts[i]];
+                                fill_quad_tex(q, w, TEXLIT[li]);
+                        } else
+                                fill_quad(q[0], q[1], q[2], q[3], FACE_LIT[f][li]);
                 }
                 if (mode != M_SOLID)
-                        for (int i = 0; i < 4; i++)
-                                draw_line(q[i].x, q[i].y, q[(i + 1) % 4].x,
-                                    q[(i + 1) % 4].y, 2, edge);
+                        for (int i = 0; i < 4; i++) {
+                                int e = EID[fa->verts[i]][fa->verts[(i + 1) & 3]];
+
+                                if (drawn & (1u << e))
+                                        continue;
+                                drawn |= 1u << e;
+                                draw_edge(q[i].x, q[i].y,
+                                    q[(i + 1) & 3].x, q[(i + 1) & 3].y, edge);
+                        }
         }
         bb[0] = fr.bx0; bb[1] = fr.by0; bb[2] = fr.bx1; bb[3] = fr.by1;
 }
@@ -486,16 +829,29 @@ static void tty_restore(void)
 }
 
 /* The keys of the command line itself may still be in the queue; the
- * kernel original drained pop_char() the same way before starting. */
+ * kernel original drained pop_char() the same way before starting.
+ * Drained in batches since: one read takes whatever is pending. */
 static void kbd_drain(void)
 {
-        uint8_t c;
+        uint8_t buf[64];
 
-        while (read(kbd, &c, 1) == 1)
-                ;
+        for (;;) {
+                ssize_t n = read(kbd, buf, sizeof buf);
+
+                if (n <= 0)
+                        break;
+        }
 }
 
 /* ---- the dirty rectangle: what this frame's blit sends --------------- */
+
+/* How far past the projected corners the drawing reaches: the 2x2 edge
+ * blocks overshoot the corners by exactly one pixel, and one more is
+ * margin.  (The first port padded six and seven; every one of those
+ * pixels rode the blit for nothing.) */
+#define EDGE_PAD 2
+
+#define HELP_TXT "SPACE pause   +/- speed   M mode   T texture   ESC quit"
 
 static int dx0, dy0, dx1, dy1; /* [dx0, dx1) x [dy0, dy1), clipped */
 
@@ -538,15 +894,19 @@ static int blit_dirty(void)
 static int run(void)
 {
         uint32_t F_BG, F_EDGE, F_HUD, F_HELP;
-        int cx, cy, half_view, d, scale;
-        int mode = M_SOLID_EDGES, paused = 0;
+        int cx, cy, half_view, d, scale, help_w;
+        int mode = M_SOLID_EDGES, paused = 0, textured = 1;
         long speed = 100;       /* percent */
-        int64_t clock = 0;      /* scaled milliseconds */
-        long last, next_frame;
+        int64_t clock = 0;      /* milliseconds scaled by speed; the /100
+                                 * is folded into the angles below, so
+                                 * no remainder is lost between frames */
+        long last, fps_at;
         int have_prev = 0, prev[4];
+        int have_pose = 0, pax = 0, pay = 0, paz = 0;
         uint32_t frames = 0, fps = 0;
-        long fps_at;
         int hud_dirty = 1;
+        char hud[96], prev_hud[96];
+        uint8_t kbuf[64];
 
         long r = prism_fb_info(&FB);
 
@@ -585,6 +945,8 @@ static int run(void)
         F_EDGE = rgb_pack(245, 248, 255);
         F_HUD = rgb_pack(150, 160, 190);
         F_HELP = rgb_pack(110, 120, 150);
+        build_face_colors();
+        build_texture();
 
         cx = CW / 2;
         cy = CH / 2 + 8;
@@ -597,6 +959,7 @@ static int run(void)
         scale = CH / 540;
         if (scale < 1) scale = 1;
         if (scale > 3) scale = 3;
+        help_w = text_width(HELP_TXT, scale);
 
         /* The opening frame: the whole screen, to the cube's background. */
         fill_rect(0, 0, CW, CH, F_BG);
@@ -606,46 +969,54 @@ static int run(void)
                 goto blit_failed;
 
         last = prism_uptime_ms();
-        next_frame = last;
         fps_at = last;
+        prev_hud[0] = '\0';
 
         for (;;) {
-                char hud[96];
-                int bb[4], redraw_hud = 0, quit = 0;
+                int bb[4], quit = 0, force = 0, hud_changed = 0;
                 long now;
+                int ax, ay, az;
 
-                /* The keyboard: everything pending, one byte per read. */
+                /* The keyboard: everything pending, as much of it as one
+                 * read brings back -- a syscall a batch, not a byte. */
                 for (;;) {
-                        uint8_t c;
-                        ssize_t n = read(kbd, &c, 1);
+                        ssize_t n = read(kbd, kbuf, sizeof kbuf);
 
                         if (n <= 0)
                                 break; /* EAGAIN (or worse): nothing more */
-                        switch (c) {
-                        case 0x1b:
-                                quit = 1;
-                                break;
-                        case ' ': case 'p': case 'P':
-                                paused = !paused;
-                                redraw_hud = 1;
-                                break;
-                        case '+': case '=':
-                                speed += 25;
-                                if (speed > 800)
-                                        speed = 800;
-                                redraw_hud = 1;
-                                break;
-                        case '-':
-                                speed -= 25;
-                                if (speed < 25)
-                                        speed = 25;
-                                redraw_hud = 1;
+                        for (ssize_t i = 0; i < n; i++) {
+                                switch (kbuf[i]) {
+                                case 0x1b:
+                                        quit = 1;
+                                        break;
+                                case ' ': case 'p': case 'P':
+                                        paused = !paused;
+                                        hud_dirty = 1;
+                                        break;
+                                case '+': case '=':
+                                        speed += 25;
+                                        if (speed > 800)
+                                                speed = 800;
+                                        hud_dirty = 1;
+                                        break;
+                                case '-':
+                                        speed -= 25;
+                                        if (speed < 25)
+                                                speed = 25;
+                                        hud_dirty = 1;
+                                        break;
+                                case 't': case 'T':
+                                textured = !textured;
+                                hud_dirty = 1;
+                                force = 1;
                                 break;
                         case 'm': case 'M':
-                                mode = mode == M_SOLID_EDGES ? M_SOLID
-                                    : mode == M_SOLID ? M_WIRE : M_SOLID_EDGES;
-                                redraw_hud = 1;
-                                break;
+                                        mode = mode == M_SOLID_EDGES ? M_SOLID
+                                            : mode == M_SOLID ? M_WIRE : M_SOLID_EDGES;
+                                        hud_dirty = 1;
+                                        force = 1;
+                                        break;
+                                }
                         }
                         if (quit)
                                 break;
@@ -661,71 +1032,93 @@ static int run(void)
                         close(kbd);
                         return 0;
                 }
-                hud_dirty |= redraw_hud;
 
                 now = prism_uptime_ms();
-                if (now < next_frame) {
-                        prism_sleep_ms(1); /* the userland hlt(): park to the tick */
-                        continue;
-                }
-                next_frame = now + FRAME_MS;
                 if (!paused)
-                        clock += (now - last) * speed / 100;
+                        clock += (now - last) * speed;
                 last = now;
 
-                /* Three axes at different rates: one full turn every 6 s, 9 s, 15 s. */
-                int ax = (int32_t)(clock * TURN / 9000);
-                int ay = (int32_t)(clock * TURN / 6000);
-                int az = (int32_t)(clock * TURN / 15000);
+                /* Three axes at different rates: one full turn every 6 s,
+                 * 9 s, 15 s of scaled time -- the denominators carry the
+                 * clock's old /100, so the sampling loses nothing. */
+                ax = (int32_t)(clock * TURN / 900000);
+                ay = (int32_t)(clock * TURN / 600000);
+                az = (int32_t)(clock * TURN / 1500000);
 
-                frames++;
                 if (now - fps_at >= 1000) {
-                        fps = (uint32_t)((uint64_t)frames * 1000 / (uint64_t)(now - fps_at));
+                        fps = (uint32_t)((uint64_t)frames * 1000 /
+                            (uint64_t)(now - fps_at));
                         frames = 0;
                         fps_at = now;
                         hud_dirty = 1;
                 }
+                if (hud_dirty) {
+                        snprintf(hud, sizeof hud,
+                            "PRISM CUBE   %u fps   speed %ld%%   mode %s   tex %s%s",
+                            fps, speed, mode_name(mode), textured ? "on" : "off",
+                            paused ? "   [paused]" : "");
+                        hud_dirty = 0;
+                        hud_changed = strcmp(hud, prev_hud) != 0;
+                }
 
-                snprintf(hud, sizeof hud,
-                    "PRISM CUBE   %u fps   speed %ld%%   mode %s%s",
-                    fps, speed, mode_name(mode), paused ? "   [paused]" : "");
+                /* Nothing has moved and the HUD says what is already on
+                 * the screen: the frame is right where it lies.  Park to
+                 * the tick and look again.  This is the whole trick
+                 * behind the frame rate: a render happens exactly as
+                 * often as the cube's angles, its mode or the HUD text
+                 * actually change, and not once more -- on a 100 Hz
+                 * kernel that is every tick the pose can differ (twice
+                 * the old 20 ms gate), at low speeds only the ticks
+                 * where it does, and for a paused cube never. */
+                if (!force && have_pose && !hud_changed &&
+                    ax == pax && ay == pay && az == paz) {
+                        prism_sleep_ms(1); /* the userland hlt(): park to the tick */
+                        continue;
+                }
 
                 dirty_reset();
                 /* Erase where the cube was (the kernel's prev_box wipe,
-                 * a little wider for the thick edges). */
+                 * EDGE_PAD wide: the edge blocks reach one pixel past
+                 * the corners, and one more is margin). */
                 if (have_prev)
-                        fill_rect(prev[0] - 6, prev[1] - 6,
-                            prev[2] - prev[0] + 13, prev[3] - prev[1] + 13, F_BG);
-                draw_cube(cx, cy, d, ax, ay, az, mode, F_EDGE, bb);
+                        fill_rect(prev[0] - EDGE_PAD, prev[1] - EDGE_PAD,
+                            prev[2] - prev[0] + 2 * EDGE_PAD + 1,
+                            prev[3] - prev[1] + 2 * EDGE_PAD + 1, F_BG);
+                draw_cube(cx, cy, d, ax, ay, az, mode, textured, F_EDGE, bb);
                 if (have_prev)
-                        dirty_add(prev[0] - 6, prev[1] - 6,
-                            prev[2] + 7, prev[3] + 7);
-                dirty_add(bb[0] - 6, bb[1] - 6, bb[2] + 7, bb[3] + 7);
+                        dirty_add(prev[0] - EDGE_PAD, prev[1] - EDGE_PAD,
+                            prev[2] + EDGE_PAD + 1, prev[3] + EDGE_PAD + 1);
+                dirty_add(bb[0] - EDGE_PAD, bb[1] - EDGE_PAD,
+                    bb[2] + EDGE_PAD + 1, bb[3] + EDGE_PAD + 1);
                 have_prev = 1;
                 prev[0] = bb[0]; prev[1] = bb[1]; prev[2] = bb[2]; prev[3] = bb[3];
 
-                if (hud_dirty) {
-                        const char *help = "SPACE pause   +/- speed   M mode   ESC quit";
-                        int hw = text_width(help, scale);
+                if (hud_changed) {
                         int hy = CH - 8 * scale - 10;
 
                         fill_rect(0, 8, CW, 8 * scale + 4, F_BG);
                         draw_text(16, 10, hud, scale, F_HUD, F_BG);
                         fill_rect(0, CH - 8 * scale - 14, CW, 8 * scale + 6, F_BG);
-                        draw_text((CW - hw) / 2, hy, help, scale, F_HELP, F_BG);
+                        draw_text((CW - help_w) / 2, hy,
+                            HELP_TXT,
+                            scale, F_HELP, F_BG);
                         dirty_add(0, 8, CW, 8 + 8 * scale + 8);
                         dirty_add(0, CH - 8 * scale - 14, CW, CH);
+                        strcpy(prev_hud, hud);
                 }
-                hud_dirty = 0;
 
-                if (blit_dirty() < 0) {
-blit_failed:
-                        printf("cube: fb_blit failed\n");
-                        tty_restore();
-                        close(kbd);
-                        return 1;
-                }
+                if (blit_dirty() < 0)
+                        goto blit_failed;
+                frames++;
+                pax = ax; pay = ay; paz = az;
+                have_pose = 1;
         }
+
+blit_failed:
+        printf("cube: fb_blit failed\n");
+        tty_restore();
+        close(kbd);
+        return 1;
 }
 
 int main(int argc, char **argv, char **envp)
@@ -736,5 +1129,9 @@ int main(int argc, char **argv, char **envp)
         /* Unbuffered, like every port: the shell's prompt must not wait. */
         setvbuf(stdout, 0, _IONBF, 0);
         build_sin();
+        for (int i = 0; i < 8; i++)
+                VERTS[i] = vertex(i);
+        build_font();
+        build_edges();
         return run();
 }

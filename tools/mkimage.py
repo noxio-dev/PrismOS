@@ -173,8 +173,9 @@ def main():
                     help="ESP size in MiB (FAT32 needs at least 34)")
     ap.add_argument("--root-dir", required=True,
                     help="directory tree copied into the ext4 root (P3)")
-    ap.add_argument("--root-size", type=int, default=64,
-                    help="ext4 root size in MiB")
+    ap.add_argument("--root-size", type=int, default=96,
+                    help="ext4 root size in MiB (phase 4.1 raised it from 64: "
+                         "the binutils utilities alone are ~11 MiB more)")
     ap.add_argument("-o", "--output", required=True)
     args = ap.parse_args()
 

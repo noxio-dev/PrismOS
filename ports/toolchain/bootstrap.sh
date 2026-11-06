@@ -105,7 +105,11 @@ do_wrappers() {
         if [ -z "${HOST_CXX:-}" ]; then
                 if command -v clang++ >/dev/null 2>&1; then HOST_CXX=clang++; else HOST_CXX=g++; fi
         fi
-        for t in gcc g++ cc c++ ar ranlib nm strip ld as objcopy; do
+        # The full utility set (phase 4.1 completed it): objdump and readelf
+        # joined the list -- verify.sh's diet checks disassemble through the
+        # prefixed names now, and the binutils port's own build expects them
+        # there.  build.sh's real cross tools replace every wrapper alike.
+        for t in gcc g++ cc c++ ar ranlib nm strip ld as objcopy objdump readelf; do
                 case $t in
                 gcc|cc)  tool=$HOST_CC ;;
                 g++|c++) tool=$HOST_CXX ;;
