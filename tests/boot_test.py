@@ -23,6 +23,20 @@ import tempfile
 import time
 
 
+def kernel_version():
+    """The binary's own version (sys/kern/Cargo.toml) so checks that pin it
+    (the kernel-shell `env:` line) keep tracking the kernel when it bumps."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "sys/kern/Cargo.toml")) as f:
+        for line in f:
+            if line.startswith("version"):
+                return line.split("=", 1)[1].strip().strip('"')
+    return "unknown"
+
+
+KVER = kernel_version()
+
+
 def run_vm(cmd, steps, expect, timeout):
     """steps: list of (wait_for, send); expect: strings that must appear."""
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -210,7 +224,7 @@ def main():
           ("pid 5 hello -- exited with status 0", "exec hello fault\r"),
           ("pid 6 hello -- killed by exception 14", "exec hello exit 42\r"),
           ("pid 7 hello -- exited with status 42", "exec notelf\r")],
-         ['argv[2] = "alpha"', "env: PRISMOS=0.3.2", "main() runs at 0x80", "AT_PAGESZ = 4096",
+         ['argv[2] = "alpha"', "env: PRISMOS=" + KVER, "main() runs at 0x80", "AT_PAGESZ = 4096",
           "float check: ok",
           "hello chain: pid 2 calls execve()", 'argv[2] = "(after execve)"', 'argv[4] = "y"',
           "execve(/nonexistent)         -> -2", "execve(/boot/loader.conf)    -> -13",
@@ -385,9 +399,13 @@ def main():
 
     # Phase 3.3: the userland session -- init (pid 1) and the shell on the
     # tty's line discipline, /proc generated on read, and a ^C that reaches
-    # a blocked foreground read through TIOCSPGRP.
+    # a blocked foreground read through TIOCSPGRP.  Since 3.4.5 the shell
+    # is busybox ash (login spelling: argv[0] "-sh", /etc/profile's PATH
+    # and PS1), so `ps` / `df` / `ls` are its applets and the prompt is the
+    # profile's own prism$ -- the checks the phase 3.3 scenarios already
+    # made, now through real software.
     scenarios += [
-        ("BIOS userland: init, /proc, ps, df (phase 3.3)", bios_cmd,
+        ("BIOS userland: init, /proc, ps, df (phases 3.3 + 3.4)", bios_cmd,
          [("prism$ ", "cat /proc/version\r"),
           ("prism$ ", "cat /proc/meminfo\r"),
           ("prism$ ", "ls /proc\r"),
@@ -408,8 +426,45 @@ def main():
         ("BIOS userland: ^C interrupts a blocked read (phase 3.3)", bios_cmd,
          [("prism$ ", "fd\r"),
           ("type 4 bytes (EXACTLY wxyz):", "\x03"),
-          ("sh: fd: killed by signal 2", "ps\r")],
-         ["fd (pid ", "type 4 bytes", "sh: fd: killed by signal 2"], 240),
+          ("prism$ ", "ps\r")],
+         ["fd (pid ", "type 4 bytes"], 240),
+    ]
+
+    # Phase 3.4 (the roadmap's own words): sh scripts run in QEMU -- pipes,
+    # loops, redirections -- checked by `make test`.  ash is the session
+    # shell, so every step is a script line the busybox applets answer:
+    # the pipe through fork + pipe + dup2 + execve, the redirection into
+    # /tmp (the tmpfs), the arithmetic and the for loop, the new-syscall
+    # half of the phase (touch's utimensat, chmod then ls -l, `time`'s
+    # wait4 with the child's rusage), and the multi-call dispatch
+    # (busybox uname, a tar round trip).
+    scenarios += [
+        ("BIOS busybox: ash pipes, redirections, loops (phase 3.4)", bios_cmd,
+         [("prism$ ", "echo one two three | wc -w\r"),
+          ("prism$ ", "echo redirected > /tmp/t && cat /tmp/t\r"),
+          ("prism$ ", "for i in 1 2 3; do echo line $i; done | wc -l\r"),
+          ("prism$ ", "echo $((6 * 7))\r"),
+          ("prism$ ", "cd /tmp && pwd\r"),
+          ("prism$ ", "touch /tmp/x && chmod 700 /tmp/x && ls -l /tmp/x\r"),
+          ("prism$ ", "time echo timed\r"),
+          ("prism$ ", "tar cf /tmp/a.tar /etc/passwd && tar tf /tmp/a.tar\r"),
+          ("prism$ ", "grep root /etc/passwd\r"),
+          ("prism$ ", "ls /usr/bin | grep -c busybox\r"),
+          ("prism$ ", "busybox uname -s\r"),
+          ("prism$ ", "ash -c 'echo subshell $((40 + 2))'\r")],
+         ["3",                      # wc -w of "one two three"
+          "redirected",             # the redirection round trip
+          "3",                      # the loop piped into wc -l
+          "42",                     # the arithmetic
+          "/tmp",                   # cd + pwd
+          "rwx",                    # touch + chmod 700 + ls -l
+          "timed",                  # time's own child, through wait4
+          "real", "user", "sys",    # the rusage report (syscall 66)
+          "etc/passwd",             # the tar round trip
+          "root:x:0:0:root:/:/usr/bin/sh",
+          "1",                      # ls | grep -c busybox
+          "PrismOS",                # busybox uname -s (the kernel's utsname)
+          "subshell 42"], 240),
     ]
 
     # A substring filter for focused runs (comma-separated): keep the

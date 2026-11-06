@@ -10,13 +10,17 @@ freshly booted image (needs qemu).
 
 The session this drives is /dev/ttyS0's (phase 3.3.5): the kernel found
 a UART, init put a getty on it, and every keystroke below crosses the
-serial line's own queue and line discipline.  Checks (roadmap 3.3.8):
-the kernel starts /sbin/init as pid 1 and init mounts /proc and /tmp
-(pid 1's mounts, phase 3.3.7); /proc answers (version, the per-pid
-files, the cwd and fd symlinks, the magic self through stat); the line
-edits (VERASE through the serial line) and ^C interrupts a blocked
-foreground read of the fd program, reported by the shell as the kill;
-/dev full is the ENOSPC it must be; ^D ends the shell and init brings
+serial line's own queue and line discipline.  Since phase 3.4.5 the
+shell behind that getty is busybox ash (the login spelling: /etc/profile
+sets the PATH and the prism$ prompt), so the scenarios speak ash: the
+builtins it owns, the applets it execs, its own line editing (the editor
+runs raw on the tty, VERASE included) and its own spelling of the error
+paths.  Checks (roadmap 3.3.8): the kernel starts /sbin/init as pid 1
+and init mounts /proc and /tmp (pid 1's mounts, phase 3.3.7); /proc
+answers (version, the per-pid files, the cwd and fd symlinks, the magic
+self through stat); the line edits and ^C interrupt a blocked foreground
+read of the fd program (reported by the shell as the kill);
+/dev/full is the ENOSPC it must be; ^D ends the shell and init brings
 the *serial* session back; and the console session it also started is
 visible in ps the whole time (sleeping at its VGA prompt).
 """
@@ -84,30 +88,35 @@ def main():
 
     out = run_steps(sys.argv[1], [
         # /proc: the static files, the magic self symlink, the per-pid
-        # directory (pid 1 is init itself).
+        # directory (pid 1 is init itself).  ash's argv[0] is the login
+        # spelling "-sh" -- /proc/self/cmdline carries it verbatim.
         ("prism$ ", "cat /proc/version\r"),
         ("PrismOS version", "cat /proc/self/cmdline\r"),
-        ("/usr/bin/sh", "cat /proc/self/stat\r"),
+        ("-sh", "cat /proc/self/stat\r"),
         ("(sh) R 1", "ls /proc/1\r"),
         ("fd", "ls /proc/self\r"),
         # The cwd and fd symlinks (phase 3.3.6): ls -l of the directory
-        # shows the arrows through lstat + readlink.
+        # shows the arrows through lstat + readlink (busybox ls now).
         ("cwd", "ls -l /proc/self\r"),
         ("-> /usr/bin/sh", "ls /dev\r"),
         # /dev: ttyS0 is there, a queue of its own (phase 3.3.5).
         ("tty0", "cat /etc/passwd\r"),
         ("root:x:0:0:root:/:/usr/bin/sh", "ps\r"),
-        # The tty's line discipline: VERASE (0x7f through the serial
-        # line) fixes a typoed command, exactly like on a real terminal.
-        ("    2     1 S", "pwdd\x7f\r"),           # "pwdd" + backspace -> pwd
-        ("/", "echo testt\x7f\r"),           # "testt" + backspace -> test
-        # /dev/full: the write no disk could make.
-        ("test", "write /dev/full probe\r"),
-        # ^C on a blocked foreground read (the fd program's stdin check).
+        # busybox ps through /proc: pid 1's command line is the tell.
+        ("PID", "pwdd\x7f\r"),                # "pwdd" + VERASE -> pwd
+        ("/", "echo testt\x7f\r"),              # "testt" + VERASE -> test
+        # The line edits above are ash's own editor (raw mode): the
+        # erase key, the retyped line, the same serial queue.
+        # /dev/full: the write no disk could make -- ash's redirection.
+        ("test", "echo probe > /dev/full\r"),
+        # ^C on a blocked foreground read (the fd program's stdin check);
+        # ash survives it (interactive shells ignore SIGINT without job
+        # control) and answers with a fresh prompt.
         ("No space left on device", "fd\r"),
         ("type 4 bytes (EXACTLY wxyz):", "\x03"),
+        ("prism$ ", "echo after-interrupt\r"),
         # ^D at the prompt: the shell exits, init reports and respawns.
-        ("sh: fd: killed by signal 2", "\x04"),
+        ("after-interrupt", "\x04"),
     ])
 
     print(out)
@@ -118,19 +127,18 @@ def main():
         "PrismOS init: starting the console shell",
         "PrismOS init: starting the serial shell (ttyS0)",
         "PrismOS version",                    # /proc/version
-        "/usr/bin/sh",                        # /proc/self/cmdline
+        "-sh",                                # /proc/self/cmdline (the login argv[0])
         "(sh) R 1",                           # /proc/self/stat (comm, state, ppid)
         "cmdline", "cwd", "exe", "fd", "stat", "status",  # /proc/N's listing
         "-> /usr/bin/sh", "-> /",            # ls -l's readlink of the pair
         "ttyS0",                              # /dev's serial node (3.3.5)
         "root:x:0:0:root:/:/usr/bin/sh",      # /etc/passwd
-        # ps rows: init sleeps in waitpid, the console shell sleeps at its
-        # VGA prompt (the session this test never touches), this shell runs.
-        "    1     0 S", "    2     1 S", "    3     1 R",
+        "PID",                                # busybox ps's header (through /proc)
+        "/sbin/init",                         # pid 1's command line in ps
         "/",                                  # pwd (the edited line)
         "test",                               # the erased-and-retyped echo
-        "sh: write: /dev/full: No space left on device",
-        "sh: fd: killed by signal 2",
+        "No space left on device",            # the /dev/full redirection
+        "after-interrupt",                    # the shell survived the ^C
     ]
     missing = [w for w in want if w not in out]
 

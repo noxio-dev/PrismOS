@@ -1,22 +1,22 @@
-# /usr/bin/sh -- the userland shell (phase 3.3.7): what init respawns
-# on the console.  The tty does the line editing (ICANON + ECHO, the
-# kernel's user/tty.rs), this does the words: builtins for the daily
-# surface (cd, ls, cat, write, append, df, ps, ...), a PATH walk for
-# everything else, ^C for the foreground command (TIOCSPGRP).  busybox
-# ash replaces it at 3.4.5 -- until then it is the honest test rig for
-# the whole phase: termios, /proc, statfs, the interruptible reads.
+# /usr/bin/minish -- the bootstrap shell (phase 3.3.7), busybox ash's
+# tenant since 3.4.5: what init respawns on the terminals is /usr/bin/sh,
+# the busybox symlink, and this stays as the test rig the phase's
+# scenarios ran on -- the honest fallback a session can always exec
+# (termios, /proc, statfs, the interruptible reads, one builtin set,
+# no pipes, no redirections: exactly the rig the README's 3.3 promises
+# busybox would replace).
 [package]
 name = "sh"
 version = "0.1.0"
-description = "the userland shell: builtins + PATH exec, on the tty's line discipline"
+description = "the bootstrap shell: builtins + PATH exec, on the tty's line discipline"
 
 [build]
 sources = ["src/sh.c"]
 
 [install]
-path = "/usr/bin/sh"
+path = "/usr/bin/minish"
 
-# verify.sh's sh diet: every syscall the program makes (the foreground
+# verify.sh's minish diet: every syscall the program makes (the foreground
 # claim and df's statfs go raw -- prism_ioctl / prism_statfs, hence 29 /
 # 48 without the libc symbols; signal() is mlibc's sigaction wrapper,
 # hence 38; the exit path is _exit, syscall 0 never rides a symbol).

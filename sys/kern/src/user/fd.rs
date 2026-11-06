@@ -529,11 +529,11 @@ fn read_zero(buf: u64, len: usize) -> i64 {
 
 /// Deliver a completed console read to user memory.
 fn console_deliver(buf: u64, chunk: &[u8], got: usize) -> i64 {
-    if copy_out(buf, 0, &chunk[..got]) {
-        got as i64
-    } else {
-        -EFAULT
-    }
+    // TEMP instrumentation: locate the burst-typing stall.
+    // crate::kprintln!("[dlv] t={} buf={:#x} got={}", uptime_ms(), buf, got);
+    let r = if copy_out(buf, 0, &chunk[..got]) { got as i64 } else { -EFAULT };
+    // crate::kprintln!("[dlv] -> {}", r);
+    r
 }
 
 fn read_tty(which: tty::Term, desc: &Rc<FileDesc>, buf: u64, len: usize) -> i64 {
@@ -541,15 +541,47 @@ fn read_tty(which: tty::Term, desc: &Rc<FileDesc>, buf: u64, len: usize) -> i64 
     let start = uptime_ms();
     let want = len.min(CHUNK);
     let mut chunk = [0u8; CHUNK];
+    let wname = match which {
+        tty::Term::Console => "console",
+        tty::Term::Serial => "serial",
+    };
+    // crate::kprintln!(
+    //     "[tty] t={} read pid={} {} fd_nonblock={} len={}",
+    //     uptime_ms(),
+    //     process::getpid(),
+    //     wname,
+    //     nonblock,
+    //     len
+    // );
     // The tty's ^C fallback target while we are the parked reader.
     tty::set_reader(which, process::getpid());
+    let mut iters = 0u64;
     loop {
+        // Trace the queue state on the first few iterations, then stale-loop
+        // every 128TH so an unwrap stall is visible without flooding serial.
+        iters += 1;
+        if iters <= 3 || iters % 128 == 0 {
+            let (raw, lines) = tty::queue_depths(which);
+            // crate::kprintln!(
+            //     "[ttyq] iter={} raw={} lines={} hw={}",
+            //     iters, raw, lines, tty::hardware_pending(which)
+            // );
+        }
         // Drain what arrived (echo, line assembly, ISIG) and take one
         // completed piece: a canonical read answers a whole line, a raw
         // read whatever is queued (user/tty.rs, phase 3.3).
         tty::pump_term(which);
+        // crate::kprintln!("[rd] t={} iters={} post-pump", uptime_ms(), iters); // TEMP
         if let Some(got) = tty::take(which, &mut chunk[..want]) {
             tty::set_reader(which, 0);
+            // crate::kprintln!("[rd] post-take got={}", got); // TEMP
+            if got == 0 {
+                // crate::kprintln!(
+                //     "[tty] eof pid={} {} (canon test: line completed empty)",
+                //     process::getpid(),
+                //     wname
+                // );
+            }
             return console_deliver(buf, &chunk, got); // got == 0: the ^D end of file
         }
         if signal::interrupt_pending() {
@@ -568,6 +600,7 @@ fn read_tty(which: tty::Term, desc: &Rc<FileDesc>, buf: u64, len: usize) -> i64 
             tty::set_reader(which, 0);
             return -EAGAIN;
         }
+        // crate::kprintln!("[rd] iters={} parking", iters); // TEMP
         park_once();
     }
 }
@@ -832,6 +865,10 @@ pub fn sys_open(path_p: u64, flags: u64) -> i64 {
             // answer -- the claim is TIOCSCTTY's to make.
             DEV_TTY => {
                 let Some(cur) = process::current() else { return -EFAULT };
+                // crate::kprintln!(
+                //     "[ctty] open /dev/tty pid={} sid={} ctty={}",
+                //     cur.pid, cur.sid, cur.ctty
+                // );
                 match cur.ctty {
                     0 => return -ENXIO,
                     2 => Kind::Serial,
@@ -1124,18 +1161,25 @@ fn put_dev_stat(buf: u64, id: u32, mode: u16) -> i64 {
 // ------------------------------------------------- fcntl (phase 3.1)
 
 /// `fcntl(fd, cmd, arg)` (syscall 27): F_DUPFD (dup at the lowest number
-/// >= arg), the FD_CLOEXEC side of a number (F_GETFD / F_SETFD) and the
-/// O_NONBLOCK / O_APPEND side of the *description* (F_GETFL / F_SETFL --
-/// what every dup of the number shares).  Anything else is -EINVAL.
+/// >= arg) and F_DUPFD_CLOEXEC (the same walk, but the new number arrives
+/// FD_CLOEXEC-marked -- the Linux-specific command, `F_LINUX_SPECIFIC_BASE`
+/// + 6: exactly the one busybox ash saves every fd through, `savefd` in
+/// read_profile, `setjobctl` and the `dup_CLOEXEC` walkers), the FD_CLOEXEC
+/// side of a number (F_GETFD / F_SETFD) and the O_NONBLOCK / O_APPEND side
+/// of the *description* (F_GETFL / F_SETFL -- what every dup of the number
+/// shares).  Anything else is -EINVAL.
 pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
     const F_DUPFD: u64 = 0;
     const F_GETFD: u64 = 1;
     const F_SETFD: u64 = 2;
     const F_GETFL: u64 = 3;
     const F_SETFL: u64 = 4;
+    // The Linux-specific numbering (include/uapi/asm-generic/fcntl.h): one
+    // past the five portable commands, F_LINUX_SPECIFIC_BASE = 1024 + 6.
+    const F_DUPFD_CLOEXEC: u64 = 1030;
     let Some(cur) = process::current() else { return -EFAULT };
     match cmd {
-        F_DUPFD => {
+        F_DUPFD | F_DUPFD_CLOEXEC => {
             if arg >= MAX_FDS as u64 {
                 return -EINVAL;
             }
@@ -1152,6 +1196,13 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
                 return -EMFILE;
             }
             if cur.fds.install_at(n, desc) {
+                // The CLOEXEC half of the pair: F_DUPFD installs plain
+                // (the new number starts without FD_CLOEXEC, POSIX), the
+                // cloexec spelling marks it in the same breath.  The table
+                // owns the mark; the description stays untouched.
+                if cmd == F_DUPFD_CLOEXEC {
+                    cur.fds.set_cloexec(n, true);
+                }
                 n as i64
             } else {
                 -EMFILE
@@ -1322,7 +1373,7 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> i64 {
             } else {
                 -EFAULT
             }
-        }
+            }
         TCSETS | TCSETSW | TCSETSF => {
             let mut t = [0u8; tty::TERMIOS_LEN];
             if !copy_in(arg, 0, &mut t) {
@@ -1332,20 +1383,39 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> i64 {
             0
         }
         TIOCSCTTY => {
-            // The session leader's claim (phase 3.3.4).  POSIX: only a
-            // session leader may make it, and arg 1 is the "steal it from
-            // another session" force nobody here needs yet.
             let Some(cur) = process::current() else { return -EFAULT };
             if cur.sid != cur.pid {
                 return -EPERM;
             }
+
+            let pid = cur.pid;
             let sid = cur.sid;
-            let _ = process::with_pid_mut(cur.pid, |p| p.ctty = term_id);
-            // The claim belongs to the session: every live member of it
-            // resolves /dev/tty to this terminal from here on.
-            for pid in process::session_pids(sid) {
-                let _ = process::with_pid_mut(pid, |p| p.ctty = term_id);
+
+            let _ = process::with_pid_mut(pid, |p| p.ctty = term_id);
+
+            for member_pid in process::session_pids(sid) {
+                let _ = process::with_pid_mut(member_pid, |p| p.ctty = term_id);
             }
+
+            // The getty-shaped anchor: with the claim, the claimer's group
+            // becomes the terminal's foreground group when nobody owns it.
+            // init never calls tcsetpgrp before it spawns the shell, so a
+            // fresh claim is the seat ash's setjobctl reads through
+            // tcgetpgrp -- without this the shell finds 0 != its own group,
+            // sends itself SIGTTIN (no stop-support: the default ignores)
+            // and spins in its "while we are in the background" loop
+            // forever, silent: the 3.4 session never reached its prompt.
+            if tty::fg_pgrp(which) == 0 {
+                tty::set_fg(which, cur.pgid);
+            }
+
+            let current_ctty = process::current().map_or(0, |p| p.ctty);
+
+            // crate::kprintln!(
+            //     "[ctty] claim pid={} sid={} term={} current_ctty={}",
+            //     pid, sid, term_id, current_ctty
+            // );
+
             0
         }
         TIOCGPGRP => {
@@ -1515,6 +1585,197 @@ pub fn sys_readlink(path_p: u64, buf_p: u64, bufsz: u64) -> i64 {
     }
 }
 
+// ------------------------------------- fchdir / fsync / chmod / utimensat
+//                                        (phase 3.4 -- the busybox step)
+//
+// The syscall gaps the BusyBox port found (the roadmap's own words):
+// fchdir, fsync, chmod / fchmod, utimensat -- the calls a shell's cd,
+// a cp that flushes, a chmod / touch and an ls -l of a re-touched file
+// lean on.  All four ride machinery that already existed: the VFS calls
+// (chmod since the kernel shell, sync since the write-back cache, the
+// inode time setters since phase 1.4) only needed their syscall numbers
+// and the fd bridges.
+
+/// The descriptor behind `fd`, or the errno answer for a bad number.
+fn desc_of_or_errno(fd: u64) -> Result<Rc<FileDesc>, i64> {
+    let Some(cur) = process::current() else { return Err(-EFAULT) };
+    match cur.fds.get(fd as usize) {
+        Some(d) => Ok(d),
+        None => Err(-EBADF),
+    }
+}
+
+/// `fchdir(fd)` (syscall 62): the cwd becomes the directory `fd` is open
+/// on.  The path is the one `open` recorded for the description --
+/// absolute, the same walk's answer -- and the directory check goes
+/// through the table (the slot's own fstat), not a second walk; a renamed
+/// directory keeps its recorded spelling, the same trade every
+/// path-holding description here makes.
+pub fn sys_fchdir(fd: u64) -> i64 {
+    let desc = match desc_of_or_errno(fd) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    let Kind::Vfs(slot) = &desc.kind else {
+        return -ENOTDIR; // a pipe / device is nobody's directory
+    };
+    match crate::fs::fsys::vfs().fstat(*slot) {
+        Ok(st) if st.ftype == FileType::Dir => {}
+        Ok(_) => return -ENOTDIR,
+        Err(e) => return -fs_errno(e),
+    }
+    let Some(path) = desc.path.clone() else { return -ENOENT };
+    let Some(cur) = process::current() else { return -EFAULT };
+    cur.cwd = path;
+    0
+}
+
+/// `fsync(fd)` (syscall 63): push the open file's dirty state to the
+/// device.  The block cache is mount-wide (write-back, phase 1.5), so
+/// the flush is the mount's -- what a `sync`-shaped future can lean on
+/// too.  A pipe never had data on a device (-EINVAL, the Linux answer);
+/// the kernel-side devices (consoles, null / zero / full) hold no state
+/// a disk owns, so theirs is an honest 0.
+pub fn sys_fsync(fd: u64) -> i64 {
+    let desc = match desc_of_or_errno(fd) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    match &desc.kind {
+        Kind::Vfs(slot) => {
+            crate::fs::fsys::vfs().fsync_fd(*slot).map_or_else(|e| -fs_errno(e), |_| 0)
+        }
+        Kind::PipeRead(_) | Kind::PipeWrite(_) => -EINVAL,
+        _ => 0,
+    }
+}
+
+/// `chmod(path, mode)` (syscall 64): the permission bits of a file the
+/// walk finds -- the VFS call the kernel shell's `chmod` command already
+/// speaks, on ext4 through the journal, on tmpfs in memory.
+pub fn sys_chmod(path_p: u64, mode: u64) -> i64 {
+    let abs = match user_path(path_p) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    crate::fs::fsys::vfs().chmod(&abs, (mode & 0o7777) as u16).map_or_else(|e| -fs_errno(e), |_| 0)
+}
+
+/// `fchmod(fd, mode)` (syscall 65): the same call through an open file --
+/// the fd bridge to the VFS's chmod, what a `cp -p` or an `install`
+/// uses on the file it just wrote.
+pub fn sys_fchmod(fd: u64, mode: u64) -> i64 {
+    let desc = match desc_of_or_errno(fd) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    let Kind::Vfs(slot) = &desc.kind else {
+        // No inode behind a pipe or a kernel-side device to chmod (devfs
+        // nodes are fixed; phase 3.5 owns permissions for real).
+        return -EINVAL;
+    };
+    crate::fs::fsys::vfs().chmod_fd(*slot, (mode & 0o7777) as u16).map_or_else(|e| -fs_errno(e), |_| 0)
+}
+
+/// `utimensat(dirfd, path, times, flags)` (syscall 68): set atime / mtime
+/// -- what `touch`, `cp -p` and `tar -x` all do.  The POSIX spellings the
+/// port serves:
+///   * `times == NULL` (or every field UTIME_NOW): both times become now;
+///   * `tv_nsec == UTIME_OMIT`: that time keeps its value;
+///   * an empty `path` with a real `dirfd`: futimens() -- the open file
+///     itself takes the pair (mlibc's utimes family lands here);
+///   * `AT_SYMLINK_NOFOLLOW`: the link's own times, not the target's.
+/// The times are second-granular (the inode's precision); anything past
+/// u32 seconds saturates rather than wraps.  Only the AT_FDCWD walk
+/// exists -- the kernel has no *at calls (the sysdeps spell that
+/// honestly), so another dirfd is -EINVAL.
+pub fn sys_utimensat(dirfd: u64, path_p: u64, times_p: u64, flags: u64) -> i64 {
+    const AT_FDCWD: i64 = -100;
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const UTIME_NOW: i64 = (1 << 30) - 1;
+    const UTIME_OMIT: i64 = (1 << 30) - 2;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return -EINVAL;
+    }
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+
+    // The pair to apply: None = keep (UTIME_OMIT), Some(second) = set.
+    // A NULL `times` is "both now" (POSIX), which is also the default.
+    let now = crate::fs::vfs::now() as u64;
+    let mut atime = Some(now);
+    let mut mtime = Some(now);
+    if times_p != 0 {
+        let mut buf = [0u8; 32]; // two struct timespec { tv_sec, tv_nsec }
+        if !copy_in(times_p, 0, &mut buf) {
+            return -EFAULT;
+        }
+        let field = |i: usize, half: usize| {
+            let o = i * 16 + half * 8;
+            i64::from_le_bytes(buf[o..o + 8].try_into().unwrap())
+        };
+        let one = |sec: i64, nsec: i64| -> Result<Option<u64>, i64> {
+            match nsec {
+                UTIME_OMIT => Ok(None),
+                UTIME_NOW => Ok(Some(now)),
+                _ if sec >= 0 && sec <= u32::MAX as i64 => Ok(Some(sec as u64)),
+                _ => Err(-EINVAL), // a negative or > u32-seconds time is refused
+            }
+        };
+        atime = match one(field(0, 0), field(0, 1)) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        mtime = match one(field(1, 0), field(1, 1)) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+    }
+
+    // The fd side (futimens): a NULL or empty path with a real fd.
+    let path = if path_p == 0 {
+        None
+    } else {
+        match user_string(path_p) {
+            Ok(s) => Some(s),
+            Err(e) => return e,
+        }
+    };
+    let by_fd = || -> i64 {
+        let desc = match desc_of_or_errno(dirfd) {
+            Ok(d) => d,
+            Err(e) => return e,
+        };
+        let Kind::Vfs(slot) = &desc.kind else {
+            return -EINVAL; // a pipe / device carries no times to set
+        };
+        crate::fs::fsys::vfs().utimens_fd(*slot, atime, mtime).map_or_else(|e| -fs_errno(e), |_| 0)
+    };
+    match path {
+        // A NULL path with AT_FDCWD is the POSIX -EINVAL; with a real fd
+        // it is futimens() (mlibc also spells futimens as an empty path).
+        None => {
+            if dirfd as i64 == AT_FDCWD {
+                return -EINVAL;
+            }
+            by_fd()
+        }
+        Some(p) if p.is_empty() => {
+            if dirfd as i64 == AT_FDCWD {
+                return -ENOENT; // the empty path is no file, like everywhere
+            }
+            by_fd()
+        }
+        Some(p) => {
+            if dirfd as i64 != AT_FDCWD {
+                return -EINVAL; // no *at walks in this kernel (yet)
+            }
+            let abs = process::abs_current(&p);
+            crate::fs::fsys::vfs().utimens(&abs, follow, atime, mtime).map_or_else(|e| -fs_errno(e), |_| 0)
+        }
+    }
+}
+
 // ------------------------------------------------------- statfs (phase 3.3)
 
 /// The Linux x86-64 `struct statfs` this fills (120 bytes): f_type,
@@ -1661,11 +1922,16 @@ fn wait_deadline(timeout_ms: u64, start: u64) -> u64 {
 /// array -- 8 bytes per entry (int fd, short events, short revents).
 /// POLLIN / POLLOUT follow the readiness probe; POLLERR / POLLHUP /
 /// POLLNVAL are always reported (they are output-only bits).  The call
-/// parks (bounded, like every blocking wait here) until some descriptor is
-/// ready or the timeout expires, then answers the number of entries with a
-/// non-zero revents (0 on timeout), revents written back for every entry.
-/// A negative fd is skipped (POSIX: ignored, revents 0); a closed number
-/// polls POLLNVAL.  Unknown event bits are dropped on the floor.
+/// parks until some descriptor is ready or the timeout expires, then
+/// answers the number of entries with a non-zero revents (0 only on a
+/// *real* timeout -- `timeout_ms >= 0` expired), revents written back for
+/// every entry.  A negative timeout is POSIX "wait until an event occurs":
+/// the house cap bounds one park at a time and re-arms itself, and a
+/// deliverable signal ends the wait with -EINTR (0 answered for a negative
+/// timeout leaked as EOF to busybox ash's `read_key` -- "Timed out",
+/// errno=EAGAIN -- and the session shell exited(0) at its prompt without
+/// one single read).  A negative fd is skipped (POSIX: ignored, revents 0);
+/// a closed number polls POLLNVAL.  Unknown event bits are dropped.
 pub fn sys_poll(fds_p: u64, nfds: u64, timeout_ms: u64) -> i64 {
     let n = nfds as usize;
     if n > MAX_POLLFDS {
@@ -1682,7 +1948,7 @@ pub fn sys_poll(fds_p: u64, nfds: u64, timeout_ms: u64) -> i64 {
         }
     }
     let start = uptime_ms();
-    let deadline = wait_deadline(timeout_ms, start);
+    let mut deadline = wait_deadline(timeout_ms, start);
     let mut revents: Vec<i32> = alloc::vec![0; n];
     loop {
         let mut ready = 0i64;
@@ -1716,7 +1982,7 @@ pub fn sys_poll(fds_p: u64, nfds: u64, timeout_ms: u64) -> i64 {
                 ready += 1;
             }
         }
-        if ready > 0 || uptime_ms() >= deadline {
+        if ready > 0 || (timeout_ms as i64 >= 0 && uptime_ms() >= deadline) {
             // Write the revents back into the array and hand it to the user
             // (fd / events go back as they came -- the ABI leaves them
             // alone, and so do we).
@@ -1727,7 +1993,31 @@ pub fn sys_poll(fds_p: u64, nfds: u64, timeout_ms: u64) -> i64 {
             if n > 0 && !copy_out(fds_p, 0, &buf) {
                 return -EFAULT;
             }
+            // TEMP: the ash exit(0) hunt -- what poll answered and on what.
+            if n > 0 {
+                // crate::kprintln!(
+                //     "[poll] pid={} ready={} fd0_ev={:#x} fd0_re={:#x}",
+                //     process::getpid(),
+                //     ready,
+                //     i16::from_le_bytes(buf[4..6].try_into().unwrap()),
+                //     revents[0]
+                // );
+            }
             return ready;
+        }
+        if signal::interrupt_pending() {
+            // A deliverable signal: poll answers EINTR and the caller
+            // re-enters (busybox's safe_poll does exactly that retry).
+            return -EINTR;
+        }
+        if uptime_ms() >= deadline {
+            // The caller asked `timeout_ms < 0` -- POSIX "wait until an
+            // event occurs", not "you may answer timeout after a cap".  The
+            // house cap only bounds one park at a time: re-arm it and keep
+            // the wait honest.  (A 0 here leaked as EOF to busybox ash's
+            // read_key -- `Timed out`, `errno = EAGAIN` -- and the session
+            // shell exited(0) at its prompt without one single read.)
+            deadline = uptime_ms() + WAIT_MAX_MS;
         }
         park_once();
     }
@@ -1737,12 +2027,15 @@ pub fn sys_poll(fds_p: u64, nfds: u64, timeout_ms: u64) -> i64 {
 /// 3.2; five arguments -- r10 / r8 carry 4 and 5): the classic three
 /// bitsets (fd_set: 1024 bits) plus a `struct timeval`.  Readiness follows
 /// the same probe as poll; exceptfds is accepted and always comes back
-/// empty (nothing exceptional ever happens here).  The call parks (bounded)
-/// until a watched descriptor is ready or the timeout (NULL = forever,
-/// capped; a zero timeval is a single probe) expires; it answers the number
-/// of bits set in the returned sets (0 on timeout), -EBADF when a watched
-/// number is not open (POSIX), -EINVAL for a bad nfds, -EFAULT for bad
-/// pointers.  Bits above nfds are ignored, like everywhere.
+/// empty (nothing exceptional ever happens here).  The call parks until a
+/// watched descriptor is ready or the timeout expires; a NULL timeval is
+/// POSIX "wait until a descriptor is ready" (the same forever-poll rule as
+/// above: the house cap bounds one park at a time and re-arms itself, a
+/// deliverable signal answers -EINTR).  A zero timeval is a single probe.
+/// It answers the number of bits set in the returned sets (0 only on a
+/// real timeout with a *given* timeval), -EBADF when a watched number is
+/// not open (POSIX), -EINVAL for a bad nfds, -EFAULT for bad pointers.
+/// Bits above nfds are ignored, like everywhere.
 pub fn sys_select(nfds: u64, r_p: u64, w_p: u64, e_p: u64, tv_p: u64) -> i64 {
     if nfds as usize > MAX_POLLFDS {
         return -EINVAL;
@@ -1783,7 +2076,7 @@ pub fn sys_select(nfds: u64, r_p: u64, w_p: u64, e_p: u64, tv_p: u64) -> i64 {
     }
     // The deadline: a timeval (NULL = forever), house-capped like above.
     let start = uptime_ms();
-    let deadline = if tv_p == 0 {
+    let mut deadline = if tv_p == 0 {
         start + WAIT_MAX_MS
     } else {
         let got: Result<u64, i64> = {
@@ -1833,7 +2126,7 @@ pub fn sys_select(nfds: u64, r_p: u64, w_p: u64, e_p: u64, tv_p: u64) -> i64 {
             // exceptfds: nothing exceptional ever happens here -- the set
             // comes back empty, which POSIX lets us choose.
         }
-        if count > 0 || uptime_ms() >= deadline {
+        if count > 0 || (tv_p != 0 && uptime_ms() >= deadline) {
             // The modified sets go back (a NULL set pointer stays NULL --
             // nothing to answer into).
             let Some(cur) = process::current() else { return -EFAULT };
@@ -1851,6 +2144,17 @@ pub fn sys_select(nfds: u64, r_p: u64, w_p: u64, e_p: u64, tv_p: u64) -> i64 {
                 }
             }
             return count;
+        }
+        if signal::interrupt_pending() {
+            // A deliverable signal: select answers EINTR (the caller
+            // re-enters -- POSIX).
+            return -EINTR;
+        }
+        if uptime_ms() >= deadline {
+            // The timeval was NULL -- "wait until a descriptor is ready",
+            // not "you may answer timeout after a cap": re-arm the house
+            // cap and keep the park honest (the same forever-poll rule).
+            deadline = uptime_ms() + WAIT_MAX_MS;
         }
         park_once();
     }

@@ -60,6 +60,16 @@
 //    59 setsid()                    60 setpgid(pid, pgid)   61 getpgid(pid)
 //    (a negative kill pid names a group; TIOCSCTTY claims a terminal)
 //
+// Phase 3.4 (the BusyBox step -- the gaps the port revealed):
+//    62 fchdir(fd)                  the directory an fd is open on
+//    63 fsync(fd)                   flush the open file's mount
+//    64 chmod(path, mode)           the permission bits (journal-written)
+//    65 fchmod(fd, mode)            the same, through an open file
+//    66 wait4(pid, &status, flags, &rusage)  wait with the child's rusage
+//    67 getrusage(who, &rusage)     SELF / CHILDREN / THREAD
+//    68 utimensat(dirfd, path, &times[2], flags)  atime / mtime, the
+//                                   UTIME_NOW / UTIME_OMIT pair included
+//
 // `exit` never returns to the caller.  `yield` and `sleep` switch to another
 // process and come back here only when the process is scheduled again (the
 // trap frame stayed on its kernel stack).  `yield` only hands the CPU to a
@@ -236,6 +246,17 @@ fn sys_execve(frame: &mut IsrFrame, path_p: u64, argv_p: u64, envp_p: u64) -> i6
 /// frame on the current process's kernel stack.  `exit` never returns.
 pub extern "C" fn dispatch(frame: &mut IsrFrame) {
     let (a0, a1, a2) = (frame.rdi, frame.rsi, frame.rdx);
+    // TEMP: the ash exit(0) hunt -- every userland syscall trace.
+    
+    // crate::kprintln!(
+    //     "[sc] pid={} nr={} a=({:#x}, {:#x}, {:#x})",
+    //     process::getpid(),
+    //     frame.rax,
+    //     a0,
+    //     a1,
+    //     a2
+    // );
+    
     // r10 / r8 / r9 carry arguments 4..6 (the Linux order; mmap is the
     // only six-argument call so far).
     let ret: i64 = match frame.rax {
@@ -254,7 +275,7 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         7 => sys_execve(frame, a0, a1, a2),
         // ---- phase 2.5 --------------------------------------------------
         8 => process::fork_current(frame),
-        9 => process::wait_current(a0, a1, a2),
+        9 => process::wait_current(a0, a1, a2, 0),
         10 => signal::sys_kill(a0, a1),
         11 => signal::sys_signal(a0, a1),
         12 => {
@@ -321,6 +342,14 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         59 => sysc::sys_setsid(),
         60 => sysc::sys_setpgid(a0, a1),
         61 => sysc::sys_getpgid(a0),
+        // ---- phase 3.4: the busybox gaps --------------------------------
+        62 => fd::sys_fchdir(a0),
+        63 => fd::sys_fsync(a0),
+        64 => fd::sys_chmod(a0, a1),
+        65 => fd::sys_fchmod(a0, a1),
+        66 => process::wait_current(a0, a1, a2, frame.r10),
+        67 => process::sys_getrusage(a0, a1),
+        68 => fd::sys_utimensat(a0, a1, a2, frame.r10),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

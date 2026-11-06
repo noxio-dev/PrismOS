@@ -201,13 +201,19 @@ pub fn pump_term(which: Term) {
     let flags = crate::arch::io::cli_save();
     // SAFETY: interrupts masked; the discipline is single-threaded by this
     // guard (the tick and a read path can never interleave a pop).
+    let mut n = 0usize; // TEMP
     unsafe {
         while let Some(b) = get_input_byte(which) {
             feed(which, b);
+            n += 1; // TEMP
         }
     }
     // SAFETY: flags came from cli_save on this stack.
     unsafe { crate::arch::io::restore_flags(flags) };
+    if n > 0 { // TEMP: locate the burst-typing stall (pump vs take vs copy_out)
+        let w = if matches!(which, Term::Serial) { "ser" } else { "cons" };
+        // crate::kprintln!("[pump] {} n={}", w, n);
+    }
 }
 
 /// One input byte through the discipline (interrupts are masked by the
@@ -492,7 +498,25 @@ pub fn readable(which: Term) -> bool {
     r
 }
 
-/// Record who is parked in a read of `which` (the ^C fallback target).
+/// Queue depths for diagnostics: (raw bytes still in the discipline's
+/// raw queue, canonical lines waiting to be taken).
+pub fn queue_depths(which: Term) -> (usize, usize) {
+    // SAFETY: read-only look under masked interrupts (the read paths
+    // already mask before calling pump/take; diagnostics run inside that
+    // window in practice).  Lock-free: atomics/field loads only.
+    unsafe {
+        let tty = tty_of(which);
+        (tty.raw.len(), tty.lines.len())
+    }
+}
+
+/// Whether the hardware still holds undrained input for `which`.
+pub fn hardware_pending(which: Term) -> usize {
+    match which {
+        Term::Console => crate::hw::kbd::has_char() as usize,
+        Term::Serial => crate::hw::serial::has_byte() as usize,
+    }
+}
 /// The read paths call this on entry and clear it (`0`) on the way out.
 pub fn set_reader(which: Term, pid: u64) {
     // SAFETY: the tty is only touched under masked interrupts; this is an

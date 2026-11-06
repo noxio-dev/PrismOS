@@ -23,6 +23,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/resource.h>
+#include <sys/statfs.h>
+#include <sys/statvfs.h>
 #include <termios.h>
 
 /*-
@@ -30,10 +32,13 @@
  *
  * The PrismOS sysdeps (phase 3.2, step 2): every mlibc tag the kernel has
  * a syscall for, spoken through the raw convention of generic/syscall.cpp.
- * Everything else -- threads / clone, sockets, *at() past AT_FDCWD, rusage
- * accounting, fchmod and friends -- is deliberately absent from the tag
- * list (include/mlibc/sysdeps.hpp), so mlibc's generic layer answers
- * ENOSYS: what the kernel lacks stays ENOSYS, the port's contract.
+ * Everything else -- threads / clone, sockets, *at() beyond AT_FDCWD -- is
+ * deliberately absent from the tag list (include/mlibc/sysdeps.hpp), so
+ * mlibc's generic layer answers ENOSYS: what the kernel lacks stays
+ * ENOSYS, the port's contract.  (Phase 3.4 -- the busybox step -- moved
+ * fchdir / fsync / the chmod pair / utimensat / rusage / the mount pair /
+ * statfs from that "lacks" column to the served one; fchmodat and the
+ * other *at() names stay.)
  *
  * Kernel-side references: sys/kern/src/user/{syscall,fd,sysc,signal,
  * futex,process}.rs.  Layout notes worth remembering while reading:
@@ -522,6 +527,116 @@ int Sysdeps<Chdir>::operator()(const char *path) {
         return 0;
 }
 
+// ---------------------------------------------- the phase 3.4 additions
+// (the busybox step): the gaps the port revealed, spoken the same way.
+
+int Sysdeps<Fchdir>::operator()(int fd) {
+        auto ret = sys(PRISM_SYS_FCHDIR, fd);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<Fsync>::operator()(int fd) {
+        auto ret = sys(PRISM_SYS_FSYNC, fd);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<Fdatasync>::operator()(int fd) {
+        // The kernel has exactly one flush -- the mount's write-back cache
+        // pushed to the device -- so the data-only distinction is not a
+        // promise this disk keeps; the same call answers.
+        auto ret = sys(PRISM_SYS_FSYNC, fd);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<Chmod>::operator()(const char *pathname, mode_t mode) {
+        auto ret = sys(PRISM_SYS_CHMOD, pathname, mode);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<Fchmod>::operator()(int fd, mode_t mode) {
+        auto ret = sys(PRISM_SYS_FCHMOD, fd, mode);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<Utimensat>::operator()(int dirfd, const char *pathname,
+                const struct timespec times[2], int flags) {
+        // One kernel call for both spellings: a path with AT_FDCWD, or an
+        // empty path / NULL with a real fd (futimens -- the utimes family
+        // lands here).  The UTIME_NOW / UTIME_OMIT sentinels travel
+        // verbatim; the kernel reads them off the pair.
+        auto ret = sys(PRISM_SYS_UTIMENSAT, dirfd, pathname, times, flags);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<Mount>::operator()(const char *source, const char *target,
+                const char *fstype, unsigned long flags, const void *data) {
+        // The kernel's mount(2) is the four-argument shape (flags in the
+        // fourth register, MS_RDONLY = 1 the one bit it reads); there is
+        // no per-fs options channel, so `data` has nowhere to go.
+        (void)data;
+        auto ret = sys(PRISM_SYS_MOUNT, source, target, fstype, flags);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<Umount2>::operator()(const char *target, int flags) {
+        // No lazy / force detach on a flush that is already synchronous.
+        (void)flags;
+        auto ret = sys(PRISM_SYS_UMOUNT, target);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<Statfs>::operator()(const char *path, struct statfs *buf) {
+        // The kernel fills the x86-64 Linux layout (120 bytes) the ABI's
+        // abi-bits/statfs.h is -- the same pair fstatfs would need if the
+        // kernel had an fd spelling of it (it does not yet).
+        auto ret = sys(PRISM_SYS_STATFS, path, buf);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<Statvfs>::operator()(const char *path, struct statvfs *out) {
+        /* The kernel speaks statfs(2) (syscall 48, the 120-byte Linux
+         * layout); statvfs is its POSIX twin -- same numbers, fields
+         * re-ordered and re-named, favouring what a `df` wants to print
+         * (busybox's df asks statvfs, the call found by the port).  The
+         * conversion glibc does in its own userspace is done here, so the
+         * kernel keeps exactly one spelling of the call. */
+        struct statfs sfs;
+        auto ret = sys(PRISM_SYS_STATFS, path, &sfs);
+        if(int e = sc_error(ret); e)
+                return e;
+        memset(out, 0, sizeof(*out));
+        out->f_bsize = sfs.f_bsize;
+        out->f_frsize = sfs.f_frsize ? sfs.f_frsize : sfs.f_bsize;
+        out->f_blocks = sfs.f_blocks;
+        out->f_bfree = sfs.f_bfree;
+        out->f_bavail = sfs.f_bavail;
+        out->f_files = sfs.f_files;
+        out->f_ffree = sfs.f_ffree;
+        out->f_favail = sfs.f_ffree; // Linux has no separate "root may use"
+        memcpy(&out->f_fsid, &sfs.f_fsid, sizeof(out->f_fsid));
+        out->f_flag = sfs.f_flags;   // the MS_* bits are the ST_* bits
+        out->f_namemax = sfs.f_namelen;
+        return 0;
+}
+
 int Sysdeps<Mkdir>::operator()(const char *path, mode_t mode) {
         auto ret = sys(PRISM_SYS_MKDIR, path, mode);
         if(int e = sc_error(ret); e)
@@ -534,6 +649,16 @@ int Sysdeps<Rmdir>::operator()(const char *path) {
         if(int e = sc_error(ret); e)
                 return e;
         return 0;
+}
+
+int Sysdeps<Fchownat>::operator()(int dirfd, const char *path,
+                uid_t uid, gid_t gid, int flags) {
+        /* The kernel has no owner changes (chown* absent from its surface):
+         * ENOSYS, like the other absent classes -- and NOT the missing-
+         * sysdep __ensure, which mlibc guarantees from the generic fallback
+         * and which busied the tar extraction with one. */
+        (void)dirfd; (void)path; (void)uid; (void)gid; (void)flags;
+        return ENOSYS;
 }
 
 int Sysdeps<Unlinkat>::operator()(int dirfd, const char *path, int flags) {
@@ -620,6 +745,36 @@ gid_t Sysdeps<GetEgid>::operator()() {
         return static_cast<gid_t>(sys(PRISM_SYS_GETGID));
 }
 
+int Sysdeps<GetGroups>::operator()(size_t size, gid_t *list, int *ret) {
+        /* One group identity per process (phase 3.4, busybox's `id`): the
+         * gid the kernel answers (syscall 51) is the whole supplementary
+         * set a single-user system has.  Answered in userspace -- there is
+         * no getgroups syscall to add for one number, and the count for a
+         * single group is exactly what `id` prints after the gid. */
+        gid_t gid = static_cast<gid_t>(sys(PRISM_SYS_GETGID));
+        if(size == 0) {
+                *ret = 1;
+                return 0;
+        }
+        list[0] = gid;
+        *ret = 1;
+        return 0;
+}
+
+int Sysdeps<Brk>::operator()(void **out) {
+        /* The query half of sbrk (phase 3.4, found by relinking binutils
+         * against the new library): libiberty's xmalloc asks sbrk(0) at
+         * startup to tally its allocations, and the kernel's brk (21)
+         * answers exactly that -- the current break, unchanged.  Growing
+         * through sbrk stays ENOMEM: mlibc's allocator owns the heap
+         * through mmap, and the tag only ever promises the query. */
+        auto ret = sys(PRISM_SYS_BRK, 0);
+        if(int e = sc_error(ret); e)
+                return e;
+        *out = reinterpret_cast<void *>(static_cast<uintptr_t>(ret));
+        return 0;
+}
+
 int Sysdeps<Umask>::operator()(mode_t mode, mode_t *old) {
         auto ret = sys(PRISM_SYS_UMASK, mode);
         if(int e = sc_error(ret); e)
@@ -650,14 +805,27 @@ int Sysdeps<Execve>::operator()(const char *path, char *const argv[], char *cons
 int Sysdeps<Waitpid>::operator()(pid_t pid, int *status, int flags, struct rusage *ru,
                 pid_t *ret_pid) {
         /* pid semantics match: -1 (and 0) wait on any child, a positive pid
-         * on that child; WNOHANG is the flag the kernel knows.  It keeps no
-         * rusage accounting -- wait4() gets honest zeroes. */
-        if(ru)
-                memset(ru, 0, sizeof(struct rusage));
-        auto ret = sys(PRISM_SYS_WAIT, pid, status, flags);
+         * on that child; WNOHANG is the flag the kernel knows.  wait4()
+         * rides the same tag with its rusage pointer -- the kernel's 66
+         * (phase 3.4) fills the child's ru_utime / ru_stime from the PCB's
+         * own user / sys tick pair, and a plain waitpid passes none: two
+         * call sites, not a chosen number, exactly the lstat/stat rule. */
+        auto ret = ru
+                        ? sys(PRISM_SYS_WAIT4, pid, status, flags, ru)
+                        : sys(PRISM_SYS_WAIT, pid, status, flags);
         if(int e = sc_error(ret); e)
                 return e;
         *ret_pid = static_cast<pid_t>(ret);
+        return 0;
+}
+
+int Sysdeps<GetRusage>::operator()(int scope, struct rusage *usage) {
+        /* RUSAGE_SELF / RUSAGE_CHILDREN / RUSAGE_THREAD -- the kernel's 67
+         * answers all three (THREAD is SELF: one process, one thread), the
+         * tick-split pair straight out of the PCB. */
+        auto ret = sys(PRISM_SYS_GETRUSAGE, scope, usage);
+        if(int e = sc_error(ret); e)
+                return e;
         return 0;
 }
 

@@ -92,6 +92,106 @@ pub fn _print(args: fmt::Arguments) {
     }
 }
 
+// ---------------------------------------------- escape sequences / column
+
+/// 0 = normal, 1 = just after ESC, 2 = inside a CSI sequence.
+static mut ESC_STATE: u8 = 0;
+/// First numeric parameter of the CSI sequence under way.
+static mut ESC_PARAM: u32 = 0;
+/// Approximate cursor column, tracked from what ring 3 writes (the
+/// Vga / FbConsole types expose no cursor query, so we follow it here).
+static mut COL: usize = 0;
+
+/// Update the tracked column for one character that reaches the screen.
+fn track_col(ch: char) {
+    // SAFETY: single CPU; output paths are serialized by the callers.
+    let col = unsafe { &mut *addr_of_mut!(COL) };
+    let (cols, _) = text_dims();
+    match ch {
+        '\n' | '\r' => *col = 0,
+        '\x08' => *col = col.saturating_sub(1),
+        '\t' => *col = ((*col + 8) & !7).min(cols.saturating_sub(1)),
+        c => {
+            *col += char_width(c).max(1);
+            if *col >= cols {
+                *col = 0;
+            }
+        }
+    }
+}
+
+fn current_col() -> usize {
+    // SAFETY: single CPU; plain read.
+    unsafe { *addr_of_mut!(COL) }
+}
+
+/// Erase from the cursor to the end of the line, cursor stays put: spaces
+/// over the rest of the line, then the same number of backspaces.  The very
+/// last cell of the line is left alone (writing it would wrap the cursor).
+fn erase_eol(emit: &mut dyn FnMut(char)) {
+    let (cols, _) = text_dims();
+    let n = cols.saturating_sub(current_col() + 1);
+    for _ in 0..n {
+        emit(' ');
+    }
+    for _ in 0..n {
+        emit('\x08');
+    }
+}
+
+/// Interprets the few CSI sequences we can honour: `ESC[nD` (cursor left),
+/// `ESC[K` / `ESC[J` (erase to end of line).  Everything else is swallowed.
+/// `emit` prints one character the way the caller does.  Returns true when
+/// `ch` was consumed by the sequence.
+fn eat_escape(ch: char, emit: &mut dyn FnMut(char)) -> bool {
+    // SAFETY: single CPU; output paths are serialized by the callers.
+    let (st, param) = unsafe { (&mut *addr_of_mut!(ESC_STATE), &mut *addr_of_mut!(ESC_PARAM)) };
+    match *st {
+        0 => {
+            if ch == '\x1b' {
+                *st = 1;
+                true
+            } else {
+                false
+            }
+        }
+        1 => {
+            if ch == '[' {
+                *st = 2;
+                *param = 0;
+                true
+            } else {
+                *st = 0; // lone ESC: drop it, the next char prints normally
+                false
+            }
+        }
+        _ => {
+            if let Some(d) = ch.to_digit(10) {
+                *param = param.saturating_mul(10).saturating_add(d).min(500);
+            } else if ('\u{40}'..='\u{7e}').contains(&ch) {
+                *st = 0;
+                let n = (*param).max(1);
+                match ch {
+                    'D' => {
+                        for _ in 0..n.min(current_col() as u32) {
+                            emit('\x08');
+                        }
+                    }
+                    'K' | 'J' => erase_eol(emit),
+                    _ => {}
+                }
+            }
+            true
+        }
+    }
+}
+
+/// Print one char on screen *and* serial (the /dev/console path).
+fn emit_tee(c: char) {
+    track_col(c);
+    crate::kprint!("{}", c);
+}
+
 /// Fixed-capacity formatting target for the console tee (1 KiB, no alloc).
 struct LogBuf {
     buf: [u8; 1024],
@@ -100,10 +200,12 @@ struct LogBuf {
 
 /// Print raw bytes on the console (phase 2.6): every write to the console
 /// device -- fd 1 / fd 2 of a process, `/dev/console`, -- funnels here.
-/// Valid UTF-8 goes through as is; control characters (other than newline /
-/// tab) and invalid sequences print as '?', so a user program cannot inject
-/// terminal escapes into the console.  Incomplete multi-byte sequences are
-/// decoded across the chunk boundaries the callers copy with.
+/// Valid UTF-8 goes through as is; backspace, newline and tab are kept,
+/// `\r` returns to the start of the line, a few CSI sequences are honoured
+/// (see eat_escape); other control characters and invalid sequences print
+/// as '?', so a user program cannot inject terminal escapes into the
+/// console.  Incomplete multi-byte sequences are decoded across the chunk
+/// boundaries the callers copy with.
 pub fn write_bytes(mut b: &[u8]) {
     while !b.is_empty() {
         let (valid, skip, bad) = match core::str::from_utf8(b) {
@@ -116,14 +218,21 @@ pub fn write_bytes(mut b: &[u8]) {
             }
         };
         for ch in valid.chars() {
-            if ch.is_control() && ch != '\n' && ch != '\t' {
-                crate::kprint!("?");
-            } else {
-                crate::kprint!("{}", ch);
+            if eat_escape(ch, &mut emit_tee) {
+                continue;
+            }
+            match ch {
+                '\r' => {
+                    for _ in 0..current_col() {
+                        emit_tee('\x08');
+                    }
+                }
+                c if c.is_control() && c != '\n' && c != '\t' && c != '\x08' => emit_tee('?'),
+                c => emit_tee(c),
             }
         }
         if bad {
-            crate::kprint!("?");
+            emit_tee('?');
         }
         b = &b[skip.min(b.len())..];
     }
@@ -146,6 +255,15 @@ pub fn write_local(mut b: &[u8]) {
             }
         };
         for ch in valid.chars() {
+            if eat_escape(ch, &mut local_char) {
+                continue;
+            }
+            if ch == '\r' {
+                for _ in 0..current_col() {
+                    local_char('\x08');
+                }
+                continue;
+            }
             local_char(ch);
         }
         if bad {
@@ -166,6 +284,7 @@ fn local_char(mut ch: char) {
     if ch.is_control() && ch != '\n' && ch != '\t' && ch != '\x08' {
         ch = '?';
     }
+    track_col(ch);
     if let Some(v) = c.vga.as_mut() {
         v.put_char(ch);
     }
@@ -234,6 +353,8 @@ pub fn clear() {
         f.clear();
         f.flush();
     }
+    // SAFETY: single CPU; the cursor is back at the origin.
+    unsafe { *addr_of_mut!(COL) = 0 };
 }
 
 /// Put the text cursor back at the top-left corner without erasing the
@@ -248,6 +369,8 @@ pub fn home() {
     if let Some(f) = c.fb.as_mut() {
         f.home();
     }
+    // SAFETY: single CPU; the cursor is back at the origin.
+    unsafe { *addr_of_mut!(COL) = 0 };
 }
 
 /// Switch the framebuffer console to a RAM back buffer.  Needs the PMM and

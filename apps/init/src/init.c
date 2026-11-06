@@ -9,13 +9,19 @@
  *
  *   * the mounts -- /proc and /tmp are pid 1's to set up, like on every
  *     real unix (the kernel keeps / and /dev, the devtmpfs split;
- *     mount(2) through prism_raw.h, phase 3.3.7);
+ *     mount(2) through the libc since phase 3.4: the mount pair moved
+ *     from prism_raw.h into mlibc's linux option with the busybox
+ *     step);
  *   * a shell per terminal, always -- one on the console (/dev/tty0)
  *     and, when the boot probe found a UART, a getty on /dev/ttyS0
  *     (phase 3.3.5: the serial line is a terminal of its own now, the
- *     one the headless machines and the boot tests talk to).  Both
- *     come back when they exit, crash, or take a signal they cannot
- *     refuse (a ^D at the prompt, the respawn loop is blind to why);
+ *     one the headless machines and the boot tests talk to).  Since
+ *     3.4.5 the shell is /usr/bin/sh -- the busybox symlink, ash --
+ *     started as a *login* shell (argv[0] = "-sh", the classic getty
+ *     spelling) so it reads /etc/profile: the PATH and the prompt the
+ *     whole session inherits.  Both come back when they exit, crash,
+ *     or take a signal they cannot refuse (a ^D at the prompt, the
+ *     respawn loop is blind to why);
  *   * the reaping -- waitpid(-1) collects the shells, their orphaned
  *     grandchildren (the kernel re-parents them here, like every
  *     unix) and anything else that dies alone;
@@ -23,9 +29,9 @@
  *     foreground child, not for the session), and nothing here reads
  *     the terminals: the shells own them.
  *
- * Deliberately not here yet (the roadmap's 3.4 step): /etc/inittab
- * parsing, runlevels, a shutdown protocol -- busybox init brings all
- * of that.  This is the honest minimum a pid 1 must be.
+ * Deliberately not here yet: /etc/inittab parsing, runlevels, a
+ * shutdown protocol -- busybox init brings all of that, and this file
+ * is not it.  This is the honest minimum a pid 1 must be.
  */
 
 #include <errno.h>
@@ -34,10 +40,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
-#include "prism_raw.h"
+#include <sys/ioctl.h>
 
 #define SHELL "/usr/bin/sh"
 
@@ -53,21 +59,28 @@ static char *const envp[] = {
 };
 
 /* One mount pid 1 makes at a time.  EBUSY (already mounted) is fine --
- * the rescue path or a restart may have been there first. */
+ * the rescue path or a restart may have been there first.  Since phase
+ * 3.4 this is mlibc's mount(2) -- the linux option's own call, the pair
+ * the busybox `mount` applet speaks too; the raw prism_raw.h spelling
+ * is /sbin/init's history. */
 static void mount_one(const char *path, const char *type, int rdonly)
 {
-        long r = prism_mount("none", path, type, rdonly ? 1UL : 0UL);
-        if (r == 0)
+        unsigned long flags = rdonly ? MS_RDONLY : 0;
+        if (mount("none", path, type, flags, NULL) == 0)
                 printf("init: %s mounted (%s%s)\n", path, type,
                         rdonly ? ", read-only" : "");
-        else if (r == -16) /* EBUSY */
+        else if (errno == EBUSY)
                 printf("init: %s already mounted\n", path);
         else
-                printf("init: cannot mount %s: %s\n", path, strerror((int)-r));
+                printf("init: cannot mount %s: %s\n", path, strerror(errno));
 }
 
 /* fork + exec the shell with its standard trio on `tty` -- the getty
- * shape: the child owns the terminal from its very first printf. */
+ * shape: the child owns the terminal from its very first printf.  The
+ * argv[0] spelling is the login-shell one ("-sh"): busybox ash reads
+ * /etc/profile for it -- the PATH and the PS1 the session lives with
+ * (phase 3.4.5; apps/sh stays installed as /usr/bin/minish, the rig
+ * the 3.3 scenarios ran on). */
 static pid_t spawn_shell(const char *tty)
 {
         pid_t pid = fork();
@@ -77,24 +90,42 @@ static pid_t spawn_shell(const char *tty)
                 return -1;
         }
         if (pid == 0) {
-                /* The child: back to signal defaults, then the terminal,
-                 * then the shell.  execve would reset the caught ones
-                 * anyway; this keeps the failed-exec path honest too. */
                 signal(SIGINT, SIG_DFL);
                 signal(SIGQUIT, SIG_DFL);
                 signal(SIGTERM, SIG_DFL);
                 signal(SIGHUP, SIG_DFL);
+
+                if (setsid() < 0) {
+                        dprintf(2, "init: setsid: %s\n", strerror(errno));
+                        _exit(126);
+                }
+
                 int fd = open(tty, O_RDWR);
-                if (fd < 0)
-                        _exit(126); /* no terminal, no session */
-                dup2(fd, 0);
-                dup2(fd, 1);
-                dup2(fd, 2);
+                if (fd < 0) {
+                        dprintf(2, "init: open %s: %s\n", tty, strerror(errno));
+                        _exit(126);
+                }
+
+                if (ioctl(fd, TIOCSCTTY, 0) < 0) {
+                        dprintf(2, "init: TIOCSCTTY: %s\n", strerror(errno));
+                        _exit(126);
+                }
+
+                for (int i = 0; i < 3; i++) {
+                        if (dup2(fd, i) < 0) {
+                                dprintf(2, "init: dup2(%d): %s\n", i, strerror(errno));
+                                _exit(126);
+                        }
+                }
+
                 if (fd > 2)
                         close(fd);
-                char *argv[] = { (char *)SHELL, NULL };
+
+                char *argv[] = {(char *)"-sh", NULL};
                 execve(SHELL, argv, envp);
-                _exit(127); /* not reached on success */
+
+                dprintf(2, "init: execve: %s\n", strerror(errno));
+                _exit(127);
         }
         return pid;
 }

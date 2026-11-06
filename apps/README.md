@@ -8,10 +8,12 @@ the builder.  Eight packages live here: `hello`, `fork`, `fd`, `posix`
 scenario: setsid, setpgid, `kill(-pgrp)`, lstat on a symlink), `cube`
 (the kernel's spinning cube), `tmpfs` (the phase 3.3 RAM file system,
 exercised from ring 3), `init` (the session keeper the kernel starts as
-pid 1: it mounts `/proc` and `/tmp`, then respawns a shell on the
-console and a getty on `/dev/ttyS0`) and `sh` (the shell each of those
-terminals gets: builtins, PATH exec, and the session / foreground-group
-setup of 3.3.4 before its first prompt).
+pid 1: it mounts `/proc` and `/tmp` through mlibc's `mount(2)` since
+phase 3.4, then respawns a login shell on the console and a getty on
+`/dev/ttyS0`) and `sh` (the bootstrap shell, installed as
+`/usr/bin/minish` since phase 3.4.5 — busybox ash owns `/usr/bin/sh`
+now, and this stays the test rig the 3.3 scenarios ran on: builtins,
+PATH exec, and the session / foreground-group setup of 3.3.4).
 
 ## The five-minute tour
 
@@ -24,8 +26,9 @@ prism$ demo
 hello from demo (uptime 1437 ms)
 ```
 
-(The session prompt is `prism$ ` now — init + the userland shell own
-the console; the kernel shell's `prism# ` is the rescue mode,
+(The session prompt is `prism$ ` still — init + busybox ash own the
+console since phase 3.4, and the prompt comes from `/etc/profile`; the
+kernel shell's `prism# ` is the rescue mode,
 `kernel_options="init=kshell"` in loader.conf.)
 
 No Makefile wiring, no editing anywhere else: drop a directory with a

@@ -16,6 +16,26 @@ sysdep_supported_options = {
         # follows it now.  Found by the binutils port: the utilities call
         # getopt_long, mlibc answers it only with this option on.
         'glibc': true,
+        # The linux option (phase 3.4): the busybox step.  mount(2) /
+        # umount(2), statfs(2) and the mntent family live behind it
+        # (options/linux/generic/{sys-mount,sys-statfs,mntent}.cpp), and
+        # they are the calls the busybox `mount` / `df` applets parse their
+        # flags through -- the sysdeps.hpp comment promised the tags "stay
+        # raw through prism_raw.h until that option lands with the busybox
+        # step"; this is that step.  The kernel serves the three syscalls
+        # (48 / 55 / 56) already; the tags joined them.  The option also
+        # needs the kernel UAPI headers mlibc's own sysdep-signatures
+        # includes (<linux/capability.h>): the twenty-two-header closure
+        # the port carries in ../linux-headers, passed as
+        # -Dlinux_kernel_headers by the build scripts.
+        'linux': true,
+        # The BSD option rides along (managarm's own arrangement): the
+        # linux option's utmp.cpp includes <utmp.h>, and that header lives
+        # in options/bsd -- one option cannot build without the other.
+        # The five files it adds (ether, pty, nameser constants, ...) all
+        # speak through sysdep_or_enosys: what the kernel lacks stays
+        # ENOSYS, the port's contract holds.
+        'bsd': true,
 }
 
 # The kernel's ELF loader links statically, full stop: it refuses DT_JMPREL

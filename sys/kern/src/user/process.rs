@@ -104,6 +104,7 @@ pub const MAX_SLEEP_MS: u64 = 10_000;
 pub const NO_WATCHDOG: u64 = u64::MAX;
 
 const EFAULT: i64 = 14;
+const EINVAL: i64 = 22;
 const ECHILD: i64 = 10;
 const ENOMEM: i64 = 12;
 
@@ -250,6 +251,16 @@ pub struct Process {
     slice_left: u32,
     /// CPU ticks charged so far (only while running).
     pub used: u64,
+    /// The user half of those ticks (phase 3.4): the ones the timer took
+    /// while the process was in ring 3 -- rusage's ru_utime.
+    pub user_used: u64,
+    /// The system half (phase 3.4): ticks taken inside the kernel on the
+    /// process's behalf (a syscall doing I/O) -- ru_stime.
+    pub sys_used: u64,
+    /// rusage of reaped children (phase 3.4): each wait4/wait adds the
+    /// child's own pair plus what its children left it -- RUSAGE_CHILDREN.
+    pub child_user: u64,
+    pub child_sys: u64,
     /// Watchdog: CPU ticks the process may use in total.
     budget: u64,
     /// Tick at which a sleeping process becomes ready again.
@@ -529,6 +540,10 @@ fn spawn_common(
         prio,
         slice_left: SLICE_TICKS,
         used: 0,
+        user_used: 0,
+        sys_used: 0,
+        child_user: 0,
+        child_sys: 0,
         budget: if timeout_ticks == 0 { DEFAULT_TIMEOUT_TICKS } else { timeout_ticks },
         wake_at: 0,
         switches: 0,
@@ -775,13 +790,17 @@ fn drop_reaped(p: Box<Process>) {
     drop(p);
 }
 
-/// `wait(pid, status_ptr, flags)` (syscall 9): reap a child.  `pid` is a
+/// `wait(pid, status_ptr, flags)` (syscall 9) and `wait4(pid, status_ptr,
+/// flags, rusage_ptr)` (syscall 66, phase 3.4): reap a child.  `pid` is a
 /// child pid, or 0 / (u64)-1 for "any child"; `flags` & 1 is WNOHANG.
 /// Blocks (State::Waiting, woken by the child's death) when children exist
 /// but none has died yet.  Returns the reaped pid, 0 for WNOHANG with a
 /// living child, -ECHILD with no matching child, -EFAULT for an unwritable
-/// status word.
-pub fn wait_current(pid_arg: u64, status_ptr: u64, flags: u64) -> i64 {
+/// status word.  A non-zero `rusage_ptr` (wait4) receives the child's
+/// ru_utime / ru_stime -- its own CPU plus everything its own children
+/// left it -- and the caller's RUSAGE_CHILDREN grows by the same pair,
+/// the way getrusage reports it.
+pub fn wait_current(pid_arg: u64, status_ptr: u64, flags: u64, rusage_ptr: u64) -> i64 {
     let Some(cur0) = current() else { return -EFAULT };
     let me = cur0.pid;
     drop(cur0);
@@ -865,10 +884,101 @@ pub fn wait_current(pid_arg: u64, status_ptr: u64, flags: u64) -> i64 {
             }
         }
         if let Some(p) = removed {
+            // The rusage the child leaves behind (phase 3.4): its own pair
+            // plus its reaped children's -- what wait4 reports and what the
+            // parent's RUSAGE_CHILDREN accumulates, the POSIX shape.  The
+            // switch counters go with it (taken before the reap frees it).
+            let (cu, cs, csw, civ) = (
+                p.user_used.wrapping_add(p.child_user),
+                p.sys_used.wrapping_add(p.child_sys),
+                p.switches,
+                p.preempts,
+            );
             drop_reaped(p);
+            // SAFETY: syscall context, IF=0, we are CURRENT.
+            unsafe {
+                let cur = CURRENT;
+                (*cur).child_user += cu;
+                (*cur).child_sys += cs;
+            }
+            if rusage_ptr != 0 {
+                let Some(cur) = current() else { return -EFAULT };
+                let Some(aspace) = cur.aspace.as_ref() else { return -EFAULT };
+                if !aspace.ensure_writable(rusage_ptr) {
+                    return -EFAULT;
+                }
+                let ru = rusage_bytes(cu, cs, csw, civ);
+                if !aspace.write(rusage_ptr, &ru, false) {
+                    return -EFAULT;
+                }
+            }
         }
         return zpid as i64;
     }
+}
+
+// ------------------------------------------------------------- rusage
+
+/// One tick is 10 ms (pit::HZ = 100): a tick count becomes the timeval
+/// pair rusage reports.
+fn ticks_to_timeval(ticks: u64) -> (u64, u64) {
+    (ticks / 100, (ticks % 100) * 10_000)
+}
+
+/// The Linux x86-64 `struct rusage` (144 bytes): ru_utime / ru_stime as
+/// two struct timeval, then fourteen `long` counters -- ru_maxrss and the
+/// twelve the kernel has no story for yet (zero), plus ru_nvcsw /
+/// ru_nivcsw which the PCB's own switches / preempts answer honestly.
+fn rusage_bytes(user: u64, sys: u64, vcsw: u64, ivcsw: u64) -> Vec<u8> {
+    let (ut, uu) = ticks_to_timeval(user);
+    let (st, su) = ticks_to_timeval(sys);
+    let mut w: Vec<u8> = Vec::new();
+    let mut push = |v: u64| w.extend_from_slice(&v.to_le_bytes());
+    push(ut);        // ru_utime.tv_sec
+    push(uu);        // ru_utime.tv_usec
+    push(st);        // ru_stime.tv_sec
+    push(su);        // ru_stime.tv_usec
+    push(0);         // ru_maxrss (no RSS accounting yet)
+    push(0);         // ru_ixrss
+    push(0);         // ru_idrss
+    push(0);         // ru_isrss
+    push(0);         // ru_minflt
+    push(0);         // ru_majflt
+    push(0);         // ru_nswap
+    push(0);         // ru_inblock
+    push(0);         // ru_oublock
+    push(0);         // ru_msgsnd
+    push(0);         // ru_msgrcv
+    push(0);         // ru_nsignals
+    push(vcsw);      // ru_nvcsw -- times the process was given the CPU
+    push(ivcsw);     // ru_nivcsw -- times the tick took it away
+    debug_assert_eq!(w.len(), 144);
+    w
+}
+
+/// `getrusage(who, &rusage)` (syscall 67, phase 3.4): RUSAGE_SELF (0) is
+/// the caller's own pair, RUSAGE_CHILDREN (-1) what its reaped children
+/// accumulated; RUSAGE_THREAD (1) is SELF -- one process, one thread.
+/// Anything else is -EINVAL.
+pub fn sys_getrusage(who: u64, buf: u64) -> i64 {
+    const RUSAGE_SELF: i64 = 0;
+    const RUSAGE_CHILDREN: i64 = -1;
+    const RUSAGE_THREAD: i64 = 1;
+    let (user, sys, vcsw, ivcsw) = {
+        let Some(cur) = current() else { return -EFAULT };
+        match who as i64 {
+            RUSAGE_SELF | RUSAGE_THREAD => (cur.user_used, cur.sys_used, cur.switches, cur.preempts),
+            RUSAGE_CHILDREN => (cur.child_user, cur.child_sys, 0, 0),
+            _ => return -EINVAL,
+        }
+    };
+    let ru = rusage_bytes(user, sys, vcsw, ivcsw);
+    let Some(cur) = current() else { return -EFAULT };
+    let Some(aspace) = cur.aspace.as_ref() else { return -EFAULT };
+    if !aspace.ensure_writable(buf) || !aspace.write(buf, &ru, false) {
+        return -EFAULT;
+    }
+    0
 }
 
 // ----------------------------------------------------------- context switch
@@ -1238,6 +1348,10 @@ pub fn exit_current(outcome: Outcome) -> ! {
         let pid = (*cur).pid;
         {
             let p = &mut *cur;
+            // crate::kprintln!(
+            //     "[exit] pid={} outcome={:?} (used {} user {} sys {})",
+            //     pid, outcome, p.used, p.user_used, p.sys_used
+            // );
             zombify_common(p, outcome);
         }
         after_death(pid);
@@ -1458,6 +1572,14 @@ pub fn on_tick(from_user: bool) {
             return; // the shell or the idle loop was interrupted
         }
         (*cur).used += 1;
+        // The rusage split (phase 3.4): the tick knows which side of the
+        // ring boundary it caught the process on -- user ticks are
+        // ru_utime, kernel ones ru_stime, exactly the shape wait4 reports.
+        if from_user {
+            (*cur).user_used += 1;
+        } else {
+            (*cur).sys_used += 1;
+        }
         if (*cur).aspace.is_some() && (*cur).used >= (*cur).budget {
             exit_current(Outcome::Timeout);
         }

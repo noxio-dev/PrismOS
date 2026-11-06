@@ -77,6 +77,15 @@ MPFR_VER=${MPFR_VER:-4.2.1}
 MPC_VER=${MPC_VER:-1.3.1}
 STAGE=all
 
+# The Linux UAPI set the port carries (phase 3.4), installed beside
+# mlibc's own headers -- see ports/mlibc/linux-headers/PROVENANCE.txt.
+install_uapi() {
+        mkdir -p "$SYSROOT/usr/include"
+        cp -r "$REPO/ports/mlibc/linux-headers/linux" "$SYSROOT/usr/include/"
+        cp -r "$REPO/ports/mlibc/linux-headers/asm" "$SYSROOT/usr/include/"
+        cp -r "$REPO/ports/mlibc/linux-headers/asm-generic" "$SYSROOT/usr/include/"
+}
+
 while [ $# -gt 0 ]; do
         case "$1" in
         --prefix) PREFIX=$2; SYSROOT=$2/x86_64-prismos; shift 2 ;;
@@ -202,9 +211,11 @@ do_mlibc() {
                 --cross-file "$REPO/ports/toolchain/cross.txt" \
                 --prefix=/usr \
                 -Ddefault_library=static -Dbuild_tests=false \
+                -Dlinux_kernel_headers="$REPO/ports/mlibc/linux-headers" \
                 >/dev/null
         ninja -C "$REPO/build/mlibc-cross" -j "$JOBS"
         meson install -C "$REPO/build/mlibc-cross" --destdir "$SYSROOT" >/dev/null
+        install_uapi
         say mlibc "libc.a + crt objects (cross-built) in $SYSROOT/usr/lib"
 }
 
@@ -235,9 +246,11 @@ do_dynlib() {
                 --cross-file "$REPO/ports/toolchain/cross.txt" \
                 --prefix=/usr \
                 -Ddefault_library=both -Dbuild_tests=false \
+                -Dlinux_kernel_headers="$REPO/ports/mlibc/linux-headers" \
                 >/dev/null
         ninja -C "$REPO/build/mlibc-shared" -j "$JOBS"
         meson install -C "$REPO/build/mlibc-shared" --destdir "$SYSROOT" >/dev/null
+        install_uapi
         say dynlib "libc.so + ld.so (cross-built) in $SYSROOT/usr/lib"
 }
 

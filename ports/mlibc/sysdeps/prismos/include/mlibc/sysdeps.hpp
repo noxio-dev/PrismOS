@@ -8,7 +8,7 @@
  * The PrismOS sysdeps tag set (phase 3.2, step 2): every tag the kernel has
  * a syscall for.  A tag absent from this list is *missing on purpose* --
  * mlibc's generic layer then answers ENOSYS (pthread_create, sockets,
- * *at() beyond AT_FDCWD, rusage, ...) -- which is the port's contract:
+ * *at() beyond AT_FDCWD, ...) -- which is the port's contract:
  * what the kernel lacks stays ENOSYS.
  */
 
@@ -91,7 +91,37 @@ struct PrismOSSysdepTags :
          * (lstat rides on the Stat tag's AT_SYMLINK_NOFOLLOW flag). */
         SetSid,
         SetPgid,
-        GetPgid
+        GetPgid,
+
+        GetGroups,
+
+        /* the query half of sbrk: libiberty's xmalloc asks sbrk(0) at
+         * startup (its allocation tally), and the kernel's brk (21)
+         * answers the current break -- found by relinking binutils
+         * against the phase 3.4 library. */
+        Brk,
+
+        /* the phase 3.4 step (the busybox port): the syscall gaps the
+         * shell and its applets found -- fchdir for cd, fsync for a cp
+         * that flushes, the chmod pair, utimensat for touch / cp -p /
+         * tar, wait4's rusage (and getrusage behind it), and the mount
+         * pair + statfs the linux option carries: the tags stay raw
+         * through prism_raw.h no longer, busybox's own applets are the
+         * libc's callers now.  (Fdatasync rides Fsync: the kernel has
+         * one flush; fchmodat and the other *at() names stay absent --
+         * ENOSYS, the port's contract.) */
+        Fchdir,
+        Fsync,
+        Fdatasync,
+        Chmod,
+        Fchmod,
+        Fchownat,
+        Utimensat,
+        GetRusage,
+        Mount,
+        Umount2,
+        Statfs,
+        Statvfs
 {};
 
 struct SysdepTraits {

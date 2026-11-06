@@ -200,6 +200,14 @@ pub trait FileSystem {
     fn chmod(&mut self, _ino: u64, _mode: u16) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
+    /// utimensat's payload (phase 3.4): set atime / mtime.  `None` keeps
+    /// the time (UTIME_OMIT), `Some(t)` sets it to that second -- the inode
+    /// times are second-granular, a nanosecond tail is not stored.  The
+    /// sentinel resolution (UTIME_NOW / UTIME_OMIT, a NULL `times`) is the
+    /// syscall layer's, before the walk.
+    fn utimens(&mut self, _ino: u64, _atime: Option<u64>, _mtime: Option<u64>) -> FsResult<()> {
+        Err(FsError::ReadOnly)
+    }
     /// fallocate-style preallocation: allocate unwritten blocks for
     /// [start, start+len) without writing data; the file size grows past
     /// EOF unless `keep_size` (phase 1.5).
@@ -709,6 +717,15 @@ impl Vfs {
         self.mounts[mi].fs.chmod(ino, mode)
     }
 
+    /// utimensat(2) by path (phase 3.4): `follow` is the AT_SYMLINK_NOFOLLOW
+    /// side (false = the link itself is the file whose times change).
+    pub fn utimens(&mut self, path: &str, follow: bool, atime: Option<u64>, mtime: Option<u64>) -> FsResult<()> {
+        Self::check_len(path)?;
+        let p = normalize("/", path);
+        let (mi, ino) = self.walk(&p, follow)?;
+        self.mounts[mi].fs.utimens(ino, atime, mtime)
+    }
+
     /// Preallocate blocks for [start, start + len) of `path`.
     pub fn fallocate(&mut self, path: &str, start: u64, len: u64, keep_size: bool) -> FsResult<()> {
         let p = normalize("/", path);
@@ -912,6 +929,35 @@ impl Vfs {
         let (mid, ino) = (f.mount, f.ino);
         let mi = self.mount_index(mid)?;
         self.mounts[mi].fs.truncate(ino, size)
+    }
+
+    /// fchmod(2) by descriptor (phase 3.4): the open file's own inode --
+    /// the fd bridge to the same call `chmod` makes by path.
+    pub fn chmod_fd(&mut self, fd: usize, mode: u16) -> FsResult<()> {
+        let f = self.file(fd)?;
+        let (mid, ino) = (f.mount, f.ino);
+        let mi = self.mount_index(mid)?;
+        self.mounts[mi].fs.chmod(ino, mode)
+    }
+
+    /// utimensat / futimens by descriptor (phase 3.4): the open file's
+    /// inode takes the pair.
+    pub fn utimens_fd(&mut self, fd: usize, atime: Option<u64>, mtime: Option<u64>) -> FsResult<()> {
+        let f = self.file(fd)?;
+        let (mid, ino) = (f.mount, f.ino);
+        let mi = self.mount_index(mid)?;
+        self.mounts[mi].fs.utimens(ino, atime, mtime)
+    }
+
+    /// fsync(2) by descriptor (phase 3.4): push the open file's dirty
+    /// state to the device.  The block cache is mount-wide (write-back,
+    /// phase 1.5), so the flush is the mount's -- the honest answer for a
+    /// file sync on a system whose dirty data lives in one page cache.
+    pub fn fsync_fd(&mut self, fd: usize) -> FsResult<()> {
+        let f = self.file(fd)?;
+        let mid = f.mount;
+        let mi = self.mount_index(mid)?;
+        self.mounts[mi].fs.sync()
     }
 
     /// Number of descriptors currently open.

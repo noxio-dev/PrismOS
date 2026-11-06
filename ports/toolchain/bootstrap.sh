@@ -61,6 +61,19 @@ JOBS=$(nproc 2>/dev/null || echo 2)
 [ "$JOBS" -gt 8 ] && JOBS=8
 STAGE=all
 
+# The Linux UAPI set the port carries (phase 3.4): installed into the
+# sysroot beside mlibc's own headers, the way a real cross toolchain ships
+# kernel headers -- what mlibc's glibc-option <sys/ioctl.h> (with the linux
+# option on) and every <linux/*.h> an app includes resolve against.
+# ports/mlibc/linux-headers/PROVENANCE.txt says what it is and why it is
+# exactly this small.
+install_uapi() {
+        mkdir -p "$SYSROOT/usr/include"
+        cp -r "$REPO/ports/mlibc/linux-headers/linux" "$SYSROOT/usr/include/"
+        cp -r "$REPO/ports/mlibc/linux-headers/asm" "$SYSROOT/usr/include/"
+        cp -r "$REPO/ports/mlibc/linux-headers/asm-generic" "$SYSROOT/usr/include/"
+}
+
 while [ $# -gt 0 ]; do
         case "$1" in
         --mlibc)  MLIBC=$2; shift 2 ;;
@@ -152,9 +165,11 @@ do_headers() {
                 --cross-file "$REPO/ports/toolchain/cross.txt" \
                 --prefix=/usr \
                 -Dheaders_only=true -Ddefault_library=static -Dbuild_tests=false \
+                -Dlinux_kernel_headers="$REPO/ports/mlibc/linux-headers" \
                 >/dev/null
         ninja -C "$REPO/build/mlibc-headers"
         meson install -C "$REPO/build/mlibc-headers" --destdir "$SYSROOT" >/dev/null
+        install_uapi
         say headers "sysroot headers in $SYSROOT/usr/include"
 }
 
@@ -165,14 +180,16 @@ do_headers() {
 do_library() {
         do_mlibc
         rm -rf "$REPO/build/mlibc-full"
-        say library "meson setup (ansi + posix, static)"
+        say library "meson setup (ansi + posix + linux, static)"
         meson setup "$REPO/build/mlibc-full" "$MLIBC" \
                 --cross-file "$REPO/ports/toolchain/cross.txt" \
                 --prefix=/usr \
                 -Ddefault_library=static -Dbuild_tests=false \
+                -Dlinux_kernel_headers="$REPO/ports/mlibc/linux-headers" \
                 >/dev/null
         ninja -C "$REPO/build/mlibc-full" -j "$JOBS"
         meson install -C "$REPO/build/mlibc-full" --destdir "$SYSROOT" >/dev/null
+        install_uapi
         say library "libc.a + crt objects in $SYSROOT/usr/lib"
 }
 
@@ -232,16 +249,16 @@ do_hello() {
 # apps' own checks run per package, from tools/prism.py, with the
 # manifest's [verify] diet.
 do_verify() {
-	sh "$REPO/ports/toolchain/verify.sh" "$REPO/build/usr/hello-mlibc/hello" "$SYSROOT"
+        sh "$REPO/ports/toolchain/verify.sh" "$REPO/build/usr/hello-mlibc/hello" "$SYSROOT"
 }
 
 case "$STAGE" in
-	all)     do_wrappers; do_mlibc; do_headers; do_library; do_hello; do_verify ;;
-	wrappers) do_wrappers ;;
-	mlibc)    do_mlibc ;;
-	headers)  do_headers ;;
-	library)  do_library ;;
-	hello)    do_hello ;;
-	verify)   do_verify ;;
-	*) echo "unknown stage: $STAGE (try: list)" >&2; exit 2 ;;
+        all)     do_wrappers; do_mlibc; do_headers; do_library; do_hello; do_verify ;;
+        wrappers) do_wrappers ;;
+        mlibc)    do_mlibc ;;
+        headers)  do_headers ;;
+        library)  do_library ;;
+        hello)    do_hello ;;
+        verify)   do_verify ;;
+        *) echo "unknown stage: $STAGE (try: list)" >&2; exit 2 ;;
 esac

@@ -409,4 +409,20 @@ impl Ext4 {
         i.set_ctime(now());
         self.write_inode(&mut i)
     }
+
+    /// utimensat's payload (phase 3.4): the pair the syscall layer resolved
+    /// (None = UTIME_OMIT, Some(second) = set).  The inode times are
+    /// second-granular; ctime comes along, like every metadata change.
+    pub(super) fn op_utimens(&mut self, ino: u32, atime: Option<u64>, mtime: Option<u64>) -> FsResult<()> {
+        self.check_rw()?;
+        let mut i = self.read_inode(ino)?;
+        if let Some(t) = atime {
+            i.set_atime(t.min(u32::MAX as u64) as u32);
+        }
+        if let Some(t) = mtime {
+            i.set_mtime(t.min(u32::MAX as u64) as u32);
+        }
+        i.set_ctime(now());
+        self.write_inode(&mut i)
+    }
 }

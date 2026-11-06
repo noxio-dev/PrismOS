@@ -15,12 +15,23 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang lld gcc binutils make python3 \
+            clang lld gcc binutils make meson ninja-build python3 \
             mtools dosfstools e2fsprogs xorriso \
             qemu-system-x86 ovmf
 
       - name: Install Rust target
         run: rustup target add x86_64-unknown-none
+
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@v2
+      
+      - name: Cache build directory
+        uses: actions/cache@v4
+        with:
+          path: build/
+          key: prismos-build-${{ runner.os }}-${{ hashFiles('Makefile', '**/Makefile', '**/meson.build', '**/*.mk', 'Cargo.lock', '**/Cargo.toml', 'toolchain/**') }}
+          restore-keys: |
+            prismos-build-${{ runner.os }}-
 
       - name: Build
         run: make
