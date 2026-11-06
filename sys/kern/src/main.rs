@@ -15,7 +15,9 @@
 //   -> keyboard (i8042) -> sti -> PCI/AHCI -> VFS (ext4 on the first
 //   volume found) -> shell
 //
-// Every step logs one line so the boot output doubles as a bring-up check.
+// The boot output doubles as a bring-up check, but it is only shown when
+// the loader's command line contains `-v` (verbose).  Errors and warnings
+// are always printed.
 
 #![no_std]
 #![no_main]
@@ -44,9 +46,29 @@ use user::tty;
 
 use core::arch::asm;
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use alloc::string::String;
 use alloc::vec::Vec;
+
+/// Set from the loader's command line (`-v`): boot info lines are printed
+/// only when true.
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+/// `kprintln!` for informational boot lines: silent unless `-v` was given.
+/// Failures and warnings keep using `kprintln!` so they always show.
+macro_rules! vprintln {
+    () => {
+        if VERBOSE.load(Ordering::Relaxed) {
+            kprintln!();
+        }
+    };
+    ($($arg:tt)*) => {
+        if VERBOSE.load(Ordering::Relaxed) {
+            kprintln!($($arg)*);
+        }
+    };
+}
 
 #[no_mangle]
 #[link_section = ".text._start"]
@@ -61,38 +83,42 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // is up; before that they read as 0.
     crate::lib::klog::init(pit::uptime_ms);
 
-    kprintln!("Hello, world!");
-    kprintln!();
-    kprintln!("PrismOS kernel {} (Rust, x86_64)", env!("CARGO_PKG_VERSION"));
+    // `-v` anywhere in the loader's command line turns the boot log on.
+    let verbose = bi.map_or(false, |b| b.cmdline().split_whitespace().any(|o| o == "-v"));
+    VERBOSE.store(verbose, Ordering::Relaxed);
+
+    vprintln!("Hello, world!");
+    vprintln!();
+    vprintln!("PrismOS kernel {} (Rust, x86_64)", env!("CARGO_PKG_VERSION"));
 
     match bi {
         Some(bi) => {
-            kprintln!("firmware : {}", bi.firmware_name());
-            kprintln!("memory   : {} MiB usable", bi.usable_bytes() >> 20);
-            kprintln!(
+            vprintln!("firmware : {}", bi.firmware_name());
+            vprintln!("memory   : {} MiB usable", bi.usable_bytes() >> 20);
+            vprintln!(
                 "kernel   : {} KiB at phys {:#x}, virt {:#x}",
                 bi.kernel_size >> 10,
                 bi.kernel_phys,
                 bi.kernel_virt
             );
             if bi.flags & boot::FLAG_FB != 0 {
-                kprintln!("display  : {}x{} framebuffer", bi.fb.width, bi.fb.height);
+                vprintln!("display  : {}x{} framebuffer", bi.fb.width, bi.fb.height);
             } else {
-                kprintln!("display  : VGA text 80x25");
+                vprintln!("display  : VGA text 80x25");
             }
-            kprintln!("modules  : {}", bi.modules().len());
-            kprintln!("cmdline  : \"{}\"", bi.cmdline());
+            vprintln!("modules  : {}", bi.modules().len());
+            vprintln!("cmdline  : \"{}\"", bi.cmdline());
         }
         None => kprintln!("warning: no valid boot info from the loader"),
     }
 
-    kprintln!();
+    vprintln!();
 
     // --- CPU / VM detection -----------------------------------------------
     let cpu = cpu::Cpu::detect();
     let brand = cpu.brand();
-    kprintln!("cpu      : {}", if brand.is_empty() { "unknown" } else { brand });
-    kprintln!(
+    vprintln!("cpu      : {}", if brand.is_empty() { "unknown" } else { brand });
+    vprintln!(
         "vendor   : {}, family {} model {} stepping {}",
         cpu.vendor(),
         cpu.family(),
@@ -100,32 +126,32 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         cpu.stepping()
     );
     let mut feats = [0u8; 256];
-    kprintln!("features : {}", cpu.features_into(&mut feats));
+    vprintln!("features : {}", cpu.features_into(&mut feats));
 
     match vm::detect() {
         Some(v) => {
-            kprintln!(
+            vprintln!(
                 "machine  : {} (sig \"{}\", hv max leaf {:#x})",
                 v.name(),
                 v.signature_str(),
                 v.max_leaf
             );
             if let Some(pv) = v.kvm_features() {
-                kprintln!("kvm      : paravirt features {:#010x}", pv);
+                vprintln!("kvm      : paravirt features {:#010x}", pv);
             }
         }
-        None => kprintln!("machine  : bare metal"),
+        None => vprintln!("machine  : bare metal"),
     }
 
     // --- Interrupt infrastructure -------------------------------------------
     gdt::init();
-    kprintln!("gdt/tss  : loaded (code {:#x}, data {:#x}, tss {:#x})", gdt::KERNEL_CS, gdt::KERNEL_DS, gdt::TSS_SEL);
+    vprintln!("gdt/tss  : loaded (code {:#x}, data {:#x}, tss {:#x})", gdt::KERNEL_CS, gdt::KERNEL_DS, gdt::TSS_SEL);
     idt::init();
-    kprintln!("idt      : 256 gates, exceptions 0..20 + irqs 0x20..0x2f");
+    vprintln!("idt      : 256 gates, exceptions 0..20 + irqs 0x20..0x2f");
     pic::init();
-    kprintln!("pic      : 8259 remapped to 0x20..0x2f, all lines masked");
+    vprintln!("pic      : 8259 remapped to 0x20..0x2f, all lines masked");
     pit::init();
-    kprintln!("pit      : channel 0 at {} Hz", pit::HZ);
+    vprintln!("pit      : channel 0 at {} Hz", pit::HZ);
 
     // --- Device IRQs (registered now, unmasked at the end) ------------------
     serial::init();
@@ -133,7 +159,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // Nothing is unmasked yet: whether the 8259 or the IOAPIC delivers these
     // lines is decided after the ACPI/APIC probe (unmasking on the 8259 and
     // then switching leaves a stale INTR request behind).
-    kprintln!(
+    vprintln!(
         "serial   : COM1 115200 8n1, rx on irq{}{}",
         pic::IRQ_COM1,
         if serial::present() { "" } else { " (no UART detected)" }
@@ -157,7 +183,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         intr::park()
     };
     let ps = pmm::init(bi);
-    kprintln!(
+    vprintln!(
         "pmm      : {} MiB in {} pages ({} free), bitmap ok",
         (ps.top - ps.base) >> 20,
         ps.total_pages,
@@ -165,7 +191,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     );
 
     if vmm::init(bi) {
-        kprintln!(
+        vprintln!(
             "vmm      : own pml4 active, direct map at {:#x}, kernel W^X",
             vmm::DIRECT_MAP_BASE
         );
@@ -173,10 +199,10 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         kprintln!("vmm      : table build failed -- running on loader tables");
     }
     if console::enable_backbuffer() {
-        kprintln!("display  : back buffer active, text and graphics are double-buffered");
+        vprintln!("display  : back buffer active, text and graphics are double-buffered");
     }
     if heap::init() {
-        kprintln!(
+        vprintln!(
             "heap     : {} KiB at {:#x} (buddy 4 KiB..4 MiB + slab 32..1024)",
             heap::size() >> 10,
             vmm::HEAP_BASE
@@ -189,14 +215,14 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // Needs the GDT (selector layout), the heap (process stacks) and the
     // VMM (per-process page tables).
     let ui = user::usermode::init();
-    kprintln!(
+    vprintln!(
         "user     : syscall/sysret ready, SMEP {} SMAP {} UMIP {}",
         yn(ui.smep),
         yn(ui.smap),
         yn(ui.umip)
     );
     process::init();
-    kprintln!(
+    vprintln!(
         "proc     : pcb + {} KiB kernel stacks per process, preemptive priority scheduler",
         process::KSTACK_SIZE >> 10
     );
@@ -205,7 +231,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // Needs the direct map (tables above 4 GiB) so it comes after the VMM.
     if acpi::init(bi) {
         let a = acpi::info().unwrap();
-        kprintln!(
+        vprintln!(
             "acpi     : rev {} ({}), {} tables, {} cpu(s), {} ioapic(s), hpet {}",
             a.rsdp_rev,
             if a.xsdt { "XSDT" } else { "RSDT" },
@@ -215,10 +241,10 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             if a.hpet { "yes" } else { "no" }
         );
     } else {
-        kprintln!("acpi     : no usable tables (staying on the 8259)");
+        vprintln!("acpi     : no usable tables (staying on the 8259)");
     }
     if apic::init() {
-        kprintln!(
+        vprintln!(
             "apic     : lapic id {} at {:#x} ({}), 8259 masked, timer {} Hz ({} counts/ms via {})",
             apic::lapic_id(),
             apic::lapic_phys(),
@@ -229,7 +255,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         );
         apic::unmask(pic::IRQ_COM1);
     } else {
-        kprintln!("apic     : unavailable, timer stays on the PIT");
+        vprintln!("apic     : unavailable, timer stays on the PIT");
         pic::unmask(pic::IRQ_TIMER);
         pic::unmask(pic::IRQ_COM1);
     }
@@ -237,7 +263,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // --- Keyboard ------------------------------------------------------------
     let ks = kbd::init();
     if ks.present {
-        kprintln!(
+        vprintln!(
             "kbd      : i8042 {}{}, scancode set {}, layout {}",
             if ks.self_test { "self-test ok" } else { "self-test FAILED" },
             if ks.port_test { ", port ok" } else { ", port test FAILED" },
@@ -245,20 +271,20 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             kbd::layout_name()
         );
         if ks.set2 {
-            kprintln!("           translation unavailable: decoding raw set 2");
+            vprintln!("           translation unavailable: decoding raw set 2");
         }
         if !ks.acked {
             kprintln!("           keyboard did not ACK -- it may stay silent");
         }
         irq_unmask(pic::IRQ_KBD);
     } else {
-        kprintln!("kbd      : no PS/2 controller detected (USB-only machine?)");
-        kprintln!("           console input stays on the serial line");
+        vprintln!("kbd      : no PS/2 controller detected (USB-only machine?)");
+        vprintln!("           console input stays on the serial line");
     }
 
     // --- Lift off --------------------------------------------------------------
     intr::sti();
-    kprintln!("interrupts enabled");
+    vprintln!("interrupts enabled");
 
     // --- SMP (phase 1.5) --------------------------------------------------------
     // Bring the application processors up through the LAPIC: they run their
@@ -266,7 +292,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     let ncpu = smp::init();
     if ncpu > 1 {
         let (answered, aps) = smp::ipi_ping_all();
-        kprintln!(
+        vprintln!(
             "smp      : {} cpu(s) online ({} AP up, IPI round-trip {}/{})",
             ncpu,
             ncpu - 1,
@@ -274,14 +300,17 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             aps
         );
     } else {
-        kprintln!("smp      : single cpu (no AP in the MADT or APIC unavailable)");
+        vprintln!("smp      : single cpu (no AP in the MADT or APIC unavailable)");
     }
 
     // --- PCI / storage (needs the system tick for command time-outs) ----------
-    kprintln!("pci      : {} function(s) on the bus", pci::init());
+    // Run the init *outside* the macro: its arguments are not evaluated
+    // when verbose is off.
+    let npci = pci::init();
+    vprintln!("pci      : {} function(s) on the bus", npci);
     let ndisks = ahci::init();
     match ahci::controller() {
-        Some(c) => kprintln!(
+        Some(c) => vprintln!(
             "ahci     : controller {:02x}:{:02x}.{} AHCI {}.{}, {} port(s), {} slot(s), {} disk(s)",
             c.pci.0,
             c.pci.1,
@@ -292,12 +321,12 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             c.slots,
             ndisks
         ),
-        None => kprintln!("ahci     : no controller"),
+        None => vprintln!("ahci     : no controller"),
     }
     for i in 0..ndisks {
         if let Some(d) = ahci::disk(i) {
             use blk::BlockDev;
-            kprintln!(
+            vprintln!(
                 "           disk {} (port {}): {} MiB, \"{}\"",
                 i,
                 d.port(),
@@ -344,7 +373,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     if !rescue {
         match spawn_init(init) {
             Ok(pid) => {
-                kprintln!("user     : {} as pid {} -- the userland session", init, pid);
+                vprintln!("user     : {} as pid {} -- the userland session", init, pid);
                 // This is the idle loop of the session era: init waits, the
                 // shell parks on its reads, commands come and go, and this
                 // call returns only when the whole session is dead.
@@ -357,7 +386,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             }
         }
     } else {
-        kprintln!("user     : init= is kshell -- rescue mode");
+        vprintln!("user     : init= is kshell -- rescue mode");
     }
 
     // The rescue kernel shell: the console input belongs to it alone
@@ -367,8 +396,8 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     crate::fs::fsys::mount_proc_and_tmp();
     process::set_init(0);
     tty::reset_input();
-    kprintln!("dropping to the shell");
-    kprintln!();
+    vprintln!("dropping to the shell");
+    vprintln!();
 
     // Defense in depth: the disk paths may only ever sleep with interrupts
     // on, but a leaked IF=0 here would freeze the shell on its first idle
