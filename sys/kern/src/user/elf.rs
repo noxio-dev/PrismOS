@@ -6,6 +6,10 @@
 // `PT_INTERP` is honoured -- dynamic linking.
 //
 // What is accepted
+//   * A script: a file starting with `#!interpreter [arg]` is run through
+//     its interpreter (`load_path` rewrites argv as `interpreter [arg]
+//     script args...` and loads the interpreter instead, up to 4 levels
+//     deep, like Linux).
 //   * ELF64, little endian, x86-64, `ET_EXEC` or `ET_DYN`.  A static PIE
 //     (`ET_DYN`, linked with `-pie --no-dynamic-linker`) is the natural
 //     format here: user space starts at USER_BASE (512 GiB), far above the
@@ -58,6 +62,11 @@ pub const MAX_STRING: usize = 4096;
 pub const MAX_ARG_BYTES: usize = 24 * 1024;
 const MAX_PHDRS: usize = 32;
 const MAX_RELOCS: u64 = 1 << 16;
+/// Longest chain of `#!` interpreters (a script whose interpreter is a
+/// script...), like Linux's limit of 4.
+const MAX_SHEBANG_DEPTH: usize = 4;
+/// Linux reads at most 256 bytes of the first line (BINPRM_BUF_SIZE).
+const SHEBANG_MAX: usize = 256;
 
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
@@ -171,9 +180,59 @@ fn page_up(x: u64) -> Option<u64> {
 }
 
 /// Read an executable from the VFS and load it (the `execve` front end).
+/// A file starting with `#!` is a script: the interpreter named on its
+/// first line is loaded instead, with the script path inserted in argv.
 pub fn load_path(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Loaded, ExecError> {
+    load_path_inner(path, path.as_bytes(), argv, envp, 0)
+}
+
+fn load_path_inner(
+    path: &str,
+    execfn: &[u8],
+    argv: &[Vec<u8>],
+    envp: &[Vec<u8>],
+    depth: usize,
+) -> Result<Loaded, ExecError> {
     let image = read_program(path)?;
-    load(&image, path.as_bytes(), argv, envp)
+    if image.starts_with(b"#!") {
+        if depth >= MAX_SHEBANG_DEPTH {
+            return Err(ExecError::File("too many levels of #! interpreters", 40)); // ELOOP
+        }
+        let (interp, arg) = parse_shebang(&image)?;
+        // argv becomes: interp [optional-arg] script-path argv[1..]
+        let mut nargv: Vec<Vec<u8>> = Vec::new();
+        nargv.push(interp.as_bytes().to_vec());
+        if let Some(a) = arg {
+            nargv.push(a.into_bytes());
+        }
+        nargv.push(path.as_bytes().to_vec());
+        nargv.extend(argv.iter().skip(1).cloned());
+        // AT_EXECFN stays the script path, like on Linux.
+        return load_path_inner(&interp, execfn, &nargv, envp, depth + 1);
+    }
+    load(&image, execfn, argv, envp)
+}
+
+/// Parse `#!interpreter [one optional argument]` from the first line.
+/// Everything after the interpreter is passed as a single argument
+/// (the Linux behaviour: `#!/usr/bin/env python -u` gives "python -u").
+fn parse_shebang(image: &[u8]) -> Result<(String, Option<String>), ExecError> {
+    let head = &image[2..image.len().min(SHEBANG_MAX)];
+    let line = match head.iter().position(|&b| b == b'\n') {
+        Some(n) => &head[..n],
+        None => head,
+    };
+    let line = core::str::from_utf8(line)
+        .map_err(|_| ExecError::NotElf("non-UTF-8 #! line"))?
+        .trim(); // also drops a trailing \r
+    let (interp, rest) = match line.find(|c| c == ' ' || c == '\t') {
+        Some(i) => (&line[..i], line[i..].trim()),
+        None => (line, ""),
+    };
+    if interp.is_empty() {
+        return Err(ExecError::NotElf("empty #! interpreter"));
+    }
+    Ok((String::from(interp), if rest.is_empty() { None } else { Some(String::from(rest)) }))
 }
 
 /// Read `path` and check it is an executable regular file: what both the

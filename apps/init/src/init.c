@@ -144,6 +144,10 @@ static void report(const char *which, int st)
 
 int main(void)
 {
+        if (getpid() != 1) {
+                printf("init: must be run as pid 1\n");
+                return 1;
+        }
         /* A ^C is for the foreground command, not for the session. */
         signal(SIGINT, SIG_IGN);
         signal(SIGQUIT, SIG_IGN);
