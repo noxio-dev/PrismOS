@@ -15,7 +15,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang lld gcc binutils make python3 \
+            clang lld gcc binutils make meson ninja-build python3 \
             mtools dosfstools e2fsprogs xorriso \
             qemu-system-x86 ovmf
 
