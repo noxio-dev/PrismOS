@@ -11,4 +11,5 @@ build/
 sys/kern/target/
 tests/fstest/target/
 
-!sys/kern/data/unifont.bin__pycache__/
+!sys/kern/data/unifont.bin
+__pycache__/
