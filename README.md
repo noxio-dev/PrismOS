@@ -40,10 +40,12 @@ The detailed checklist, with the notes behind every step, lives in
 ## Build and run
 
 ```sh
-make            # build build/prismos.img
-make run        # boot it in QEMU (BIOS)
-make run-uefi   # boot it in QEMU with OVMF
-make test       # automated boot tests
+make              # build build/prismos.img
+make run          # boot it in QEMU (BIOS)
+make run-kvm      # boot it in QEMU/KVM (BIOS)
+make run-uefi     # boot it in QEMU with OVMF
+make run-kvm-uefi # boot it in QEMU/KVM with OVMF
+make test         # automated boot tests
 ```
 
 Host-side tests that need no QEMU: `make fstest` (VFS + ext4 checked with
