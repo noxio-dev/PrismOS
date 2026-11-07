@@ -5,7 +5,7 @@
 #
 # tools/prism.py -- the PrismOS package tool.
 #
-# A userland program on PrismOS is a *package*: a directory under apps/ with
+# A userland program on PrismOS is a *package*: a directory under pkg/ with
 # a prism.toml manifest.  prism reads the manifest and does everything the
 # way the kernel's ELF loader (sys/kern/src/user/elf.rs) wants it:
 #
@@ -18,17 +18,17 @@
 #   verify   ports/toolchain/verify.sh against the built binary: the
 #            loader-contract shape checks, plus the program's own syscall
 #            and symbol diet when the manifest declares one ([verify])
-#   stage    the stripped binary into build/apps-out/<name> -- the whole
+#   stage    the stripped binary into build/pkg-out/<name> -- the whole
 #            file the kernel's exec reads must stay under MAX_ELF_FILE
 #            (4 MiB), and the meson debug sections buy the loader nothing
 #   install  the staged binary into an image root tree, at [install] path
 #
 # Usage (or, the same through the ./prism shim at the repo root):
-#   python3 tools/prism.py init <name>     scaffold apps/<name>
-#   python3 tools/prism.py build [name]    build one app, or all of them
+#   python3 tools/prism.py init <name>     scaffold pkg/<name>
+#   python3 tools/prism.py build [name]    build one package, or all of them
 #   python3 tools/prism.py install [name]  install into a root tree
 #   python3 tools/prism.py verify [name]   the contract checks, alone
-#   python3 tools/prism.py list            the apps and their manifests
+#   python3 tools/prism.py list            the packages and their manifests
 #   python3 tools/prism.py run             make the image and boot it
 #   python3 tools/prism.py clean [name]    remove build outputs
 #
@@ -42,7 +42,7 @@ import subprocess
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-APPS_DIR = os.path.join(REPO, "apps")
+PKG_DIR = os.path.join(REPO, "pkg")
 BUILD_DIR = os.path.join(REPO, "build")
 PREFIX = os.path.join(BUILD_DIR, "toolchain", "usr")
 SYSROOT = os.path.join(PREFIX, "x86_64-prismos")
@@ -50,7 +50,7 @@ CC = os.path.join(PREFIX, "bin", "x86_64-prismos-gcc")
 LD = os.path.join(PREFIX, "bin", "x86_64-prismos-ld")
 STRIP = os.path.join(PREFIX, "bin", "x86_64-prismos-strip")
 VERIFY_SH = os.path.join(REPO, "ports", "toolchain", "verify.sh")
-SHARED_HEADERS = [os.path.join(APPS_DIR, "include", "prism_raw.h")]
+SHARED_HEADERS = [os.path.join(PKG_DIR, "include", "prism_raw.h")]
 
 # The do_prog discipline of ports/toolchain/bootstrap.sh, verbatim.
 BASE_CFLAGS = [
@@ -202,7 +202,7 @@ class App:
         self.syscalls = [str(n) for n in verify.get("syscalls", [])]
         self.symbols = list(verify.get("symbols", []))
 
-        # identity: the directory under apps/ is the package's name
+        # identity: the directory under pkg/ is the package's name
         dirname = os.path.basename(os.path.normpath(directory))
         if self.name != dirname:
             raise ManifestError("package name %r must match its directory %r"
@@ -245,7 +245,7 @@ class App:
 
     @property
     def staged(self):
-        return os.path.join(BUILD_DIR, "apps-out", self.name)
+        return os.path.join(BUILD_DIR, "pkg-out", self.name)
 
     def source_files(self):
         if self.makefile:
@@ -273,15 +273,15 @@ class App:
 
 
 def find_apps():
-    if not os.path.isdir(APPS_DIR):
+    if not os.path.isdir(PKG_DIR):
         return []
-    apps = []
-    for manifest in sorted(glob.glob(os.path.join(APPS_DIR, "*", "prism.toml"))):
+    pkgs = []
+    for manifest in sorted(glob.glob(os.path.join(PKG_DIR, "*", "prism.toml"))):
         try:
-            apps.append(App(os.path.dirname(manifest)))
+            pkgs.append(App(os.path.dirname(manifest)))
         except (ManifestError, ValueError) as e:
             die("%s: %s" % (manifest, e))
-    return apps
+    return pkgs
 
 
 def get_app(name):
@@ -326,7 +326,7 @@ def compile_and_link(app):
             "-nostdinc",
             "-isystem", gcc_include_dir(),
             "-isystem", os.path.join(SYSROOT, "usr", "include"),
-            "-I", os.path.join(APPS_DIR, "include"),
+            "-I", os.path.join(PKG_DIR, "include"),
         ] + app.cflags
         say(app.name, "compiling %s" % os.path.relpath(src, app.dir))
         subprocess.check_call(cmd)
@@ -376,7 +376,7 @@ def run_verify(app):
 
 
 def stage(app):
-    """build/apps-out/<name>: the stripped binary the image installs."""
+    """build/pkg-out/<name>: the stripped binary the image installs."""
     os.makedirs(os.path.dirname(app.staged), exist_ok=True)
     if app.strip:
         subprocess.check_call([STRIP, "--strip-all", "-o", app.staged,
@@ -423,7 +423,7 @@ def install(app, dest):
 INIT_MAIN_C = """\
 /* %(name)s -- a PrismOS app, started from `prism init`.
  * The C library (mlibc, in the sysroot) for the portable surface; the raw
- * shim (apps/include/prism_raw.h) for the calls it has no word for. */
+ * shim (pkg/include/prism_raw.h) for the calls it has no word for. */
 #include <stdio.h>
 #include "prism_raw.h"
 
@@ -439,7 +439,7 @@ INIT_TOML = """\
 # in the builtin mode: prism compiles the sources against the mlibc sysroot
 # and links the static PIE the kernel's loader expects, then verify.sh
 # checks the loader contract, then the stripped binary is staged for the
-# image.  See apps/README.md for every field.
+# image.  See pkg/README.md for every field.
 [package]
 name = "%(name)s"
 version = "0.1.0"
@@ -472,15 +472,15 @@ def cmd_init(args):
     name = args[0]
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
         die("package name %r must be lowercase [a-z0-9-]" % name)
-    directory = os.path.join(APPS_DIR, name)
+    directory = os.path.join(PKG_DIR, name)
     if os.path.exists(directory):
-        die("apps/%s already exists" % name)
+        die("pkg/%s already exists" % name)
     os.makedirs(os.path.join(directory, "src"))
     with open(os.path.join(directory, "prism.toml"), "w") as f:
         f.write(INIT_TOML % {"name": name})
     with open(os.path.join(directory, "src", "main.c"), "w") as f:
         f.write(INIT_MAIN_C % {"name": name})
-    print("prism: apps/%s scaffolded -- build it with "
+    print("prism: pkg/%s scaffolded -- build it with "
           "`python3 tools/prism.py build %s`" % (name, name))
     print("prism: `make` picks it up: the image installs /usr/bin/%s" % name)
 
@@ -529,12 +529,12 @@ def cmd_verify(args):
 
 
 def cmd_list(_args):
-    apps = find_apps()
-    if not apps:
-        print("prism: no apps (apps/*/prism.toml) -- `prism init <name>`")
+    pkgs = find_apps()
+    if not pkgs:
+        print("prism: no packages (pkg/*/prism.toml) -- `prism init <name>`")
         return
-    width = max(len(a.name) for a in apps)
-    for a in apps:
+    width = max(len(a.name) for a in pkgs)
+    for a in pkgs:
         mode = "make" if a.makefile else "builtin"
         print("%-*s  %-6s  %-8s  %s" % (width, a.name, mode, a.version,
                                         a.install_path))
@@ -556,7 +556,7 @@ def cmd_run(args):
 
 def cmd_clean(args):
     if not args or args == ["--all"]:
-        shutil.rmtree(os.path.join(BUILD_DIR, "apps-out"), ignore_errors=True)
+        shutil.rmtree(os.path.join(BUILD_DIR, "pkg-out"), ignore_errors=True)
         for app in find_apps():
             shutil.rmtree(app.app_rel("build"), ignore_errors=True)
         print("prism: cleaned every app's outputs")
@@ -572,11 +572,11 @@ def cmd_clean(args):
 USAGE = """\
 usage: python3 tools/prism.py <command> [args]
 
-  init <name>      scaffold a new package under apps/<name>
+  init <name>      scaffold a new package under pkg/<name>
   build [name]     build one package, or all of them
   install [name]   install built binaries into a root tree (--dest DIR)
   verify [name]    run verify.sh's contract checks alone
-  list             list the packages under apps/
+  list             list the packages under pkg/
   run              make the image and boot it (--bios, --tcg select the mode)
   clean [name]     remove a package's outputs, or all of them (--all)
 """

@@ -1,0 +1,3 @@
+PATH=/usr/bin:/bin
+export PATH
+PS1="prism$ "

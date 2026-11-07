@@ -132,6 +132,8 @@ def main():
             "user     : /sbin/init as pid 1 -- the userland session",
             "init: /proc mounted (procfs, read-only)",
             "init: /tmp mounted (tmpfs)",
+            "rc: system start-up",      # /etc/rc, run by init (rootfs/etc/rc)
+            "rc: done",
             "PrismOS init: starting the console shell",
             "PrismOS init: starting the serial shell (ttyS0)"]
 

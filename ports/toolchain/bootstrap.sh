@@ -29,8 +29,8 @@
 #                   regression it was
 #   stage verify    the proof under verify.sh's checks, statically
 #
-# The /bin programs themselves are apps/ packages now -- tools/prism.py
-# builds them from the Makefile (`make apps`); this script builds the
+# The /bin programs themselves are pkg/ packages now -- tools/prism.py
+# builds them from the Makefile (`make pkgs`); this script builds the
 # toolchain and the library they build against.
 #
 # Usage:
@@ -246,7 +246,7 @@ do_hello() {
 # ---- stage: verify -----------------------------------------------------------
 # The step-3 proof under the loader's own checks (verify.sh <elf>
 # <sysroot>, the proof's write / restorer / clock_gettime set).  The
-# apps' own checks run per package, from tools/prism.py, with the
+# the packages' own checks run per package, from tools/prism.py, with the
 # manifest's [verify] diet.
 do_verify() {
         sh "$REPO/ports/toolchain/verify.sh" "$REPO/build/usr/hello-mlibc/hello" "$SYSROOT"

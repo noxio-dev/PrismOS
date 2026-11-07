@@ -13,7 +13,7 @@
  * rename, mkdir / rmdir with ENOTEMPTY, and getdents through opendir.
  *
  * The C library for the portable surface; nothing here needs the raw
- * shim of apps/include/prism_raw.h -- even the framebuffer pair stays
+ * shim of pkg/include/prism_raw.h -- even the framebuffer pair stays
  * out (44 / 45 remain cube's).  Deterministic names, explicit cleanup
  * first (a previous run may have crashed), explicit cleanup last: /tmp
  * is RAM, but a good citizen leaves it as they found it.

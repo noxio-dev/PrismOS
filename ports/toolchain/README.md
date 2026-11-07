@@ -5,8 +5,8 @@ with Meson against a cross C/C++ compiler (headers first, then the compiler,
 then the library), install it into a sysroot* -- and rebuild `/bin/hello`
 against the result as the static PIE the kernel's loader expects (step 3),
 then port `/bin/hello`, `/bin/fork`, `/bin/fd` and `/bin/posix` off the mini
-libc onto it (step 4; apps/ packages now, built by tools/prism.py —
-see apps/README.md), and finally teach the
+libc onto it (step 4; pkg/ packages now, built by tools/prism.py —
+see pkg/README.md), and finally teach the
 loader dynamic linking (step 5): the sysroot's shared half (`libc.so` +
 `ld.so`) and a dynamically linked `hello` whose `PT_INTERP` the kernel
 honours.
@@ -30,8 +30,8 @@ ports/toolchain/
     └── gcc-14.2.0-prismos.patch      the triplet + the ABI: config.sub + config.gcc (linux's
                                        tm_file order + i386/prismos.h) + libgcc
 
-apps/                         the userland packages: one prism.toml per program
-                               (apps/hello doubles as the step-5 dynamic proof: build.sh stage dyn)
+pkg/                         the userland packages: one prism.toml per program
+                               (pkg/hello doubles as the step-5 dynamic proof: build.sh stage dyn)
 ```
 
 ## The order (the phase's todo, verbatim)
@@ -62,11 +62,11 @@ max-page-size=4096 -z noexecstack -z norelro`, the crt sandwich a
 crtendS.o crtn.o`).  `verify.sh` then checks, statically, everything the
 kernel's ELF loader (`sys/kern/src/user/elf.rs`) checks.
 
-**the ports (step 4).**  The programs are `apps/` packages now, built by
-`tools/prism.py` (`make apps`, or `./prism build <name>` for one; the
+**the ports (step 4).**  The programs are `pkg/` packages now, built by
+`tools/prism.py` (`make pkgs`, or `./prism build <name>` for one; the
 same compile against the same sysroot, the same sandwich link, plus the
 stripped staging the kernel's 4 MiB whole-file read asks for) -- `hello`,
-`fork`, `fd`, `posix` and `cube` land in `build/apps-out/`.
+`fork`, `fd`, `posix` and `cube` land in `build/pkg-out/`.
   `verify.sh <elf> <sysroot>
 <program>` checks each one with *its own* expectations: every syscall the
 program makes (the tag layer's `mov $nr,%edi … call __do_syscallN`, the
@@ -80,7 +80,7 @@ the same patched mlibc tree with `-Ddefault_library=both`: the static
 `libc.a` and the four programs never notice, and the sysroot gains
 `libc.so` (the C library as an `ET_DYN`, `SONAME libc.so`) and `ld.so`
 (the rtld: `-nostdlib`, `SONAME ld.so`, self-relocating).  `build.sh
-stage dyn` (`make hello-dyn`) then links the *same* `apps/hello`
+stage dyn` (`make hello-dyn`) then links the *same* `pkg/hello`
 sources against `libc.so` instead of `libc.a` -- `--dynamic-linker
 /lib/ld.so`, `-z now` (mlibc's rtld zeroes `GOT[1]/GOT[2]`: BIND NOW or
 nothing) -- and `stage dynverify` runs `verify.sh <elf> <sysroot> dyn`:

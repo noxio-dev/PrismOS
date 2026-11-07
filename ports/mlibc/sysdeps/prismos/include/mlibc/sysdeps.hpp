@@ -76,7 +76,7 @@ struct PrismOSSysdepTags :
          * the creation mask -- what an init and a shell lean on.  (The
          * mount pair and statfs are kernel-side syscalls 48 / 55 / 56,
          * but their tags live behind mlibc's linux option and its
-         * kernel headers; they stay raw through apps/include/prism_raw.h
+         * kernel headers; they stay raw through pkg/include/prism_raw.h
          * until that option lands with the busybox step.) */
         Tcsetattr,
         GetPpid,

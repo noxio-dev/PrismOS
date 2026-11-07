@@ -1,0 +1,19 @@
+#!/bin/sh
+# /etc/rc -- the system start-up script.
+#
+# init (pid 1) runs this once, as `sh /etc/rc`, after it has mounted /proc
+# and /tmp and before it starts the first login shell.  It is plain ash:
+# edit it in rootfs/etc/rc on the host and rebuild the image.
+#
+# A failing script is reported by init and never stops the boot.  Anything
+# left running in the background is reaped by init like any other orphan.
+
+echo "rc: system start-up"
+
+# Start-up scripts dropped by packages: every executable /etc/rc.d/<name>
+# runs here, in name order (prefix them S10, S20... to order them).
+for script in /etc/rc.d/*; do
+	test -x "$script" && "$script"
+done
+
+echo "rc: done"

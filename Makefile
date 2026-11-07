@@ -69,7 +69,7 @@ EFI_OBJS  := $(patsubst %.c,$B/efi/%.o,$(COMMON_SRCS) boot/loader/ext4.c $(wildc
 
 # ---- default target ----------------------------------------------------
 
-.PHONY: all clean run run-uefi run-iso test kernel esp root iso run-kvm run-uefi-kvm data fstest bintest apps binutils busybox busyboxtest
+.PHONY: all clean run run-uefi run-iso test kernel esp root iso run-kvm run-uefi-kvm data fstest bintest pkgs binutils busybox busyboxtest
 all: $B/$(NAME).img
 
 # ---- compile rules -------------------------------------------------------
@@ -136,8 +136,8 @@ $B/kernel: FORCE
 	@cmp -s $(KERNEL_ELF) $@ || cp -f $(KERNEL_ELF) $@
 FORCE:
 
-# ---- apps: the userland packages (apps/<name>/prism.toml) ---------------------
-# A program is a package: a directory under apps/ with a prism.toml manifest,
+# ---- pkgs: the userland packages (pkg/<name>/prism.toml) ---------------------
+# A program is a package: a directory under pkg/ with a prism.toml manifest,
 # built by tools/prism.py (the ./prism shim).  The mini libc (usr/) is gone --
 # mlibc is the only libc -- and the packages are the whole userland: prism
 # compiles each one against the mlibc sysroot, links the static PIE the
@@ -145,19 +145,19 @@ FORCE:
 # crtn sandwich, page-aligned segments so each one gets its own protection,
 # W^X, the RELATIVE relocations the loader applies at USER_BASE), runs
 # verify.sh's loader-contract checks with the manifest's syscall and symbol
-# diet, and stages the stripped binary into build/apps-out/<name> -- the
+# diet, and stages the stripped binary into build/pkg-out/<name> -- the
 # kernel reads whole files (MAX_ELF_FILE is 4 MiB) and the meson debug
 # sections buy the loader nothing.
 #
-#   make apps            build every package (tools/prism.py build --all)
+#   make pkgs            build every package (tools/prism.py build --all)
 #   prism init <name>    scaffold a new one -- the next `make` picks it up,
 #                        no wiring anywhere else: the manifest is the program
 
-APP_DEPS := $(shell find apps -type f \
+PKG_DEPS := $(shell find pkg -type f \
 	\( -name '*.c' -o -name '*.h' -o -name '*.toml' \) 2>/dev/null)
 
-apps: $B/apps.stamp
-$B/apps.stamp: $B/toolchain/usr/.stamp $(APP_DEPS) tools/prism.py \
+pkgs: $B/pkgs.stamp
+$B/pkgs.stamp: $B/toolchain/usr/.stamp $(PKG_DEPS) tools/prism.py \
 			ports/toolchain/verify.sh
 	@mkdir -p $(@D)
 	$(PYTHON) tools/prism.py build --all
@@ -227,7 +227,7 @@ BUSYBOX_APPLETS := sh ash ls cat echo printf test mkdir rmdir rm cp mv ln \
 # ports/toolchain drives the phase's third and fourth steps: the
 # x86_64-prismos cross toolchain (binutils + gcc, patched for the triplet),
 # mlibc built with Meson against it -- headers first, then the compiler,
-# then the library.  The /bin programs are packages now (apps/, one
+# then the library.  The /bin programs are packages now (pkg/, one
 # prism.toml each, built by tools/prism.py), each linked as the static
 # PIE the loader expects.
 #
@@ -236,7 +236,7 @@ BUSYBOX_APPLETS := sh ash ls cat echo printf test mkdir rmdir rm cp mv ln \
 #                     objects in the x86_64-prismos sysroot (fast path; no
 #                     toolchain build -- ports/toolchain/build.sh replaces the
 #                     wrappers with the real cross tools under the same names)
-#   make apps         every apps/<name>/prism.toml package, built + checked
+#   make pkgs         every pkg/<name>/prism.toml package, built + checked
 #                     + staged by tools/prism.py; the step-3 proof remains
 #                     `bootstrap.sh stage hello`; cube (phase 3.3) is the
 #                     kernel's spinning cube as a process -- the framebuffer
@@ -254,7 +254,7 @@ MLIBC_SRC ?= build/mlibc
 TOOLCHAIN  := $B/toolchain/usr
 SYSROOT    := $(TOOLCHAIN)/x86_64-prismos
 
-.PHONY: mlibc apps hello-dyn bintest
+.PHONY: mlibc pkgs hello-dyn bintest
 mlibc: $B/toolchain/usr/.stamp
 
 # Any change under ports/mlibc -- the sysdeps tree, not just the
@@ -285,7 +285,7 @@ HELLO_DYN := $B/usr/bin-mlibc-dyn/hello
 
 hello-dyn: $(HELLO_DYN)
 
-$(HELLO_DYN): apps/hello/src/hello.c apps/include/prism_raw.h \
+$(HELLO_DYN): pkg/hello/src/hello.c pkg/include/prism_raw.h \
 		ports/toolchain/build.sh ports/toolchain/verify.sh \
 		$B/toolchain/usr/.stamp
 	@mkdir -p $(@D)
@@ -305,8 +305,8 @@ $B/esp.stamp: $B/loader.efi
 # P3: ext4 root, read by the loader (boot tree) and the kernel (root fs).
 root: $B/root.stamp
 # The root tree is usr-merged (phase 3.3): the binaries live in /usr/bin
-# -- the apps (tools/prism.py installs them, stripped from
-# build/apps-out, at each manifest's [install] path) plus the dynamic
+# -- the packages (tools/prism.py installs them, stripped from
+# build/pkg-out, at each manifest's [install] path) plus the dynamic
 # proof hello-dyn and the not-an-ELF sample -- and the shared half in
 # /usr/lib: ld.so (the interpreter the kernel's PT_INTERP handling loads
 # at USER_INTERP_BASE) and libc.so (the library ld.so maps with file
@@ -318,31 +318,30 @@ root: $B/root.stamp
 # existing directory (1777, the classic /tmp).  Stripped: the kernel
 # reads whole files (MAX_ELF_FILE is 4 MiB) and the debug sections buy
 # it nothing.
+ROOTFS_FILES := $(shell find rootfs -type f | sort)
 $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
-	$(HELLO_DYN) $B/apps.stamp $B/binutils.stamp $B/busybox.stamp
+	$(HELLO_DYN) $B/pkgs.stamp $B/binutils.stamp $B/busybox.stamp $(ROOTFS_FILES)
 	rm -rf $B/root
 	mkdir -p $B/root/boot/lua $B/root/boot/defaults $B/root/boot/kernel \
                  $B/root/dev $B/root/etc $B/root/proc $B/root/tmp \
                  $B/root/usr/bin $B/root/usr/lib
 	chmod 1777 $B/root/tmp
-	# /etc for the session: passwd + group -- the identity lookups a
-	# libc's getpwnam serves, root only -- the motd, and (phase 3.4) the
-	# profile a login ash reads: the PATH walks the usr-merge first, the
-	# prompt is the session's own spelling.  /proc is here as well:
-	# the procfs the kernel mounts on it needs the directory.
-	printf 'root:x:0:0:root:/:/usr/bin/sh\n' > $B/root/etc/passwd
-	printf 'root:x:0:\n' > $B/root/etc/group
-	printf 'Welcome to PrismOS (busybox + ash, phase 3.4).\n' \
-		> $B/root/etc/motd
-	printf 'PATH=/usr/bin:/bin\nexport PATH\nPS1="prism$$ "\n' \
-		> $B/root/etc/profile
+	# The hand-edited files live in rootfs/ and are copied verbatim, before
+	# the packages land on top: /etc/passwd + group (the identity lookups a
+	# libc's getpwnam serves, root only), the motd, the profile a login ash
+	# reads (the PATH walks the usr-merge first, the prompt is the session's
+	# own spelling), /etc/rc (the start-up script init runs) and the notelf
+	# sample.  /proc is created above: the procfs the kernel mounts on it
+	# needs the directory.  rootfs/README.md documents the directory and
+	# stays out of the image.
+	cp -a rootfs/. $B/root/
+	rm -f $B/root/README.md
 	cp boot/lua/*.lua $B/root/boot/lua/
 	cp boot/conf/defaults-loader.conf $B/root/boot/defaults/loader.conf
 	cp boot/conf/loader.conf $B/root/boot/loader.conf
 	cp $B/kernel $B/root/boot/kernel/kernel
 	$(PYTHON) tools/prism.py install --all --dest $B/root
 	cp $(HELLO_DYN) $B/root/usr/bin/hello-dyn
-	printf '#!/bin/sh\necho "not an ELF file"\n' > $B/root/usr/bin/notelf
 	# Phase 4.1: the binutils utilities, cross-built for x86_64-prismos --
 	# the first tools the target itself owns, the seed of phase 5's
 	# self-hosting (as and ld stay 5.1's).  Stripped already: the cross
@@ -350,7 +349,7 @@ $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
 	cp $B/binutils-out/ar $B/binutils-out/ranlib $B/binutils-out/nm \
 	   $B/binutils-out/objdump $B/binutils-out/strip $B/root/usr/bin/
 	# Phase 3.4: busybox, one static PIE, and the applets as symlinks --
-	# `sh` among them, the name ash owns now (apps/sh stays as the
+	# `sh` among them, the name ash owns now (pkg/sh stays as the
 	# /usr/bin/minish test rig).  argv[0] is the whole dispatch: a
 	# symlink called `ls` runs ls, one called `sh` runs ash.
 	cp $B/busybox-out/busybox $B/root/usr/bin/busybox
@@ -477,4 +476,4 @@ busyboxtest:
 	$(PYTHON) tests/busybox_test.py
 
 clean:
-	rm -rf $B sys/kern/target apps/*/build
+	rm -rf $B sys/kern/target pkg/*/build

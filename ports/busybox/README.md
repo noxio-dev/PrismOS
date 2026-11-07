@@ -144,7 +144,7 @@ report, and the new syscalls through `touch` / `chmod` / `ls -l`).
 ## The session
 
 `make root` installs the one binary at `/usr/bin/busybox` plus the applet
-symlinks (`sh` among them: busybox's ash owns the name -- apps/sh stays
+symlinks (`sh` among them: busybox's ash owns the name -- pkg/sh stays
 installed as `/usr/bin/minish`, the phase 3.3 test rig).  `init` spawns
 `/usr/bin/sh` with `argv[0] = "-sh"` -- the classic getty spelling of a
 *login shell*, so ash reads `/etc/profile` (the PATH and the `prism$`

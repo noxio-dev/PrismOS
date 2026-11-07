@@ -27,8 +27,8 @@
 #   3. library   mlibc proper, rebuilt with the real cross compiler under the
 #                 same meson cross file -- the bootstrap wrappers of
 #                 bootstrap.sh are simply answered by real binaries now.
-#   4. (apps)    the /bin programs are apps/ packages now -- tools/prism.py
-#                builds them from the Makefile (`make apps`) on the finished
+#   4. (pkgs)    the /bin programs are pkg/ packages now -- tools/prism.py
+#                builds them from the Makefile (`make pkgs`) on the finished
 #                toolchain; `stage hello` (the step-3 proof) remains
 #                runnable on its own.
 #   5. dynlib     the dynamic half of the library, phase 3.2's last step:
@@ -38,7 +38,7 @@
 #                 and ld.so (the rtld, an ET_DYN linked -nostdlib that
 #                 relocates itself from its own _DYNAMIC and then the
 #                 program it is the PT_INTERP of).
-#   6. dyn        the proof executable: apps/hello/src/hello.c again, but
+#   6. dyn        the proof executable: pkg/hello/src/hello.c again, but
 #                 linked dynamically -- PT_INTERP /lib/ld.so, DT_NEEDED
 #                 libc.so, -z now (mlibc's rtld fills GOT[1]/GOT[2] with
 #                 NULL: lazy binding is not an option, BIND_NOW is),
@@ -256,7 +256,7 @@ do_dynlib() {
 
 # ---- stage: dyn ---------------------------------------------------------------
 # The proof executable of phase 3.2's last step: hello, dynamically linked.
-# The same source and the same compile flags as the app (apps/hello) -- only
+# The same source and the same compile flags as the app (pkg/hello) -- only
 # the link changes: no --no-dynamic-linker, --dynamic-linker /lib/ld.so (the
 # path the kernel's PT_INTERP handling reads from the VFS at execve), -lc
 # resolved against the sysroot's libc.so (ld records DT_NEEDED libc.so, the
@@ -272,11 +272,11 @@ do_dyn() {
         OUTDIR=$REPO/build/usr/bin-mlibc-dyn
         mkdir -p "$OUTDIR"
 
-        say dyn "compiling apps/hello/src/hello.c (same flags as the static port)"
-        $CC -c "$REPO/apps/hello/src/hello.c" -o "$OUTDIR/hello.o" \
+        say dyn "compiling pkg/hello/src/hello.c (same flags as the static port)"
+        $CC -c "$REPO/pkg/hello/src/hello.c" -o "$OUTDIR/hello.o" \
                 -O2 -Wall -Wextra -ffreestanding -fPIE \
                 -fno-stack-protector -fno-asynchronous-unwind-tables -fno-math-errno \
-                -nostdinc -isystem "$GCCINC" -isystem "$SYSROOT/usr/include" -I "$REPO/apps/include"
+                -nostdinc -isystem "$GCCINC" -isystem "$SYSROOT/usr/include" -I "$REPO/pkg/include"
 
         say dyn "linking the dynamic PIE (PT_INTERP /lib/ld.so, DT_NEEDED libc.so, -z now)"
         CRTBEGIN=$($CC -print-file-name=crtbeginS.o)

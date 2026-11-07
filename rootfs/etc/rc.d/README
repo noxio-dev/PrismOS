@@ -1,0 +1,4 @@
+Start-up scripts run by /etc/rc, in name order.
+
+Only executable files are run, so this README is skipped.  A package drops
+its script here (S10name, S20name...) through its [install] path.

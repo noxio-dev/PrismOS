@@ -54,7 +54,7 @@ Phase 3 — POSIX userspace
   - [x] 3.4.4 more applets: `ps`, `mount`, `df`, `grep`, `sed`, `awk`, `tar`, `vi`
     - [x] all in the committed config: `ps` reads /proc, `mount` and `df` speak the libc's mount(2) / statvfs (the mntent listing over /proc/mounts), awk's math links out of mlibc's musl-derived libm, vi edits on the tty layer, and `time` rides along as wait4 / rusage's own proof (its report of a child's user / sys ticks is syscall 66 answering) -- `make busyboxtest` judges the single-process half of them against a host busybox of the same tarball and config; ps, vi and time are the QEMU side (the emulator's honest no-fork rule)
   - [x] 3.4.5 `init` spawns `ash`; the kernel shell becomes rescue only
-    - [x] `/usr/bin/sh` is the busybox symlink (ash) and init spawns it as a login shell reading `/etc/profile`; apps/sh stays installed as `/usr/bin/minish`, the phase 3.3 test rig; the kernel shell keeps `prism# ` for `init=` rescue exactly where 3.3.7 left it
+    - [x] `/usr/bin/sh` is the busybox symlink (ash) and init spawns it as a login shell reading `/etc/profile`; pkg/sh stays installed as `/usr/bin/minish`, the phase 3.3 test rig; the kernel shell keeps `prism# ` for `init=` rescue exactly where 3.3.7 left it
   - [x] 3.4.6 tests: `sh` scripts run in QEMU (pipes, loops, redirections), checked by `make test`
     - [x] `boot_test.py`'s busybox scenario (`make test`): pipes into `wc`, `> /tmp` redirections, for loops, `$(( ))` arithmetic, `ash -c` subshells, a tar round trip, `touch` / `chmod` / `ls -l` through the new syscalls, and `time echo timed` -- wait4 answering with the child's rusage; `tests/busybox_test.py` (`make busyboxtest`) is the host-side proof -- every single-process applet under prism_emu against a host busybox of the same tarball and the same committed config, 44 checks: text for text, files and archives byte for byte, the mounts listed text for text; `init_drive.py` and `tmpfs_drive.py` speak ash now (its line editing, its error paths, its prompt from the profile)
 - [ ] Phase 3.5 — precise time, randomness, users and permissions
@@ -94,3 +94,5 @@ Beyond (nice to have)
 - [ ] graphics: framebuffer userspace API, a minimal window system
 - [ ] desktop (Xorg, then KDE): mlibc is the entry ticket, not the whole price -- also Unix domain sockets, `epoll`, shared memory (`MAP_SHARED` of files, `shm`), a display / input device interface (KMS-style), and a lot of the Linux surface (`/proc`, `/sys`, `udev`-like discovery)
 - [ ] AArch64 port of the kernel and loader
+
+*`One day, perhaps, PrismOS will be self-hosted lol`*

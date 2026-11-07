@@ -12,6 +12,11 @@
  *     mount(2) through the libc since phase 3.4: the mount pair moved
  *     from prism_raw.h into mlibc's linux option with the busybox
  *     step);
+ *   * the start-up script -- /etc/rc, run once as `sh /etc/rc` after the
+ *     mounts and before the first shell.  Everything that changes often
+ *     (services, a package's start-up hook) lives there as a plain
+ *     script, edited from rootfs/ without touching this file; a missing
+ *     or failing script is a notice, never a stop;
  *   * a shell per terminal, always -- one on the console (/dev/tty0)
  *     and, when the boot probe found a UART, a getty on /dev/ttyS0
  *     (phase 3.3.5: the serial line is a terminal of its own now, the
@@ -46,6 +51,7 @@
 #include <sys/ioctl.h>
 
 #define SHELL "/usr/bin/sh"
+#define RC    "/etc/rc"
 
 /* The environment every session program starts with -- the same words
  * the kernel shell's `exec` hands its programs (PATH walks the
@@ -75,11 +81,57 @@ static void mount_one(const char *path, const char *type, int rdonly)
                 printf("init: cannot mount %s: %s\n", path, strerror(errno));
 }
 
+/* Run the start-up script and wait for it: `sh /etc/rc`, the shell a
+ * plain (non-login) one -- the environment is the one every session
+ * program gets, and the standard trio stays the console's own, so the
+ * script's echo lands where init's printf does.  No script, no
+ * ceremony.  Only the script is waited for (waitpid on its pid): the
+ * orphans of anything it leaves running in the background are reaped
+ * by the main loop like every other.  A script that never returns
+ * holds the boot, as it would on any unix. */
+static void run_rc(void)
+{
+        int fd = open(RC, O_RDONLY);
+        if (fd < 0)
+                return;
+        close(fd);
+
+        pid_t pid = fork();
+        if (pid < 0) {
+                printf("init: fork failed (%s)\n", strerror(errno));
+                return;
+        }
+        if (pid == 0) {
+                signal(SIGINT, SIG_DFL);
+                signal(SIGQUIT, SIG_DFL);
+                signal(SIGTERM, SIG_DFL);
+                signal(SIGHUP, SIG_DFL);
+
+                char *argv[] = {(char *)"sh", (char *)RC, NULL};
+                execve(SHELL, argv, envp);
+
+                dprintf(2, "init: execve: %s\n", strerror(errno));
+                _exit(127);
+        }
+
+        int st = 0;
+        while (waitpid(pid, &st, 0) < 0) {
+                if (errno != EINTR) {
+                        printf("init: waiting for %s: %s\n", RC, strerror(errno));
+                        return;
+                }
+        }
+        if (WIFSIGNALED(st))
+                printf("init: %s killed by signal %d\n", RC, WTERMSIG(st));
+        else if (WIFEXITED(st) && WEXITSTATUS(st) != 0)
+                printf("init: %s exited with status %d\n", RC, WEXITSTATUS(st));
+}
+
 /* fork + exec the shell with its standard trio on `tty` -- the getty
  * shape: the child owns the terminal from its very first printf.  The
  * argv[0] spelling is the login-shell one ("-sh"): busybox ash reads
  * /etc/profile for it -- the PATH and the PS1 the session lives with
- * (phase 3.4.5; apps/sh stays installed as /usr/bin/minish, the rig
+ * (phase 3.4.5; pkg/sh stays installed as /usr/bin/minish, the rig
  * the 3.3 scenarios ran on). */
 static pid_t spawn_shell(const char *tty)
 {
@@ -163,6 +215,10 @@ int main(void)
          * can still run, and the programs will say what is missing. */
         mount_one("/proc", "procfs", 1);
         mount_one("/tmp", "tmpfs", 0);
+
+        /* The start-up script, once the mounts are there (it may use
+         * /proc and /tmp) and before anybody can log in. */
+        run_rc();
 
         /* The console session first -- the machine's own screen and
          * keyboard, /dev/tty0 (writes stay on the text console; the
