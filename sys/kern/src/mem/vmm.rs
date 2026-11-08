@@ -78,6 +78,10 @@ const P: u64 = 1;
 const RW: u64 = 2;
 const US: u64 = 4;
 const PS: u64 = 0x80;
+/// Page-level write-through bit.  With PAT entry 1 reprogrammed to
+/// write-combining (`enable_pat_wc`), a mapping with PWT alone (PCD = 0,
+/// PAT = 0) is a write-combining one -- what the framebuffer wants.
+const PWT: u64 = 0x08;
 const NX: u64 = 1 << 63;
 /// Software-available PTE bit 9: the page is shared copy-on-write.  On such
 /// a page the RW bit is cleared (even for writable data), so the first write
@@ -244,6 +248,36 @@ pub fn translate(virt: u64) -> Option<u64> {
     }
 }
 
+const IA32_PAT: u32 = 0x277;
+
+/// Make PAT entry 1 -- the one a PWT-only mapping selects -- write-combining
+/// (type 0x01), leaving the other seven as the firmware set them.  The
+/// reset value has entry 1 = write-through, which the kernel never uses, so
+/// nothing else changes meaning.  Returns false (and touches nothing) when
+/// the CPU has no PAT.
+///
+/// Only the boot CPU runs when this is called; any application processor
+/// brought up later has to write the same value, or its view of the
+/// framebuffer would differ from the boot CPU's.
+fn enable_pat_wc() -> bool {
+    // CPUID.1:EDX bit 16 = PAT, bit 5 = MSR.
+    // SAFETY: CPUID leaf 1 exists on every x86-64 CPU.
+    let edx = unsafe { core::arch::x86_64::__cpuid(1) }.edx;
+    if edx & (1 << 16) == 0 || edx & (1 << 5) == 0 {
+        return false;
+    }
+    // SAFETY: IA32_PAT exists when CPUID reports PAT; the new value only
+    // changes entry 1 to a valid type (WC = 1).
+    unsafe {
+        let cur = crate::arch::io::rdmsr(IA32_PAT);
+        let new = (cur & !(0xFFu64 << 8)) | (0x01u64 << 8);
+        if new != cur {
+            crate::arch::io::wrmsr(IA32_PAT, new);
+        }
+    }
+    true
+}
+
 /// Build the kernel page tables and switch CR3.
 pub fn init(bi: &BootInfo) -> bool {
     // NX first: a PTE with bit 63 set faults as "reserved bit" when NXE
@@ -349,6 +383,21 @@ pub fn init(bi: &BootInfo) -> bool {
         ok &= map_boot(pml4, data_s, data_e, kv, kp, RW | NX);
     }
 
+    // ---- write-combining for the framebuffer -----------------------------
+    // The 2 MiB leaves that cover the screen get PWT; with PAT entry 1 set
+    // to write-combining the CPU then merges the console's stores into
+    // bursts instead of one PCIe transaction per store.  On a passthrough
+    // GPU (VRAM behind PCIe, uncached by default) that is the difference
+    // between a scroll that takes a second and one that does not show.
+    // Without PAT support the leaves stay as they were.
+    let (fb_lo, fb_hi, fb_attr) = if bi.flags & FLAG_FB != 0 && bi.fb.addr != 0 {
+        let end = bi.fb.addr + (bi.fb.pitch as u64) * (bi.fb.height as u64);
+        let attr = if enable_pat_wc() { PWT } else { 0 };
+        (bi.fb.addr & !(PAGE_2M - 1), end, attr)
+    } else {
+        (0, 0, 0)
+    };
+
     // ---- identity map: first 4 GiB ---------------------------------------
     // PML4[0] -> one PDPT -> one PD per GiB -> 512 x 2 MiB leaves.
     // (A PDPT entry with PS set would be a 1 GiB page: never put 2 MiB
@@ -362,7 +411,8 @@ pub fn init(bi: &BootInfo) -> bool {
             tw_boot(pdpt, gib as usize, pd | P | RW);
             for i in 0..512usize {
                 let phys = (gib << 30) + ((i as u64) << 21);
-                tw_boot(pd, i, phys | P | RW | PS);
+                let wc = if phys >= fb_lo && phys < fb_hi { fb_attr } else { 0 };
+                tw_boot(pd, i, phys | P | RW | PS | wc);
             }
         }
     }
@@ -454,7 +504,7 @@ pub fn init(bi: &BootInfo) -> bool {
                     e & PHYS_MASK
                 };
                 if tr_boot(pd, i2) & P == 0 {
-                    tw_boot(pd, i2, (v & PHYS_MASK_2M) | P | RW | PS);
+                    tw_boot(pd, i2, (v & PHYS_MASK_2M) | P | RW | PS | fb_attr);
                 }
                 v += PAGE_2M;
             }
