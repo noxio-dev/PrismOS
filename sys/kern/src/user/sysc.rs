@@ -50,8 +50,9 @@
 //   fsys.rs).  `getcwd` returns the length including the NUL, -ERANGE
 //   when the buffer cannot hold it -- the contract newlib's getcwd
 //   wrapper expects.
-// * `uname` fills the 6 x 65-byte utsname: "PrismOS", "prismos", "3.1",
-//   a build string, "x86_64", "(none)".
+// * `uname` fills the 6 x 65-byte utsname from lib/uts.rs: "PrismOS", the
+//   node name, the crate version, "#<build> <date>" (build.rs), "x86_64",
+//   "(none)".
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -385,32 +386,25 @@ pub fn sys_getcwd(buf: u64, size: u64) -> i64 {
 // ----------------------------------------------------------------- uname
 
 /// `uname(buf)` (syscall 35): the 6 x 65-byte utsname (sysname, nodename,
-/// release, version, machine, domainname) -- "PrismOS 3.2" in the classic
-/// shape, what uname(1)-style tools print.
+/// release, version, machine, domainname).  Every field comes from
+/// lib/uts.rs -- the crate version, the build number and date build.rs
+/// stamps, the node name (`hostname=` on the command line) -- the shape
+/// `uname -a` has on Linux.
 pub fn sys_uname(buf: u64) -> i64 {
-    const SYSNAME: &str = "PrismOS";
-    const NODENAME: &str = "prismos";
-    const RELEASE: &str = env!("CARGO_PKG_VERSION");
-    const MACHINE: &str = "x86_64";
-    const DOMAINNAME: &str = "(none)";
-
-    // Build information can be injected by the build system.
-    const VERSION: &str = match option_env!("PRISMOS_BUILD") {
-        Some(build) => build,
-        None => concat!("PrismOS ", env!("CARGO_PKG_VERSION")),
-    };
+    use crate::lib::uts;
 
     // struct utsname: six fields of 65 bytes each.
     const FIELD_SIZE: usize = 65;
     const FIELD_COUNT: usize = 6;
 
-    let fields = [
-        SYSNAME,
-        NODENAME,
-        RELEASE,
-        VERSION,
-        MACHINE,
-        DOMAINNAME,
+    let nodename = uts::nodename();
+    let fields: [&str; FIELD_COUNT] = [
+        uts::SYSNAME,
+        &nodename,
+        uts::RELEASE,
+        uts::VERSION,
+        uts::MACHINE,
+        uts::DOMAINNAME,
     ];
 
     let mut out = [0u8; FIELD_SIZE * FIELD_COUNT];

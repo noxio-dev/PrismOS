@@ -168,10 +168,7 @@ fn vfs_mounts() -> Vec<vfs::MountInfo> {
 /// The content of one inode, generated on demand.
 fn content(ino: u64) -> Option<String> {
     Some(match ino {
-        VERSION => format!(
-            "PrismOS version {} (noxiio-dev) #1 x86_64\n",
-            env!("CARGO_PKG_VERSION")
-        ),
+        VERSION => crate::lib::uts::proc_version(),
         UPTIME => uptime_str(),
         MEMINFO => meminfo_str(),
         CPUINFO => {

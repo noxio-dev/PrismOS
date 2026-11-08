@@ -359,6 +359,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // as the rescue mode: `kernel_options="init=kshell"` in loader.conf
     // boots it, and a missing or crashed init falls back to it.
     let cmdline = bi.cmdline();
+    crate::lib::uts::apply_cmdline(cmdline);
     let mut init = "/sbin/init";
     let mut rescue = false;
     for opt in cmdline.split_whitespace() {

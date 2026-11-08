@@ -21,6 +21,42 @@ fn main() {
         .unwrap_or(0);
     println!("cargo:rustc-env=BUILD_TS={ts}");
     println!("cargo:rustc-env=BUILD_DATE={}", build_date(ts));
+
+    // The utsname "version" field, Linux's shape: "#<build> <RFC 2822 date>"
+    // (what `uname -v` prints).  The build number is the commit count when
+    // the tree is a git checkout, 1 otherwise; the date is the build's.
+    println!("cargo:rustc-env=PRISMOS_BUILD_NUMBER={}", build_number());
+    println!("cargo:rustc-env=PRISMOS_BUILD_DATE={}", rfc2822(ts));
+}
+
+/// Commit count of the checkout (`git rev-list --count HEAD`), or 1 when
+/// there is no git or no repository (a source tarball).
+fn build_number() -> u64 {
+    std::process::Command::new("git")
+        .args(["rev-list", "--count", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(1)
+}
+
+/// "Sun, 08 Nov 2026 17:22:00 +0000" from a unix timestamp -- the date
+/// format Linux puts in its utsname version.
+fn rfc2822(ts: u64) -> String {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    // build_date() gives "YYYY-MM-DD HH:MM:SS UTC"; reuse it rather than
+    // redo the calendar maths.
+    let d = build_date(ts);
+    let (y, mo, day) = (&d[0..4], d[5..7].parse::<usize>().unwrap(), &d[8..10]);
+    let time = &d[11..19];
+    // 1970-01-01 was a Thursday.
+    let wd = DAYS[((ts / 86400) % 7) as usize];
+    format!("{wd}, {day} {} {y} {time} +0000", MONTHS[mo - 1])
 }
 
 /// YYYY-MM-DD HH:MM UTC from a unix timestamp, no external crates

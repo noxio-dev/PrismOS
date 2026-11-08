@@ -683,10 +683,27 @@ static int sc_uname(void)
 	bad += !expect(ec(uname(&u)), 0);
 	bad += !expect(strcmp(u.sysname, "PrismOS"), 0);
 	bad += !expect(strcmp(u.machine, "x86_64"), 0);
-	/* The release moved to "3.2" with this phase (the kernel's own
-	 * sys_uname answers it); the mini-libc program checked "3.1". */
-	bad += !expect(strcmp(u.release, "3.2"), 0);
+	/* Nothing about the build is typed here: the release and the version
+	 * ("#<build> <date>") are whatever the kernel was built with, so the
+	 * test checks them against the other place the kernel prints them --
+	 * /proc/version, "PrismOS version <release> (<who>) <version>". */
+	bad += !expect(u.release[0] != 0, 1);
+	bad += !expect(u.version[0] == '#', 1);
 	bad += !expect(u.nodename[0] != 0, 1);
+	{
+		char pv[256];
+		char want[160];
+		long pf = open("/proc/version", O_RDONLY);
+		long n = pf >= 0 ? read(pf, pv, sizeof pv - 1) : -1;
+		if (pf >= 0)
+			close(pf);
+		if (n < 0)
+			n = 0;
+		pv[n] = 0;
+		fmt(want, sizeof want, "%s version %s (", u.sysname, u.release);
+		bad += !expect(strncmp(pv, want, strlen(want)), 0);
+		bad += !expect(strstr(pv, u.version) != NULL, 1);
+	}
 
 	/* The tty pair: the console answers, a file does not -- and the
 	 * 80 columns come back through tcgetwinsize. */
@@ -699,7 +716,8 @@ static int sc_uname(void)
 	bad += !expect(ec(tcgetattr(f, &t)), -ENOTTY);
 	close(f);
 
-	fmt(d, sizeof d, "PrismOS x86_64 3.2, TCGETS/WINSZ, ENOTTY, %d checks", 9 - bad);
+	fmt(d, sizeof d, "%s %s %s, TCGETS/WINSZ, ENOTTY, %d checks",
+	    u.sysname, u.machine, u.release, 12 - bad);
 	check("uname", bad == 0, d);
 	return bad;
 }
