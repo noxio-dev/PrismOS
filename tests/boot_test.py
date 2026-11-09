@@ -52,6 +52,8 @@ def run_vm(cmd, steps, expect, timeout):
                 if not chunk:
                     break
                 out += chunk
+                sys.stdout.write(chunk.decode("latin-1", errors="replace"))
+                sys.stdout.flush()
             while steps and steps[0][0].encode() in out:
                 _, send = steps.pop(0)
                 time.sleep(0.3)
@@ -479,6 +481,11 @@ def main():
 
     failed = 0
     for name, cmd, steps, expect, timeout in scenarios:
+        print(f"\n{'=' * 60}", flush=True)
+        print(f"[TEST] {name}", flush=True)
+        print(f"[TEST] Timeout: {timeout}s", flush=True)
+        print(f"{'=' * 60}", flush=True)
+
         start = time.time()
         text, missing = run_vm(cmd(), steps, expect, timeout)
         if missing:

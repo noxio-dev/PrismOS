@@ -454,7 +454,7 @@ run-iso: $B/$(NAME).iso $(DATA_IMG)
                 -cdrom $< -serial stdio
 
 test: $B/$(NAME).img
-	$(PYTHON) tests/boot_test.py $< "$(QEMU)" "$(OVMF_CODE)" "$(OVMF_VARS)"
+	$(PYTHON) -u tests/boot_test.py $< "$(QEMU)" "$(OVMF_CODE)" "$(OVMF_VARS)"
 
 # VFS + ext4 against real images, checked with e2fsck (no QEMU needed).
 fstest:
