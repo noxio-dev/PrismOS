@@ -76,7 +76,7 @@ use crate::mem::vmm::{self, AddressSpace};
 use crate::user::elf::Loaded;
 use crate::user::fpu::FpuState;
 use crate::user::fd::FdTable;
-use crate::user::signal::{SignalState, SIGCHLD, WNOHANG};
+use crate::user::signal::{self, SignalState, SIGCHLD, WNOHANG};
 use crate::user::usermode::{self, Prog, DEFAULT_TIMEOUT_TICKS};
 
 pub use crate::user::usermode::Outcome;
@@ -265,6 +265,10 @@ pub struct Process {
     budget: u64,
     /// Tick at which a sleeping process becomes ready again.
     wake_at: u64,
+    /// ITIMER_REAL: tick at which SIGALRM is raised (0 = disarmed) and the
+    /// reload interval in ticks (0 = one shot).  setitimer / alarm.
+    pub itimer_next: u64,
+    pub itimer_interval: u64,
     /// Times the process was given the CPU.
     pub switches: u64,
     /// Times the tick took the CPU away (slice used up or better process).
@@ -546,6 +550,8 @@ fn spawn_common(
         child_sys: 0,
         budget: if timeout_ticks == 0 { DEFAULT_TIMEOUT_TICKS } else { timeout_ticks },
         wake_at: 0,
+        itimer_next: 0,
+        itimer_interval: 0,
         switches: 0,
         preempts: 0,
         exit_seq: 0,
@@ -1228,6 +1234,124 @@ fn wake_sleepers(now: u64) {
     }
 }
 
+/// Raise SIGALRM for every process whose real-time interval timer is due.
+/// Tick handler, IF=0: only flips signal bits and `state`, like
+/// `wake_sleepers`; the death of a default-action process happens later,
+/// in process context.
+fn fire_itimers(now: u64) {
+    const SIGALRM_BIT: u32 = 1 << signal::SIGALRM;
+    // SAFETY: as wake_sleepers.
+    unsafe {
+        for p in (*addr_of_mut!(TABLE)).iter_mut() {
+            if p.itimer_next == 0 || now < p.itimer_next || p.state == State::Zombie {
+                continue;
+            }
+            p.itimer_next = if p.itimer_interval > 0 { now + p.itimer_interval } else { 0 };
+            match p.signals.handler_of(signal::SIGALRM) {
+                signal::SIG_IGN => {}
+                0 => p.signals.dflt_pending |= SIGALRM_BIT,
+                _ => p.signals.pending |= SIGALRM_BIT,
+            }
+            if p.state == State::Sleeping {
+                p.state = State::Ready; // the sleep ends early, as for any signal
+            }
+        }
+    }
+}
+
+/// Microseconds per scheduler tick (the PIT runs at `pit::HZ`).
+const US_PER_TICK: u64 = 1_000_000 / crate::hw::pit::HZ;
+
+fn timeval_to_ticks(sec: i64, usec: i64) -> Option<u64> {
+    if sec < 0 || !(0..1_000_000).contains(&usec) {
+        return None;
+    }
+    let us = (sec as u64).min(1 << 32) * 1_000_000 + usec as u64;
+    if us == 0 {
+        return Some(0);
+    }
+    Some(us.div_ceil(US_PER_TICK))
+}
+
+fn ticks_to_tv_bytes(t: u64) -> [u8; 16] {
+    let us = t * US_PER_TICK;
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&((us / 1_000_000) as i64).to_le_bytes());
+    b[8..].copy_from_slice(&((us % 1_000_000) as i64).to_le_bytes());
+    b
+}
+
+/// The itimerval of the running process's ITIMER_REAL: interval, then the
+/// time left until the next expiry.
+fn itimer_value(cur: &Process) -> [u8; 32] {
+    let left = cur.itimer_next.saturating_sub(crate::hw::pit::ticks());
+    let mut b = [0u8; 32];
+    b[..16].copy_from_slice(&ticks_to_tv_bytes(cur.itimer_interval));
+    b[16..].copy_from_slice(&ticks_to_tv_bytes(if cur.itimer_next == 0 { 0 } else { left.max(1) }));
+    b
+}
+
+const ITIMER_REAL: u64 = 0;
+
+/// `getitimer(which, &itimerval)` (syscall 71).  Only ITIMER_REAL exists.
+pub fn sys_getitimer(which: u64, buf: u64) -> i64 {
+    if which != ITIMER_REAL {
+        return -EINVAL;
+    }
+    let Some(cur) = current() else { return -EFAULT };
+    let v = itimer_value(cur);
+    let Some(aspace) = cur.aspace.as_ref() else { return -EFAULT };
+    if buf == 0 || !aspace.ensure_writable(buf) || !aspace.write(buf, &v, false) {
+        return -EFAULT;
+    }
+    0
+}
+
+/// `setitimer(which, &new, &old)` (syscall 70): arm, re-arm or (value 0)
+/// disarm the real-time timer; `old` gets the previous setting.  What
+/// mlibc's alarm() is built on.
+pub fn sys_setitimer(which: u64, new_p: u64, old_p: u64) -> i64 {
+    if which != ITIMER_REAL {
+        return -EINVAL;
+    }
+    let Some(cur) = current() else { return -EFAULT };
+    let mut nv = [0u8; 32];
+    if new_p == 0 {
+        return -EFAULT;
+    }
+    {
+        let Some(aspace) = cur.aspace.as_ref() else { return -EFAULT };
+        if !aspace.read(new_p, &mut nv) {
+            return -EFAULT;
+        }
+    }
+    let i64_at = |o: usize| i64::from_le_bytes(nv[o..o + 8].try_into().unwrap());
+    let (Some(interval), Some(value)) =
+        (timeval_to_ticks(i64_at(0), i64_at(8)), timeval_to_ticks(i64_at(16), i64_at(24)))
+    else {
+        return -EINVAL;
+    };
+    let old = itimer_value(cur);
+    if old_p != 0 {
+        let Some(aspace) = cur.aspace.as_ref() else { return -EFAULT };
+        if !aspace.ensure_writable(old_p) || !aspace.write(old_p, &old, false) {
+            return -EFAULT;
+        }
+    }
+    let flags = crate::arch::io::cli_save();
+    if value == 0 {
+        cur.itimer_next = 0;
+        cur.itimer_interval = 0;
+    } else {
+        // +1 like sleep_current: never fire early by a partial tick.
+        cur.itimer_next = crate::hw::pit::ticks() + value + 1;
+        cur.itimer_interval = interval;
+    }
+    // SAFETY: restoring the flags cli_save returned.
+    unsafe { crate::arch::io::restore_flags(flags) };
+    0
+}
+
 /// Turn a process into a zombie: outcome, death order, address space freed
 /// (its Drop releases the COW-shared leaves, mem/cow.rs) and descriptors
 /// released (phase 2.6: POSIX closes everything at death -- the last clone
@@ -1566,6 +1690,7 @@ pub fn on_tick(from_user: bool) {
     // changed with interrupts masked.
     unsafe {
         wake_sleepers(crate::hw::pit::ticks());
+        fire_itimers(crate::hw::pit::ticks());
 
         let cur = CURRENT;
         if cur.is_null() {
@@ -1579,6 +1704,16 @@ pub fn on_tick(from_user: bool) {
             (*cur).user_used += 1;
         } else {
             (*cur).sys_used += 1;
+        }
+        // A SIGALRM with the default action ends a process that is
+        // running user code right now (a sleeping one dies at its next
+        // syscall return, see signal::deliver).
+        if from_user {
+            let s = &(*cur).signals;
+            let m = s.dflt_pending & !s.blocked;
+            if m != 0 {
+                exit_current(Outcome::Signaled(m.trailing_zeros() as u64));
+            }
         }
         if (*cur).aspace.is_some() && (*cur).used >= (*cur).budget {
             exit_current(Outcome::Timeout);

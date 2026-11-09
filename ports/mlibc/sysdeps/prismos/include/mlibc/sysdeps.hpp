@@ -121,7 +121,10 @@ struct PrismOSSysdepTags :
         Mount,
         Umount2,
         Statfs,
-        Statvfs
+        Statvfs,
+        SetHostname,
+        SetItimer,
+        GetItimer
 {};
 
 struct SysdepTraits {

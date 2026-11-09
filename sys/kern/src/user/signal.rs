@@ -67,6 +67,7 @@ pub const SIGKILL: u64 = 9;
 pub const SIGUSR1: u64 = 10;
 pub const SIGSEGV: u64 = 11;
 pub const SIGPIPE: u64 = 13;
+pub const SIGALRM: u64 = 14;
 pub const SIGTERM: u64 = 15;
 pub const SIGCHLD: u64 = 17;
 
@@ -143,11 +144,15 @@ pub struct SignalState {
     pub(crate) actions: [SigAction; NSIG],
     pub(crate) pending: u32,
     pub(crate) blocked: u32,
+    /// Signals raised asynchronously (the interval timer) whose disposition
+    /// is the default *terminate*: acted on in process context, at the
+    /// next syscall return or user-mode tick, never from the IRQ itself.
+    pub(crate) dflt_pending: u32,
 }
 
 impl SignalState {
     pub const fn new() -> SignalState {
-        SignalState { actions: [SigAction::new(); NSIG], pending: 0, blocked: 0 }
+        SignalState { actions: [SigAction::new(); NSIG], pending: 0, blocked: 0, dflt_pending: 0 }
     }
 
     /// The installed handler of `sig` (0 = default, SIG_IGN = ignored) --
@@ -160,7 +165,7 @@ impl SignalState {
     /// an empty pending set and the *blocked mask* (POSIX keeps it too --
     /// phase 3.2; the pre-3.2 code cleared it).
     pub fn fork_copy(&self) -> SignalState {
-        SignalState { actions: self.actions, pending: 0, blocked: self.blocked }
+        SignalState { actions: self.actions, pending: 0, blocked: self.blocked, dflt_pending: 0 }
     }
 
     /// `execve` (POSIX, phase 3.2): caught handlers go back to the default,
@@ -178,6 +183,7 @@ impl SignalState {
             }
         }
         self.pending = 0;
+        self.dflt_pending = 0;
     }
 }
 
@@ -554,6 +560,19 @@ pub fn pipe_sigpipe() -> i64 {
 /// (one u64 slot, sigset_t-sized like Linux) followed by the saved
 /// IsrFrame.  sigreturn reads this exact layout back -- keep both in sync.
 pub fn deliver(frame: &mut IsrFrame) {
+    // A default-action signal the timer raised (SIGALRM with no handler):
+    // the process dies of it, like any other terminating signal.
+    if let Some(Some(sig)) = with_current(|s| {
+        let m = s.dflt_pending & !s.blocked;
+        if m == 0 {
+            return None;
+        }
+        let sig = m.trailing_zeros() as u64;
+        s.dflt_pending &= !(1u32 << sig);
+        Some(sig)
+    }) {
+        process::exit_current(process::Outcome::Signaled(sig));
+    }
     // Pick a signal: lowest number first, handlers only (SIG_IGN counts as
     // "installed" -- its pending bit is simply dropped), nothing blocked.
     let pick = with_current(|s| {

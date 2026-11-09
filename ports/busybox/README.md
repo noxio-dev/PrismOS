@@ -168,7 +168,7 @@ contract by `ports/toolchain/verify.sh`.
 
 ## Keyboard applets
 
-`loadkmap`, `dumpkmap`, `kbd_mode` and `showkey` are enabled (BusyBox has no
+`loadkmap`, `dumpkmap`, `kbd_mode` and `showkey` are enabled (showkey needs setitimer, syscall 70) (BusyBox has no
 `loadkeys`: `loadkmap` reads the binary keymap `loadkeys --bkeymap` writes).
 They need `<linux/kd.h>`; the sysroot's copy wins when it has one, otherwise
 the verbatim UAPI header in `include/linux/kd.h` is used (see build.sh).

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Set the host name from /etc/hostname (when the file exists).  The kernel
+# starts with its built-in name, or the hostname= command-line option.
+test -f /etc/hostname && read name < /etc/hostname && test -n "$name" && hostname "$name"

@@ -17,6 +17,6 @@ holds the files you edit by hand: `/etc/passwd`, `/etc/profile`, `/etc/rc`
 The kernel boots with the `us` keymap.  `/etc/rc.d/S10keymap` loads
 `/usr/share/keymaps/$(cat /etc/keymap).bkmap` with BusyBox `loadkmap`: write
 `fr` in `/etc/keymap` for AZERTY.  `dumpkmap > file` saves the current map,
-`kbd_mode` / `showkey` inspect the keyboard.  The built-in maps are
+`kbd_mode`, `showkey` and the kernel shell command `kbd` inspect it.  The built-in maps are
 regenerated with `tools/mkkmap.rs`; the decoder is tested on the host with
 `tests/keymap_host.rs`.

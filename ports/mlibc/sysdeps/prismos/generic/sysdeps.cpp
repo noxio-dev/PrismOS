@@ -23,6 +23,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/resource.h>
+#include <sys/time.h>
 #include <sys/statfs.h>
 #include <sys/statvfs.h>
 #include <termios.h>
@@ -712,6 +713,30 @@ int Sysdeps<Readlink>::operator()(const char *path, void *buffer, size_t max_siz
 
 int Sysdeps<Uname>::operator()(struct utsname *buf) {
         auto ret = sys(PRISM_SYS_UNAME, buf);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<SetHostname>::operator()(const char *buffer, size_t bufsize) {
+        auto ret = sys(PRISM_SYS_SETHOSTNAME, buffer, bufsize);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+// ITIMER_REAL only (the kernel answers EINVAL for the other two clocks);
+// alarm() is setitimer(ITIMER_REAL) underneath.
+int Sysdeps<SetItimer>::operator()(int which, const struct itimerval *new_value,
+                struct itimerval *old_value) {
+        auto ret = sys(PRISM_SYS_SETITIMER, which, new_value, old_value);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<GetItimer>::operator()(int which, struct itimerval *curr_value) {
+        auto ret = sys(PRISM_SYS_GETITIMER, which, curr_value);
         if(int e = sc_error(ret); e)
                 return e;
         return 0;

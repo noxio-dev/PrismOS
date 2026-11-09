@@ -813,6 +813,25 @@ pub fn sys_nanosleep(req_p: u64, rem_p: u64) -> i64 {
     0
 }
 
+/// `sethostname(name, len)` (syscall 69): the node name `uname` reports.
+/// No permission check yet (there is only root); at most 64 bytes, UTF-8,
+/// no NUL or newline.
+pub fn sys_sethostname(name_p: u64, len: u64) -> i64 {
+    if len == 0 || len > 64 {
+        return -EINVAL;
+    }
+    let mut buf = [0u8; 64];
+    let Some(cur) = process::current() else { return -EFAULT };
+    let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return -EFAULT };
+    if !aspace.read(name_p, &mut buf[..len as usize]) {
+        return -EFAULT;
+    }
+    match core::str::from_utf8(&buf[..len as usize]) {
+        Ok(s) if crate::lib::uts::set_nodename(s) => 0,
+        _ => -EINVAL,
+    }
+}
+
 /// `reboot(cmd)` (syscall 57): flush every file system, then restart or
 /// power the machine off.  The commands are the Linux ones; anything else
 /// is -EINVAL.  The exit routes are the classic ISA ones: the 0x604 and

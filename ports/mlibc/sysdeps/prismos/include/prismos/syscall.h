@@ -89,6 +89,9 @@ enum {
         PRISM_SYS_WAIT4 = 66,       /* wait4(pid, &status, flags, &rusage) */
         PRISM_SYS_GETRUSAGE = 67,   /* getrusage(who, &rusage) */
         PRISM_SYS_UTIMENSAT = 68,   /* utimensat(dirfd, path, &times[2], flags) */
+        PRISM_SYS_SETHOSTNAME = 69, /* sethostname(name, len) -- uname's nodename */
+        PRISM_SYS_SETITIMER = 70,   /* setitimer(which, &new, &old) -- ITIMER_REAL only */
+        PRISM_SYS_GETITIMER = 71,   /* getitimer(which, &cur) */
 };
 
 /* arch_prctl() codes -- the Linux x86-64 values the kernel expects. */
