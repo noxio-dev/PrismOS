@@ -40,12 +40,17 @@
 //     as absent (pure-USB machines): the shell stays on the serial console
 //     and says so instead of spinning.
 //
+// Decoding is in keymap.rs: a Linux-style keymap engine (Caps / Num / Scroll
+// Lock with their LEDs, navigation and function keys, dead keys, keymaps
+// loadable at run time with BusyBox `loadkmap`).  This file is the
+// hardware side: i8042 bring-up, scancode normalisation, the LED handshake.
 // Layouts are switchable at runtime (`layout us|fr` in the shell).
 
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
-use crate::arch::io::{inb, io_wait, outb};
+use super::keymap::{self, Engine, Keymap, LED_CAP};
+use crate::arch::io::{inb, io_wait, outb, IrqGuard};
 
 const KBD_DATA: u16 = 0x60;
 const KBD_STATUS: u16 = 0x64;
@@ -74,11 +79,9 @@ impl Ring {
         // Overrun: drop the byte rather than tear the queue.
     }
 
-    /// Queue a character as UTF-8 (all or nothing, so a full ring never
-    /// leaves half a sequence behind).
-    fn push_char(&mut self, c: char) {
-        let mut tmp = [0u8; 4];
-        let bytes = c.encode_utf8(&mut tmp).as_bytes();
+    /// Queue a whole key's bytes (all or nothing, so a full ring never
+    /// leaves half an escape sequence behind).
+    fn push_bytes(&mut self, bytes: &[u8]) {
         let used = self.head.load(Ordering::Relaxed).wrapping_sub(self.tail.load(Ordering::Acquire));
         if used as usize + bytes.len() > self.buf.len() {
             return;
@@ -101,137 +104,42 @@ impl Ring {
 }
 
 // ------------------------------------------------------------------ layout
+//
+// The keys live in keymap.rs (Linux console keymaps, loadable at run time
+// with BusyBox `loadkmap`).  `layout us|fr` regenerates the built-in ones.
 
-/// One keyboard layout: unshifted / shifted / AltGr tables indexed by
-/// set-1 scancode, holding Unicode characters ('\0' = no character).  The
-/// decoder queues them as UTF-8, so accents, the euro sign and friends
-/// reach the console intact.
-pub struct Layout {
-    pub name: &'static str,
-    pub plain: [char; 128],
-    pub shift: [char; 128],
-    pub altgr: [char; 128],
-}
+const LAYOUT_US_ID: u8 = 0;
+const LAYOUT_FR_ID: u8 = 1;
+/// A keymap modified through KDSKBENT (loadkmap): no longer a built-in one.
+const LAYOUT_CUSTOM: u8 = 2;
 
-const fn fill(dst: &mut [char; 128], start: u8, s: &[char]) {
-    let mut i = 0;
-    while i < s.len() {
-        dst[start as usize + i] = s[i];
-        i += 1;
-    }
-}
+static LAYOUT: AtomicU8 = AtomicU8::new(LAYOUT_US_ID);
 
-/// Keys every layout shares: Esc, Backspace, Tab, Enter, Space, keypad.
-const fn common(t: &mut [char; 128]) {
-    t[0x01] = '\x1b';
-    t[0x0E] = '\x7f';
-    t[0x0F] = '\t';
-    t[0x1C] = '\n';
-    t[0x39] = ' ';
-}
-
-const fn keypad(t: &mut [char; 128]) {
-    fill(t, 0x47, &['7', '8', '9', '-', '4', '5', '6', '+', '1', '2', '3', '0', '.']);
-}
-
-const US_PLAIN: [char; 128] = {
-    let mut t = ['\0'; 128];
-    common(&mut t);
-    fill(&mut t, 0x02, &['1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=']);
-    fill(&mut t, 0x10, &['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']']);
-    fill(&mut t, 0x1E, &['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'']);
-    t[0x29] = '`';
-    t[0x2B] = '\\';
-    fill(&mut t, 0x2C, &['z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/']);
-    t[0x56] = '\\'; // ISO key next to left shift
-    keypad(&mut t);
-    t
-};
-
-const US_SHIFT: [char; 128] = {
-    let mut t = ['\0'; 128];
-    common(&mut t);
-    fill(&mut t, 0x02, &['!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+']);
-    fill(&mut t, 0x10, &['Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}']);
-    fill(&mut t, 0x1E, &['A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"']);
-    t[0x29] = '~';
-    t[0x2B] = '|';
-    fill(&mut t, 0x2C, &['Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?']);
-    t[0x56] = '|';
-    t
-};
-
-const US_ALTGR: [char; 128] = ['\0'; 128];
-
-/// French AZERTY (the standard Windows FR layout).  AltGr layer:
-///   é~ " # ' { ( [ - | è` _ \ ç^ à@ ) ] = }
-/// so **AltGr+8 is the backslash** (and AltGr+9 = ^, AltGr+0 = @), AltGr+E
-/// is the euro sign.  ^ and ¨ are typed as plain characters (no dead keys).
-const FR_PLAIN: [char; 128] = {
-    let mut t = ['\0'; 128];
-    common(&mut t);
-    t[0x29] = '²';
-    fill(&mut t, 0x02, &['&', 'é', '"', '\'', '(', '-', 'è', '_', 'ç', 'à', ')', '=']);
-    fill(&mut t, 0x10, &['a', 'z', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '^', '$']);
-    fill(&mut t, 0x1E, &['q', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'm', 'ù']);
-    t[0x2B] = '*';
-    fill(&mut t, 0x2C, &['w', 'x', 'c', 'v', 'b', 'n', ',', ';', ':', '!']);
-    t[0x56] = '<';
-    keypad(&mut t);
-    t
-};
-
-const FR_SHIFT: [char; 128] = {
-    let mut t = ['\0'; 128];
-    common(&mut t);
-    fill(&mut t, 0x02, &['1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '°', '+']);
-    fill(&mut t, 0x10, &['A', 'Z', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '¨', '£']);
-    fill(&mut t, 0x1E, &['Q', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 'M', '%']);
-    t[0x2B] = 'µ';
-    fill(&mut t, 0x2C, &['W', 'X', 'C', 'V', 'B', 'N', '?', '.', '/', '§']);
-    t[0x56] = '>';
-    t
-};
-
-const FR_ALTGR: [char; 128] = {
-    let mut t = ['\0'; 128];
-    // 0x03..0x0D: the AltGr layer of the digit row.
-    fill(&mut t, 0x03, &['~', '#', '{', '[', '|', '`', '\\', '^', '@', ']', '}']);
-    t[0x12] = '€';
-    t[0x1B] = '¤';
-    t
-};
-
-pub static LAYOUT_US: Layout = Layout { name: "us", plain: US_PLAIN, shift: US_SHIFT, altgr: US_ALTGR };
-pub static LAYOUT_FR: Layout = Layout { name: "fr", plain: FR_PLAIN, shift: FR_SHIFT, altgr: FR_ALTGR };
-
-/// 0 = US, 1 = FR.
-static LAYOUT: AtomicU8 = AtomicU8::new(0);
-
+/// Install a built-in layout ("us" or "fr").
 pub fn set_layout(name: &str) -> bool {
-    match name {
-        "us" => LAYOUT.store(0, Ordering::Release),
-        "fr" => LAYOUT.store(1, Ordering::Release),
+    let (layout, id) = match name {
+        "us" => (&keymap::LAYOUT_US, LAYOUT_US_ID),
+        "fr" => (&keymap::LAYOUT_FR, LAYOUT_FR_ID),
         _ => return false,
+    };
+    let _g = IrqGuard::new();
+    // SAFETY: interrupts off; the decoder only reads the keymap from IRQ1.
+    unsafe {
+        keymap::build_default(&mut *addr_of_mut!(KEYMAP), layout);
+        (*addr_of_mut!(KBD)).engine.release_all();
     }
+    LAYOUT.store(id, Ordering::Release);
     true
 }
 
 pub fn layout_name() -> &'static str {
-    if LAYOUT.load(Ordering::Acquire) == 1 {
-        "fr"
-    } else {
-        "us"
+    match LAYOUT.load(Ordering::Acquire) {
+        LAYOUT_FR_ID => "fr",
+        LAYOUT_US_ID => "us",
+        _ => "custom",
     }
 }
 
-fn current_layout() -> &'static Layout {
-    if LAYOUT.load(Ordering::Acquire) == 1 {
-        &LAYOUT_FR
-    } else {
-        &LAYOUT_US
-    }
-}
 
 // ---------------------------------------------- set 2 -> set 1 translation
 // When the i8042 cannot translate (config bit 6 refuses to stick -- seen on
@@ -301,6 +209,23 @@ const SET2_TO_SET1: [u8; 128] = {
     t[0x5D] = 0x2B; // backslash
     t[0x66] = 0x0E; // backspace
     t[0x76] = 0x01; // esc
+    // function keys (F7 is 0x83: handled before the table), locks, windows keys
+    t[0x05] = 0x3B; // F1
+    t[0x06] = 0x3C; // F2
+    t[0x04] = 0x3D; // F3
+    t[0x0C] = 0x3E; // F4
+    t[0x03] = 0x3F; // F5
+    t[0x0B] = 0x40; // F6
+    t[0x0A] = 0x42; // F8
+    t[0x01] = 0x43; // F9
+    t[0x09] = 0x44; // F10
+    t[0x78] = 0x57; // F11
+    t[0x07] = 0x58; // F12
+    t[0x77] = 0x45; // num lock
+    t[0x7E] = 0x46; // scroll lock
+    t[0x1F] = 0x5B; // E0: left windows
+    t[0x27] = 0x5C; // E0: right windows
+    t[0x2F] = 0x5D; // E0: menu
     // keypad
     t[0x69] = 0x4F; // 1
     t[0x6B] = 0x4B; // 4
@@ -321,17 +246,24 @@ const SET2_TO_SET1: [u8; 128] = {
 
 // ------------------------------------------------------------------- state
 
+const LED_IDLE: u8 = 0;
+const LED_AWAIT_CMD: u8 = 1; // 0xED sent, waiting for its ACK
+const LED_AWAIT_MASK: u8 = 2; // mask sent, waiting for its ACK
+const LED_NO_OVERRIDE: u8 = 0xFF;
+
 pub struct Kbd {
-    shift_l: bool,
-    shift_r: bool,
-    ctrl_l: bool,
-    ctrl_r: bool,
-    alt_l: bool,
-    altgr: bool, // right alt
-    caps: bool,
-    ext: bool, // 0xE0 prefix pending
-    brk: bool, // set 2: 0xF0 break prefix pending
+    ext: bool,  // 0xE0 prefix pending
+    brk: bool,  // set 2: 0xF0 break prefix pending
     set2: bool, // decoding raw set 2 codes
+    skip: u8,   // bytes of an 0xE1 (Pause) sequence still to swallow
+    engine: Engine,
+    // --- LED update state machine (0xED + mask, each acknowledged) ---
+    led_state: u8,
+    led_applied: u8, // mask the keyboard last confirmed (0xFF = unknown)
+    led_last: u8,    // mask in flight
+    led_retry: u8,
+    led_noise: u8,   // key bytes seen while waiting for an ACK
+    led_override: u8, // KDSETLED, LED_NO_OVERRIDE = follow the locks
 }
 
 /// Controller probe results, exposed to the boot log and `kbd` command.
@@ -353,116 +285,163 @@ static STATUS_CONFIG: AtomicU8 = AtomicU8::new(0);
 static STATUS_SET2: AtomicBool = AtomicBool::new(false);
 static STATUS_ACKED: AtomicBool = AtomicBool::new(false);
 static IRQ_COUNT: AtomicU32 = AtomicU32::new(0);
+/// The keyboard answered at init: worth sending it LED commands.
+static LED_CAPABLE: AtomicBool = AtomicBool::new(false);
 
 static mut KBD: Kbd = Kbd::new();
 static mut QUEUE: Ring = Ring::new();
+static mut KEYMAP: Keymap = Keymap::new();
 
 impl Kbd {
     const fn new() -> Kbd {
         Kbd {
-            shift_l: false,
-            shift_r: false,
-            ctrl_l: false,
-            ctrl_r: false,
-            alt_l: false,
-            altgr: false,
-            caps: false,
             ext: false,
             brk: false,
             set2: false,
+            skip: 0,
+            engine: Engine::new(),
+            led_state: LED_IDLE,
+            led_applied: 0xFF,
+            led_last: 0,
+            led_retry: 0,
+            led_noise: 0,
+            led_override: LED_NO_OVERRIDE,
         }
     }
 
-    /// Translate one raw controller byte into an optional character.
-    fn feed(&mut self, raw: u8) -> Option<char> {
+    /// The LED mask the keyboard should show.
+    fn led_want(&self) -> u8 {
+        if self.led_override != LED_NO_OVERRIDE {
+            self.led_override
+        } else {
+            self.engine.leds & 7
+        }
+    }
+
+    /// Start a LED update if the keyboard is out of date.  Never waits for
+    /// the keyboard: the ACKs come back through IRQ1 (`led_reply`).
+    fn kick_leds(&mut self) {
+        if self.led_state != LED_IDLE
+            || !LED_CAPABLE.load(Ordering::Relaxed)
+            || self.led_want() == self.led_applied
+        {
+            return;
+        }
+        if !wait_clear(0x02, 20) {
+            return; // controller busy: the next key press retries
+        }
+        // SAFETY: keyboard command on fixed ports.
+        unsafe { outb(KBD_DATA, 0xED) };
+        self.led_state = LED_AWAIT_CMD;
+        self.led_retry = 0;
+        self.led_noise = 0;
+    }
+
+    /// The keyboard answered a LED command: 0xFA = ACK, 0xFE = resend.
+    fn led_reply(&mut self, reply: u8) {
+        let write = |b: u8| -> bool {
+            if !wait_clear(0x02, 20) {
+                return false;
+            }
+            // SAFETY: as in kick_leds.
+            unsafe { outb(KBD_DATA, b) };
+            true
+        };
+        match (self.led_state, reply) {
+            (LED_AWAIT_CMD, 0xFA) => {
+                self.led_last = self.led_want();
+                self.led_state = if write(self.led_last) { LED_AWAIT_MASK } else { LED_IDLE };
+            }
+            (LED_AWAIT_MASK, 0xFA) => {
+                self.led_applied = self.led_last;
+                self.led_state = LED_IDLE;
+                self.kick_leds(); // the locks may have changed meanwhile
+            }
+            (LED_AWAIT_CMD, 0xFE) | (LED_AWAIT_MASK, 0xFE) => {
+                self.led_retry += 1;
+                let byte = if self.led_state == LED_AWAIT_CMD { 0xED } else { self.led_last };
+                if self.led_retry > 3 || !write(byte) {
+                    self.led_state = LED_IDLE;
+                }
+            }
+            _ => {} // stray ACK: nothing was waiting for it
+        }
+    }
+
+    /// One raw controller byte in: scancode decoding, keymap, queue out.
+    fn handle_byte(&mut self, raw: u8, km: &Keymap, queue: &mut Ring) {
+        // ACK / resend belong to the LED handshake, never to a key.
+        if raw == 0xFA || raw == 0xFE {
+            self.led_reply(raw);
+            return;
+        }
+        // Key bytes may legitimately overtake the ACK; but if a lot of them
+        // pass without one, the answer got lost: stop waiting.
+        if self.led_state != LED_IDLE {
+            self.led_noise += 1;
+            if self.led_noise > 16 {
+                self.led_state = LED_IDLE;
+            }
+        }
+
+        // showkey / kbd_mode -s: hand the bytes over untouched.
+        if self.engine.mode == keymap::K_RAW {
+            queue.push_bytes(&[raw]);
+            return;
+        }
+
+        // Pause/Break is one long prefix-1 sequence without a release.
+        if self.skip > 0 {
+            self.skip -= 1;
+            return;
+        }
+        if raw == 0xE1 {
+            self.skip = if self.set2 { 7 } else { 5 };
+            return;
+        }
         // The extended-key prefix is the same in both sets.
         if raw == 0xE0 {
             self.ext = true;
-            return None;
+            return;
         }
         if self.set2 && raw == 0xF0 {
             self.brk = true;
-            return None;
+            return;
         }
 
         // Normalize to (release, set-1 scancode).
         let (release, sc): (bool, u8) = if self.set2 {
             let r = self.brk;
             self.brk = false;
-            (r, SET2_TO_SET1[(raw & 0x7F) as usize])
+            let sc = match raw {
+                0x83 => 0x41, // F7 does not fit in 7 bits
+                0..=0x7F => SET2_TO_SET1[raw as usize],
+                _ => 0,
+            };
+            (r, sc)
         } else {
             (raw & 0x80 != 0, raw & 0x7F)
         };
+        let ext = self.ext;
+        self.ext = false;
         if sc == 0 {
-            return None; // F-keys and friends: nothing we decode
+            return; // a key we do not know
+        }
+        let kc = keymap::keycode_of(sc, ext);
+        if kc == 0 {
+            return; // fake shift, multimedia key...
         }
 
-        // --- extended (E0-prefixed) keys ---------------------------------
-        if self.ext {
-            self.ext = false;
-            match sc {
-                0x1D => self.ctrl_r = !release, // right ctrl
-                0x38 => self.altgr = !release, // right alt = AltGr
-                0x1C if !release => return Some('\n'), // keypad enter
-                0x35 if !release => return Some('/'),  // keypad slash
-                _ => {}
-            }
-            return None; // arrows, insert, delete, releases: not needed yet
+        let leds_before = self.engine.leds;
+        let mut out = self.engine.new_out();
+        self.engine.key(km, kc, !release, &mut out);
+        queue.push_bytes(out.bytes());
+        if self.engine.leds != leds_before {
+            self.kick_leds();
         }
-
-        // --- modifiers ----------------------------------------------------
-        match sc {
-            0x2A => {
-                self.shift_l = !release;
-                return None;
-            }
-            0x36 => {
-                self.shift_r = !release;
-                return None;
-            }
-            0x1D => {
-                self.ctrl_l = !release;
-                return None;
-            }
-            0x38 => {
-                self.alt_l = !release;
-                return None;
-            }
-            0x3A if !release => {
-                self.caps = !self.caps;
-                return None;
-            }
-            _ => {}
-        }
-        if release {
-            return None;
-        }
-
-        // --- printable translation -----------------------------------------
-        let layout = current_layout();
-        let shifted = self.shift_l || self.shift_r;
-        let mut c = if self.altgr {
-            layout.altgr[sc as usize]
-        } else if shifted {
-            layout.shift[sc as usize]
-        } else {
-            layout.plain[sc as usize]
-        };
-        if c == '\0' {
-            return None;
-        }
-        if self.caps && c.is_alphabetic() && !self.altgr {
-            // Caps Lock flips the case of letters (é -> É as well).
-            let flipped = if shifted { c.to_lowercase().next() } else { c.to_uppercase().next() };
-            c = flipped.unwrap_or(c);
-        }
-        // Ctrl+letter -> matching control character (Ctrl-C, Ctrl-U...).
-        if (self.ctrl_l || self.ctrl_r) && c.is_ascii_alphabetic() {
-            return Some((c.to_ascii_lowercase() as u8 & 0x1F) as char);
-        }
-        Some(c)
     }
 }
+
 
 // ------------------------------------------------------------ i8042 driver
 //
@@ -711,6 +690,10 @@ fn wait_bat() -> bool {
 
 /// Bring up the i8042 + keyboard for real hardware (see module comment).
 pub fn init() -> Status {
+    // 0. The default keymap, before any key can arrive (also on machines
+    //    without a PS/2 controller: the shell `layout` command needs it).
+    set_layout("us");
+
     // 1. Presence probe: repeated 0xFF (floating bus) or 0x00 with no
     //    system flag means there is no controller to talk to.
     let mut all_ff = true;
@@ -793,6 +776,19 @@ pub fn init() -> Status {
     STATUS_ACKED.store(acked, Ordering::Release);
     drain();
 
+    // 6. Show the lock state (Num Lock starts on) on the LEDs.  Synchronous
+    //    here -- IRQ1 is still masked; later updates go through IRQ1.
+    if acked {
+        LED_CAPABLE.store(true, Ordering::Release);
+        // SAFETY: IRQs masked, single CPU.
+        let kbd = unsafe { &mut *addr_of_mut!(KBD) };
+        let mask = kbd.led_want();
+        if kbd_cmd(0xED, KBD_ACK_TIMEOUT) && kbd_cmd(mask, KBD_ACK_TIMEOUT) {
+            kbd.led_applied = mask;
+        }
+        drain();
+    }
+
     STATUS_PRESENT.store(self_test || port_test || acked, Ordering::Release);
     status_snapshot()
 }
@@ -826,9 +822,8 @@ pub fn on_irq() {
         // SAFETY: single IRQ context; the ring is SPSC.
         let kbd = unsafe { &mut *addr_of_mut!(KBD) };
         let queue = unsafe { &mut *addr_of_mut!(QUEUE) };
-        if let Some(c) = kbd.feed(b) {
-            queue.push_char(c);
-        }
+        let km = unsafe { &*addr_of_mut!(KEYMAP) };
+        kbd.handle_byte(b, km, queue);
     }
 }
 
@@ -859,15 +854,115 @@ pub fn poll() -> bool {
     // SAFETY: as above.
     let kbd = unsafe { &mut *addr_of_mut!(KBD) };
     let queue = unsafe { &mut *addr_of_mut!(QUEUE) };
-    if let Some(c) = kbd.feed(b) {
-        queue.push_char(c);
-    }
+    let km = unsafe { &*addr_of_mut!(KEYMAP) };
+    kbd.handle_byte(b, km, queue);
     true
 }
 
 /// Modifier snapshot for the `kbd` command: (shift, ctrl, alt, altgr, caps).
 pub fn modifiers() -> (bool, bool, bool, bool, bool) {
     // SAFETY: read-only snapshot of the decoder state.
-    let k = unsafe { &*addr_of_mut!(KBD) };
-    (k.shift_l || k.shift_r, k.ctrl_l || k.ctrl_r, k.alt_l || k.altgr, k.altgr, k.caps)
+    let e = unsafe { &(*addr_of_mut!(KBD)).engine };
+    let s = e.shift_state;
+    (
+        s & 0b0011_0001 != 0,
+        s & 0b1100_0100 != 0,
+        s & 0b0000_1010 != 0,
+        s & 0b0000_0010 != 0,
+        e.leds & LED_CAP != 0,
+    )
+}
+
+/// Lock state, the LED bits: bit 0 Scroll Lock, bit 1 Num Lock, bit 2 Caps Lock.
+pub fn leds() -> u8 {
+    // SAFETY: read-only snapshot.
+    unsafe { (*addr_of_mut!(KBD)).engine.leds }
+}
+
+// ------------------------------------------------- console keyboard ioctls
+//
+// What `sys_ioctl` needs for KDGKBENT / KDSKBENT (BusyBox loadkmap and
+// dumpkmap), KDGKBMODE / KDSKBMODE (kbd_mode, showkey) and the LED ioctls.
+// Callers run in process context: the decoder state is shared with IRQ1, so
+// every mutation happens with interrupts off.
+
+/// KDGKBENT: K_NOSUCHMAP for a table that does not exist.
+pub fn kd_get_entry(table: u8, index: u8) -> u16 {
+    let _g = IrqGuard::new();
+    // SAFETY: interrupts are off, single CPU takes IRQ1.
+    unsafe { (*addr_of_mut!(KEYMAP)).get(table as usize, index as usize) }
+}
+
+/// KDSKBENT.  False = invalid table or index.
+pub fn kd_set_entry(table: u8, index: u8, value: u16) -> bool {
+    let _g = IrqGuard::new();
+    // SAFETY: as above.
+    let ok = unsafe { (*addr_of_mut!(KEYMAP)).set(table as usize, index as usize, value) };
+    if ok {
+        LAYOUT.store(LAYOUT_CUSTOM, Ordering::Release);
+    }
+    ok
+}
+
+/// KDGKBMODE.
+pub fn kd_get_mode() -> u8 {
+    // SAFETY: read-only snapshot.
+    unsafe { (*addr_of_mut!(KBD)).engine.mode }
+}
+
+/// KDSKBMODE.  False = unknown mode.
+pub fn kd_set_mode(mode: u8) -> bool {
+    if mode > keymap::K_OFF {
+        return false;
+    }
+    let _g = IrqGuard::new();
+    // SAFETY: interrupts off.
+    let kbd = unsafe { &mut *addr_of_mut!(KBD) };
+    if kbd.engine.mode != mode {
+        kbd.engine.mode = mode;
+        // Release events were not tracked in the previous mode.
+        kbd.engine.release_all();
+    }
+    true
+}
+
+/// KDGKBLED: lock state in the low 3 bits, the "default" state above.
+pub fn kd_get_kbled() -> u8 {
+    // SAFETY: read-only snapshot.
+    let e = unsafe { &(*addr_of_mut!(KBD)).engine };
+    (e.leds & 7) | (e.default_leds & 7) << 4
+}
+
+/// KDSKBLED: set the lock state (arg 0..7) or the default state (arg
+/// 0x10..0x70, the state shifted left by 4).  False = invalid argument.
+pub fn kd_set_kbled(arg: u64) -> bool {
+    if arg & !0x77 != 0 {
+        return false;
+    }
+    let _g = IrqGuard::new();
+    // SAFETY: interrupts off.
+    let kbd = unsafe { &mut *addr_of_mut!(KBD) };
+    if arg & 0x70 != 0 {
+        kbd.engine.default_leds = (arg >> 4) as u8 & 7;
+    } else {
+        kbd.engine.leds = arg as u8 & 7;
+    }
+    kbd.kick_leds();
+    true
+}
+
+/// KDGETLED: what the keyboard LEDs show right now.
+pub fn kd_get_led() -> u8 {
+    // SAFETY: read-only snapshot.
+    unsafe { (*addr_of_mut!(KBD)).led_want() }
+}
+
+/// KDSETLED: show `arg` (0..7) on the LEDs, or, for anything else, go back
+/// to showing the lock state.
+pub fn kd_set_led(arg: u64) {
+    let _g = IrqGuard::new();
+    // SAFETY: interrupts off.
+    let kbd = unsafe { &mut *addr_of_mut!(KBD) };
+    kbd.led_override = if arg <= 7 { arg as u8 } else { LED_NO_OVERRIDE };
+    kbd.kick_leds();
 }

@@ -148,7 +148,7 @@ BASE="-O2 -ffreestanding -fPIE -fno-stack-protector -fno-asynchronous-unwind-tab
 
 compile() {
         exec "$CCRAW" $BASE -nostdinc -isystem "$GCCINC" \
-                -isystem "$SYSROOT/usr/include" "$@"
+                -isystem "$SYSROOT/usr/include" -isystem "$REPO/ports/busybox/include" -isystem "$REPO/ports/mlibc/linux-headers" "$@"
 }
 
 # ---- the link: the sandwich of tools/prism.py's compile_and_link ----
@@ -202,7 +202,7 @@ link() {
         for f in $srcs; do
                 o=$(mktemp "$(dirname "$0")/prism-cc.XXXXXX")
                 if ! "$CCRAW" $BASE -nostdinc -isystem "$GCCINC" \
-                                -isystem "$SYSROOT/usr/include" -c "$f" -o "$o"; then
+                                -isystem "$SYSROOT/usr/include" -isystem "$REPO/ports/busybox/include" -isystem "$REPO/ports/mlibc/linux-headers" -c "$f" -o "$o"; then
                         rm -f "$o"
                         exit 1
                 fi

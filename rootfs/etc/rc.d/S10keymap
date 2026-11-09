@@ -1,0 +1,12 @@
+#!/bin/sh
+# Load the console keymap named in /etc/keymap (us, fr, or any
+# /usr/share/keymaps/NAME.bkmap, e.g. one made with `dumpkmap` or
+# `loadkeys --bkeymap`).  The kernel starts with "us".
+km=us
+test -f /etc/keymap && read km < /etc/keymap
+file=/usr/share/keymaps/$km.bkmap
+if test -f "$file"; then
+	loadkmap < "$file" || echo "keymap: loadkmap $km failed"
+else
+	echo "keymap: $file not found"
+fi

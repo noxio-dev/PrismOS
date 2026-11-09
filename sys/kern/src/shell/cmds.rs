@@ -291,6 +291,9 @@ fn cmd_kbd(_args: &mut Args) {
     crate::kprintln!("keyboard : {}", crate::hw::kbd::layout_name());
     crate::kprintln!("modifiers: shift={} ctrl={} alt={} altgr={} caps={}",
         yn(shift), yn(ctrl), yn(alt), yn(altgr), yn(caps));
+    let leds = crate::hw::kbd::leds();
+    crate::kprintln!("locks    : num={} caps={} scroll={}",
+        yn(leds & 2 != 0), yn(leds & 4 != 0), yn(leds & 1 != 0));
     // SAFETY: raw status port read.
     let status = unsafe { crate::arch::io::inb(0x64) };
     crate::kprintln!("i8042    : status {:#04x} (obf={} ibf={} aux={} sys={})",

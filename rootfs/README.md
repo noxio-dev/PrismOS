@@ -11,3 +11,12 @@ holds the files you edit by hand: `/etc/passwd`, `/etc/profile`, `/etc/rc`
   the usr-merge symlinks are created by the Makefile, not stored here.
 - Compiled programs do not belong here: they are packages (`pkg/`), built
   and installed by `./prism`.
+
+## Keyboard
+
+The kernel boots with the `us` keymap.  `/etc/rc.d/S10keymap` loads
+`/usr/share/keymaps/$(cat /etc/keymap).bkmap` with BusyBox `loadkmap`: write
+`fr` in `/etc/keymap` for AZERTY.  `dumpkmap > file` saves the current map,
+`kbd_mode` / `showkey` inspect the keyboard.  The built-in maps are
+regenerated with `tools/mkkmap.rs`; the decoder is tested on the host with
+`tests/keymap_host.rs`.

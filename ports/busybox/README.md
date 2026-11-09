@@ -165,3 +165,10 @@ tarball (stage fetch shares `build/toolchain-src` with `ports/toolchain`,
 downloaded once).  A full run is a couple of minutes here (two cores);
 the binary lands in `build/busybox-out`, verified against the loader's
 contract by `ports/toolchain/verify.sh`.
+
+## Keyboard applets
+
+`loadkmap`, `dumpkmap`, `kbd_mode` and `showkey` are enabled (BusyBox has no
+`loadkeys`: `loadkmap` reads the binary keymap `loadkeys --bkeymap` writes).
+They need `<linux/kd.h>`; the sysroot's copy wins when it has one, otherwise
+the verbatim UAPI header in `include/linux/kd.h` is used (see build.sh).

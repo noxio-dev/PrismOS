@@ -1471,6 +1471,76 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> i64 {
                 -EFAULT
             }
         }
+        KDGKBTYPE | KDGKBMODE | KDSKBMODE | KDGKBENT | KDSKBENT | KDGKBLED | KDSKBLED | KDGETLED
+        | KDSETLED
+            if matches!(which, tty::Term::Console) =>
+        {
+            kd_ioctl(req, arg)
+        }
+        _ => -ENOTTY,
+    }
+}
+
+// Console keyboard ioctls (<linux/kd.h>): what BusyBox loadkmap / dumpkmap /
+// kbd_mode / showkey use.  Only the console answers them, the serial line
+// stays -ENOTTY (which is how BusyBox finds out it must open /dev/console).
+const KDGETLED: u64 = 0x4B31;
+const KDSETLED: u64 = 0x4B32;
+const KDGKBTYPE: u64 = 0x4B33;
+const KDGKBMODE: u64 = 0x4B44;
+const KDSKBMODE: u64 = 0x4B45;
+const KDGKBENT: u64 = 0x4B46;
+const KDSKBENT: u64 = 0x4B47;
+const KDGKBLED: u64 = 0x4B64;
+const KDSKBLED: u64 = 0x4B65;
+const KB_101: u8 = 2;
+
+fn kd_ioctl(req: u64, arg: u64) -> i64 {
+    use crate::hw::kbd;
+    let put = |v: &[u8]| if arg != 0 && copy_out(arg, 0, v) { 0 } else { -EFAULT };
+    match req {
+        KDGKBTYPE => put(&[KB_101]),
+        // The mode is an int passed by value for KDSKBMODE, by pointer for KDGKBMODE.
+        KDGKBMODE => put(&(kbd::kd_get_mode() as u32).to_le_bytes()),
+        KDSKBMODE => {
+            if kbd::kd_set_mode(arg as u8) && arg <= 0xFF {
+                0
+            } else {
+                -EINVAL
+            }
+        }
+        // struct kbentry { u8 kb_table; u8 kb_index; u16 kb_value; }
+        KDGKBENT | KDSKBENT => {
+            let mut e = [0u8; 4];
+            if !copy_in(arg, 0, &mut e) {
+                return -EFAULT;
+            }
+            if req == KDGKBENT {
+                let v = kbd::kd_get_entry(e[0], e[1]).to_le_bytes();
+                if e[1] >= 128 {
+                    return -EINVAL;
+                }
+                return if copy_out(arg, 2, &v) { 0 } else { -EFAULT };
+            }
+            if kbd::kd_set_entry(e[0], e[1], u16::from_le_bytes([e[2], e[3]])) {
+                0
+            } else {
+                -EINVAL
+            }
+        }
+        KDGKBLED => put(&[kbd::kd_get_kbled()]),
+        KDSKBLED => {
+            if kbd::kd_set_kbled(arg) {
+                0
+            } else {
+                -EINVAL
+            }
+        }
+        KDGETLED => put(&[kbd::kd_get_led()]),
+        KDSETLED => {
+            kbd::kd_set_led(arg);
+            0
+        }
         _ => -ENOTTY,
     }
 }

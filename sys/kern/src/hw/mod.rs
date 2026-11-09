@@ -9,6 +9,7 @@ pub mod ahci;
 pub mod apic;
 pub mod blk;
 pub mod kbd;
+pub mod keymap;
 pub mod pci;
 pub mod pic;
 pub mod pit;
