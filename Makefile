@@ -221,7 +221,8 @@ $B/busybox.stamp: $B/toolchain/usr/.stamp $B/mlibc-port.md5 $(BUSYBOX_PORT_FILES
 BUSYBOX_APPLETS := sh ash ls cat echo printf test mkdir rmdir rm cp mv ln \
 	           touch chmod readlink pwd true false env sleep uname wc \
 	           head tail id whoami basename dirname time ps mount \
-	           umount df grep sed awk tar vi loadkmap dumpkmap kbd_mode showkey hostname
+	           umount df grep sed awk tar vi loadkmap dumpkmap kbd_mode showkey hostname \
+			   clear
 
 # ---- mlibc toolchain + sysroot (phase 3.2, steps 3 + 4) ---------------------
 # ports/toolchain drives the phase's third and fourth steps: the
