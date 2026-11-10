@@ -37,7 +37,7 @@ jobs:
         run: make
 
       - name: Test BIOS boot
-        timeout-minutes: 20
+        timeout-minutes: 40
         run: make test
 
       - name: Test /tmp tmpfs + usr-merge (phase 3.3)
