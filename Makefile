@@ -69,7 +69,7 @@ EFI_OBJS  := $(patsubst %.c,$B/efi/%.o,$(COMMON_SRCS) boot/loader/ext4.c $(wildc
 
 # ---- default target ----------------------------------------------------
 
-.PHONY: all clean run run-uefi run-iso test kernel esp root iso run-kvm run-uefi-kvm data fstest bintest pkgs binutils busybox busyboxtest
+.PHONY: all clean run run-uefi run-iso test kernel esp root iso run-kvm run-uefi-kvm data fstest bintest pkgs binutils busybox busyboxtest nano
 all: $B/$(NAME).img
 
 # ---- compile rules -------------------------------------------------------
@@ -211,6 +211,29 @@ $B/busybox.stamp: $B/toolchain/usr/.stamp $B/mlibc-port.md5 $(BUSYBOX_PORT_FILES
 	sh ports/busybox/build.sh
 	@touch $@
 
+# ---- phase 4.2: nano, a full-screen editor on the console -------------------
+# ports/nano cross-builds GNU nano 9.3 on ncurses 6.6 -- the curses layer
+# is part of the port: static libncursesw (terminfo core included) into the
+# port's own sysroot, then nano against it, one static PIE stripped under
+# the kernel's 4 MiB whole-file read -- plus the TERM=prism terminfo entry,
+# the host tic compiling ports/nano/prism.src (the faithful description of
+# what console/ansi.rs implements, keymap strings included).  The mlibc
+# port checksum is a dependency like the other ports': an edited sysdep
+# (or the UTF-8 charcode patch) rebuilds the library, and this stamp
+# follows.
+#
+#   make nano         build/nano-out/{nano,terminfo}, verified
+#   make root         installs the editor into /usr/bin and the entry into
+#                     /usr/share/terminfo/p/prism below
+
+NANO_PORT_FILES := $(shell find ports/nano -type f | sort)
+
+nano: $B/nano.stamp
+$B/nano.stamp: $B/toolchain/usr/.stamp $B/mlibc-port.md5 $(NANO_PORT_FILES)
+	@mkdir -p $(@D)
+	sh ports/nano/build.sh
+	@touch $@
+
 # The applets the image carries as /usr/bin symlinks to busybox: the
 # roadmap's own list (3.4.1's ash ls cat echo mkdir rm cp mv + 3.4.4's ps
 # mount df grep sed awk tar vi) plus the small utilities a session leans
@@ -321,7 +344,7 @@ root: $B/root.stamp
 # it nothing.
 ROOTFS_FILES := $(shell find rootfs -type f | sort)
 $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
-	$(HELLO_DYN) $B/pkgs.stamp $B/binutils.stamp $B/busybox.stamp $(ROOTFS_FILES)
+	$(HELLO_DYN) $B/pkgs.stamp $B/binutils.stamp $B/busybox.stamp $B/nano.stamp $(ROOTFS_FILES)
 	rm -rf $B/root
 	mkdir -p $B/root/boot/lua $B/root/boot/defaults $B/root/boot/kernel \
                  $B/root/dev $B/root/etc $B/root/proc $B/root/tmp \
@@ -357,6 +380,12 @@ $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
 	for a in $(BUSYBOX_APPLETS); do \
 		ln -s busybox $B/root/usr/bin/$$a; \
 	done
+	# Phase 4.2: nano on ncurses, the image's full-screen editor -- the
+	# terminfo entry (TERM=prism) travels beside it: ncurses looks the
+	# console up in /usr/share/terminfo/<letter>/<name>.
+	cp $B/nano-out/nano $B/root/usr/bin/nano
+	mkdir -p $B/root/usr/share/terminfo/p
+	cp $B/nano-out/terminfo/p/prism $B/root/usr/share/terminfo/p/prism
 	chmod 755 $B/root/usr/bin/*
 	$(TOOLCHAIN)/bin/x86_64-prismos-strip --strip-all \
 		-o $B/root/usr/lib/ld.so $(SYSROOT)/usr/lib/ld.so
@@ -419,40 +448,59 @@ run-uefi-kvm: $B/$(NAME).img $(DATA_IMG)
 
 # ---- ISO --------------------------------------------------------------------
 
-iso: $B/$(NAME).iso
+iso: build/prismos.iso
 
-# The ISO keeps the legacy single-volume layout: one FAT image carrying the
-# UEFI stub and the whole boot tree (the firmware reads FAT, and the loader's
-# EFI simple-file-system fallback mounts it).
-$B/isoesp.stamp: $B/loader.efi $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*)
-	rm -rf $B/iso-esp
-	mkdir -p $B/iso-esp/EFI/BOOT $B/iso-esp/boot/lua $B/iso-esp/boot/defaults $B/iso-esp/boot/kernel
-	cp $B/loader.efi $B/iso-esp/EFI/BOOT/BOOTX64.EFI
-	cp boot/lua/*.lua $B/iso-esp/boot/lua/
-	cp boot/conf/defaults-loader.conf $B/iso-esp/boot/defaults/loader.conf
-	cp boot/conf/loader.conf $B/iso-esp/boot/loader.conf
-	cp $B/kernel $B/iso-esp/boot/kernel/kernel
+build/isoesp.stamp: build/loader.efi build/kernel
+	rm -rf build/iso-esp
+	mkdir -p build/iso-esp/EFI/BOOT \
+		build/iso-esp/boot/lua \
+		build/iso-esp/boot/defaults \
+		build/iso-esp/boot/kernel
+
+	cp build/loader.efi build/iso-esp/EFI/BOOT/BOOTX64.EFI
+	cp boot/lua/*.lua build/iso-esp/boot/lua/
+	cp boot/conf/defaults-loader.conf build/iso-esp/boot/defaults/
+	cp boot/conf/loader.conf build/iso-esp/boot/
+	cp build/kernel build/iso-esp/boot/kernel/
+
 	touch $@
 
-$B/esp.img: $B/isoesp.stamp
+build/esp.img: build/isoesp.stamp
+	rm -f $@
 	truncate -s $(ESPIMG_SIZE) $@
 	$(MKFS_FAT) -n PRISMESP $@
-	$(MCOPY) -s -i $@ $B/iso-esp/* ::/
+	$(MCOPY) -s -i $@ build/iso-esp/* ::/
 
-$B/$(NAME).iso: $B/esp.img
-	rm -rf $B/iso
-	mkdir -p $B/iso
-	cp $B/esp.img $B/iso/esp.img
-	$(XORRISO) -as mkisofs -quiet -V $(NAME) -J -joliet-long -rational-rock \
-                -e esp.img -no-emul-boot -isohybrid-gpt-basdat \
-                -o $@ $B/iso
+build/prismos.iso: build/esp.img build/root.img build/data.img
+	rm -rf build/iso
+	mkdir -p build/iso
 
-run-iso: $B/$(NAME).iso $(DATA_IMG)
-	@test -n "$(OVMF_CODE)" || { echo "OVMF not found: set OVMF_CODE and OVMF_VARS"; exit 1; }
-	cp -f $(OVMF_VARS) $B/OVMF_VARS.fd
-	$(QEMU) $(QEMUFLAGS) -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
-                -drive if=pflash,format=raw,file=$B/OVMF_VARS.fd \
-                -cdrom $< -serial stdio
+	cp build/esp.img build/iso/esp.img
+	cp build/root.img build/iso/root.img
+	cp build/data.img build/iso/data.img
+
+	$(XORRISO) -as mkisofs -quiet \
+		-V PRISMOS \
+		-J -joliet-long -rational-rock \
+		-e esp.img -no-emul-boot -isohybrid-gpt-basdat \
+		-o $@ build/iso
+
+build/root.img: build/prismos.img
+	mkdir -p build
+	@LOOP=$$(sudo losetup --find --show --partscan $<); \
+	sudo dd if=$${LOOP}p3 of=$@ bs=4M status=progress; \
+	sudo losetup -d $$LOOP
+
+run-iso: build/prismos.iso
+	test -f "$(OVMF_CODE)"
+	cp "$(OVMF_VARS)" build/OVMF_VARS.iso.fd
+	$(QEMU) \
+		-machine q35 \
+		-m 512M \
+		-drive if=pflash,format=raw,readonly=on,file="$(OVMF_CODE)" \
+		-drive if=pflash,format=raw,file=build/OVMF_VARS.iso.fd \
+		-cdrom build/prismos.iso \
+		-serial stdio
 
 test: $B/$(NAME).img
 	$(PYTHON) -u tests/boot_test.py $< "$(QEMU)" "$(OVMF_CODE)" "$(OVMF_VARS)"

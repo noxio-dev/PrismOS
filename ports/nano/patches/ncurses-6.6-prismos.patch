@@ -1,0 +1,38 @@
+--- a/config.sub
++++ b/config.sub
+@@ -2108,7 +2108,7 @@
+ 	| scout* \
+ 	| secbsd* \
+ 	| sei* \
+-	| serenity* \
++	| serenity* | prismos* \
+ 	| sim* \
+ 	| skyos* \
+ 	| solaris* \
+--- a/ncurses/base/new_pair.c
++++ b/ncurses/base/new_pair.c
+@@ -49,9 +49,12 @@
+ #define MaxColors      max_colors
+ #endif
+ 
+-#if NCURSES_EXT_COLORS
+-
+-/* fix redefinition versys tic.h */
++/* PrismOS: the block is unconditional -- the tsearch / tdelete calls
++   below need their declarations whatever the color extension (upstream
++   gcc passes the implicit declarations as warnings, clang's
++   int-to-pointer conversions are errors), and the renames go with the
++   include: mlibc's search.h names the tsearch node `struct entry`, the
++   same name ncurses' terminfo entry carries. */
+ #undef entry
+ #define entry my_entry
+ #undef ENTRY
+@@ -59,8 +62,6 @@
+ 
+ #include <search.h>
+ 
+-#endif
+-
+ MODULE_ID("$Id: new_pair.c,v 1.27 2025/12/27 12:41:23 tom Exp $")
+ 
+ #if NCURSES_EXT_COLORS

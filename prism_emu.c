@@ -267,20 +267,9 @@ static void run_child(struct image *im, char **args, int nargs)
          * strings (AT_EXECFN first, then the argv strings), AT_RANDOM's
          * sixteen bytes, then -- 16-byte aligned -- argc, the argv pointers,
          * a NULL, the envp pointers, a NULL, and the auxiliary vector */
-        uint64_t sp = PRISM_STACK_TOP;
+        uint64_t sp = PRISM_STACK_TOP - 4096;
         uint64_t scratch = PRISM_SCRATCH;
         memcpy((void *)scratch, "/dev/null", 10); /* the child plants it itself */
-
-        uint64_t execfn_p = sp - (strlen(argv[0]) + 1);
-        memcpy((void *)execfn_p, argv[0], strlen(argv[0]) + 1);
-        sp = execfn_p;
-
-        uint64_t *arg_p = malloc(argc * sizeof *arg_p);
-        for (int i = argc - 1; i >= 0; i--) {
-                sp -= strlen(argv[i]) + 1;
-                memcpy((void *)sp, argv[i], strlen(argv[i]) + 1);
-                arg_p[i] = sp;
-        }
 
         uint64_t rnd = sp - 16; sp -= 16;           /* AT_RANDOM bytes */
         unsigned char rndb[16];
@@ -322,9 +311,10 @@ static void run_child(struct image *im, char **args, int nargs)
                 17 /*AT_CLKTCK*/, 100,
                 23 /*AT_SECURE*/, 0,
                 25 /*AT_RANDOM*/, rnd,
-                31 /*AT_EXECFN*/, execfn_p,
+                31 /*AT_EXECFN*/, fstr,
                 0, 0,
         };
+        uint64_t words[128];
         int nw = 0;
         words[nw++] = (uint64_t)argc;       /* argc */
         for (int i = 0; i < argc; i++)

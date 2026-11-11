@@ -74,6 +74,10 @@ pub enum Action {
     Reset,
     /// SU (CSI S): scroll the whole screen up n lines.
     ScrollUp(usize),
+    /// DECSTBM (CSI t;b r): the scrolling region, (top, bottom) in the
+    /// 1-based VT spelling the screens clamp into their own grid -- so
+    /// `None` (no parameters, ESC[r) is just (0, "as many as there are").
+    Stbm(Option<(usize, usize)>),
 }
 
 /// What `feed` makes of one character.
@@ -306,7 +310,19 @@ impl Parser {
                 }
             }
             'S' => Out::Act(Action::ScrollUp(self.num(0, 1) as usize)),
-            // DECSTBM, DSR, DA, IL/DL, ECH, DCH, window ops: known but not
+            'r' => {
+                // DECSTBM: the scrolling region.  1-based top;bottom, each
+                // defaulting to its edge (top 1, bottom "the screen's own
+                // last row" -- the screens clamp).  The screens ignore a
+                // region of fewer than two lines, like xterm.
+                let t = self.param(0).map(|v| (v.max(1) as usize) - 1);
+                let b = self.param(1).map(|v| v as usize);
+                Out::Act(Action::Stbm(match (t, b) {
+                    (None, None) => None,
+                    (t, b) => Some((t.unwrap_or(0), b.unwrap_or(65_535))),
+                }))
+            }
+            // DSR, DA, IL/DL, ECH, DCH, window ops: known but not
             // implemented -- swallowed, never printed.
             _ => Out::Swallow,
         }

@@ -24,11 +24,16 @@ pub struct Vga {
     /// Set when a glyph just filled the last column: the cursor stays
     /// there and the next printable wraps first (DECAWM).
     pending: bool,
+    /// The scrolling region (DECSTBM): rows [top, bot) -- LF, Index and
+    /// ReverseIndex scroll only this band; the cursor moves everywhere.
+    /// Defaults to the whole screen.
+    top: usize,
+    bot: usize,
 }
 
 impl Vga {
     pub const fn new() -> Self {
-        Vga { x: 0, y: 0, attr: ATTR, pending: false }
+        Vga { x: 0, y: 0, attr: ATTR, pending: false, top: 0, bot: ROWS }
     }
 
     pub fn clear(&mut self) {
@@ -53,17 +58,19 @@ impl Vga {
     }
 
     fn scroll(&mut self) {
-        for i in 0..COLS * (ROWS - 1) {
+        // The region band [top, bot) shifts up one line; the freed line
+        // blanks in the current attribute.
+        for i in self.top * COLS..(self.bot - 1) * COLS {
             // SAFETY: indices stay inside the 80x25 buffer.
             unsafe { write_volatile(BASE.add(i), read_volatile(BASE.add(i + COLS))) };
         }
-        self.fill(COLS * (ROWS - 1), COLS * ROWS);
+        self.fill((self.bot - 1) * COLS, self.bot * COLS);
     }
 
-    /// The mirror: push everything down one line, blank the top row
+    /// The mirror: push the region band down one line, blank its top row
     /// (reverse index, ESC M).
     fn scroll_down(&mut self) {
-        for r in (1..ROWS).rev() {
+        for r in ((self.top + 1)..self.bot).rev() {
             for c in 0..COLS {
                 // SAFETY: both rows lie inside the 80x25 buffer.
                 unsafe {
@@ -74,12 +81,18 @@ impl Vga {
                 };
             }
         }
-        self.fill(0, COLS);
+        self.fill(self.top * COLS, (self.top + 1) * COLS);
     }
 
     fn newline(&mut self) {
         self.x = 0;
-        if self.y + 1 >= ROWS {
+        if self.y >= self.bot {
+            // Below the region: plain moves down the screen's own rows,
+            // no scrolling (VT100).
+            if self.y + 1 < ROWS {
+                self.y += 1;
+            }
+        } else if self.y + 1 >= self.bot {
             self.scroll();
         } else {
             self.y += 1;
@@ -168,6 +181,26 @@ impl Vga {
         self.cursor_to(row, self.x);
     }
 
+    /// The scrolling region (DECSTBM), clamped to the screen and ignored
+    /// when it would hold fewer than two lines (xterm's rule).  The
+    /// cursor homes, the way xterm moves it on DECSTBM.
+    pub fn set_margins(&mut self, top: usize, bot: usize) {
+        let top = top.min(ROWS - 2);
+        let bot = bot.min(ROWS);
+        if top + 2 > bot {
+            return;
+        }
+        self.top = top;
+        self.bot = bot;
+        self.cursor_to(0, 0);
+    }
+
+    /// Full-screen region again (RIS, ESC c).
+    pub fn reset_margins(&mut self) {
+        self.top = 0;
+        self.bot = ROWS;
+    }
+
     /// Erase in line (EL): 0 cursor..end, 1 start..cursor, 2 the line.
     pub fn erase_line(&mut self, mode: u8) {
         self.pending = false;
@@ -195,11 +228,15 @@ impl Vga {
         self.cursor();
     }
 
-    /// Index (ESC D): one line down, scrolling when already on the last
-    /// row.  The column stays.
+    /// Index (ESC D): one line down, scrolling when already on the
+    /// region's bottom row.  The column stays.
     pub fn index(&mut self) {
         self.pending = false;
-        if self.y + 1 >= ROWS {
+        if self.y >= self.bot {
+            if self.y + 1 < ROWS {
+                self.y += 1;
+            }
+        } else if self.y + 1 >= self.bot {
             self.scroll();
         } else {
             self.y += 1;
@@ -208,12 +245,12 @@ impl Vga {
     }
 
     /// Reverse index (ESC M): one line up, scrolling when already on the
-    /// first row.  The column stays.
+    /// region's top row.  The column stays.
     pub fn reverse_index(&mut self) {
         self.pending = false;
-        if self.y == 0 {
+        if self.y == self.top && self.y < self.bot {
             self.scroll_down();
-        } else {
+        } else if self.y > 0 {
             self.y -= 1;
         }
         self.cursor();

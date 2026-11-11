@@ -32,6 +32,11 @@ pub struct FbConsole {
     /// Set when a glyph just filled the last column: the next printable
     /// wraps first (DECAWM), the same rule the VGA console follows.
     pending: bool,
+    /// The scrolling region (DECSTBM): rows [top, bot) -- the same state
+    /// the VGA console carries (console/vga.rs).  Defaults to the whole
+    /// grid.
+    top: usize,
+    bot: usize,
 }
 
 impl FbConsole {
@@ -57,6 +62,8 @@ impl FbConsole {
             fg,
             bg,
             pending: false,
+            top: 0,
+            bot: fb.height as usize / cell_h,
         };
         c.clear();
         c.flush();
@@ -97,12 +104,18 @@ impl FbConsole {
     }
 
     fn scroll(&mut self) {
-        self.surf.scroll_up(0, self.rows * self.cell_h, self.cell_h, self.bg);
+        self.surf.scroll_up(self.top * self.cell_h, self.bot * self.cell_h, self.cell_h, self.bg);
     }
 
     fn newline(&mut self) {
         self.x = 0;
-        if self.y + 1 >= self.rows {
+        if self.y >= self.bot {
+            // Below the region: plain moves down the grid's own rows, no
+            // scrolling (VT100), like the VGA console.
+            if self.y + 1 < self.rows {
+                self.y += 1;
+            }
+        } else if self.y + 1 >= self.bot {
             self.scroll();
         } else {
             self.y += 1;
@@ -212,6 +225,26 @@ impl FbConsole {
         self.cursor_to(row, self.x);
     }
 
+    /// The scrolling region (DECSTBM), clamped to the grid and ignored
+    /// when it would hold fewer than two lines (xterm's rule).  The
+    /// cursor homes, like the VGA console's.
+    pub fn set_margins(&mut self, top: usize, bot: usize) {
+        let top = top.min(self.rows.saturating_sub(2));
+        let bot = bot.min(self.rows);
+        if top + 2 > bot {
+            return;
+        }
+        self.top = top;
+        self.bot = bot;
+        self.cursor_to(0, 0);
+    }
+
+    /// Full-screen region again (RIS, ESC c).
+    pub fn reset_margins(&mut self) {
+        self.top = 0;
+        self.bot = self.rows;
+    }
+
     /// Erase in line (EL): 0 cursor..end, 1 start..cursor, 2 the line.
     pub fn erase_line(&mut self, mode: u8) {
         self.pending = false;
@@ -249,24 +282,29 @@ impl FbConsole {
         }
     }
 
-    /// Index (ESC D): one line down, scrolling at the bottom edge.  The
-    /// column stays.
+    /// Index (ESC D): one line down, scrolling at the region's bottom
+    /// edge.  The column stays.
     pub fn index(&mut self) {
         self.pending = false;
-        if self.y + 1 >= self.rows {
+        if self.y >= self.bot {
+            if self.y + 1 < self.rows {
+                self.y += 1;
+            }
+        } else if self.y + 1 >= self.bot {
             self.scroll();
         } else {
             self.y += 1;
         }
     }
 
-    /// Reverse index (ESC M): one line up, scrolling at the top edge.
+    /// Reverse index (ESC M): one line up, scrolling at the region's top
+    /// edge.
     pub fn reverse_index(&mut self) {
         self.pending = false;
-        if self.y == 0 {
+        if self.y == self.top && self.y < self.bot {
             self.surf
-                .scroll_down(0, self.rows * self.cell_h, self.cell_h, self.bg);
-        } else {
+                .scroll_down(self.top * self.cell_h, self.bot * self.cell_h, self.cell_h, self.bg);
+        } else if self.y > 0 {
             self.y -= 1;
         }
     }

@@ -1,0 +1,96 @@
+# The PrismOS console's terminfo entry, TERM=prism -- what
+# sys/kern/src/console/ actually implements, described the way ncurses
+# asks for it.  Compiled by the HOST tic at build time (ports/nano/
+# build.sh) into /usr/share/terminfo/p/prism, so the curses programs
+# (nano first) address the console through its real abilities and fall
+# back where it has none:
+#
+#   VT102 subset       cursor addressing, CUU/CUD/CUF/CUB, erases (EL/ED),
+#                      index / reverse index, DECSTBM scroll regions, the
+#                      save/restore-cursor pair, the hardware cursor's
+#                      visibility
+#   SGR extension      16 colors both planes (30-37/90-97, 40-47/100-107),
+#                      bold, dim, reverse -- what console/ansi.rs's sgr
+#                      carries out
+#   none of            ACS (no G0 charset switching), insert/delete line
+#                      or character, DSR/DA answerbacks, tabs set/clear
+#
+# The arrows, Home/End/Insert/Delete/PgUp/PgDn and the F1..F12 strings are
+# sys/kern/src/hw/keymap.rs's own (Linux's defkeymap, TERM=linux): the
+# kernel sends what this entry declares, so no keypad transmit mode
+# (smkx/rmkx) is needed and the keys decode as written everywhere.
+#
+# am without xenl is the DECAWM discipline the VGA and framebuffer
+# consoles share: a glyph in the last column leaves the cursor waiting
+# there, the next printable wraps first.  bce is honest too: both
+# consoles erase in the CURRENT background.  The alternate-screen pair is
+# emulated with what we have -- save cursor + clear on entry, restore
+# cursor + clear on exit -- so a full-screen program leaves the session's
+# screen as it found it.
+prism|PrismOS console (VT102 subset with SGR colors),
+	am,
+	bce,
+	msgr,
+	colors#16,
+	pairs#64,
+	lines#25,
+	columns#80,
+	bel=^G,
+	bold=\E[1m,
+	civis=\E[?25l,
+	cnorm=\E[?25h,
+	cvvis=\E[?25h,
+	clear=\E[H\E[2J,
+	cub=\E[%p1%dD,
+	cub1=\E[D,
+	cud=\E[%p1%dB,
+	cud1=\E[B,
+	cuf=\E[%p1%dC,
+	cuf1=\E[C,
+	cup=\E[%i%p1%d;%p2%dH,
+	cuu=\E[%p1%dA,
+	cuu1=\E[A,
+	csr=\E[%i%p1%d;%p2%dr,
+	dim=\E[2m,
+	ed=\E[J,
+	el=\E[K,
+	el1=\E[1K,
+	home=\E[H,
+	ht=^I,
+	ind=\ED,
+	kbs=^?,
+	kcub1=\E[D,
+	kcud1=\E[B,
+	kcuf1=\E[C,
+	kcuu1=\E[A,
+	kdch1=\E[3~,
+	kend=\E[4~,
+	kf1=\E[[A,
+	kf2=\E[[B,
+	kf3=\E[[C,
+	kf4=\E[[D,
+	kf5=\E[[E,
+	kf6=\E[17~,
+	kf7=\E[18~,
+	kf8=\E[19~,
+	kf9=\E[20~,
+	kf10=\E[21~,
+	kf11=\E[23~,
+	kf12=\E[24~,
+	khome=\E[1~,
+	kich1=\E[2~,
+	knp=\E[6~,
+	kpp=\E[5~,
+	nel=\EE,
+	op=\E[m,
+	rc=\E8,
+	rev=\E[7m,
+	ri=\EM,
+	rmcup=\E8\E[2J\E[?25h,
+	rmso=\E[m,
+	smcup=\E7\E[H\E[2J,
+	smso=\E[7m,
+	setab=\E[%?%p1%{8}%<%t%p1%{40}%+%e%p1%{92}%+%;m,
+	setaf=\E[%?%p1%{8}%<%t%p1%{30}%+%e%p1%{82}%+%;m,
+	sgr0=\E[m,
+	sgr=\E[0%?%p6%t;1%;%?%p5%t;2%;%?%p1%t;7%;%?%p3%t;7%;m,

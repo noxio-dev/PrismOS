@@ -622,3 +622,22 @@ index a1af64d0..818cd164 100644
  }
  
  } // namespace
+--- a/options/internal/generic/charcode.cpp
++++ b/options/internal/generic/charcode.cpp
+@@ -357,10 +357,12 @@
+ constinit mlibc::lazy_eternal<polymorphic_charcode_adapter<struct utf8_charcode>> global_utf8_charcode;
+ 
+ polymorphic_charcode *current_charcode() {
+-	auto loc = mlibc::getActiveLocale();
+-	if (loc->ctype.codeset() == "ANSI_X3.4-1968")
+-		return &global_ascii_charcode.get();
+-
++	// PrismOS: the charcode is UTF-8, unconditionally.  The console is
++	// (unifont, one glyph per codepoint, the keymap types UTF-8) and the
++	// C locale's codeset probe would answer ASCII: mlibc's locale system
++	// cannot load a UTF-8 locale without a locale database, and the image
++	// ships none -- so "ANSI_X3.4-1968" would crush every typed accent
++	// into two column-one glyphs.
+ 	return &global_utf8_charcode.get();
+ }
+ 

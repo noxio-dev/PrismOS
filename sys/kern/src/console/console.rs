@@ -277,13 +277,29 @@ fn apply(a: Action) {
                 f.flush();
             }
         }
-        Action::Reset => {
+        Action::Stbm(m) => {
+            // The screens clamp the 1-based VT spelling into their own
+            // grid (a missing bottom is "as many rows as there are");
+            // a degenerate region is ignored there, like xterm's.
+            let (top, bot) = m.unwrap_or((0, usize::MAX));
             if let Some(v) = c.vga.as_mut() {
+                v.set_margins(top, bot);
+            }
+            if let Some(f) = c.fb.as_mut() {
+                f.set_margins(top, bot);
+                f.flush();
+            }
+        }
+        Action::Reset => {
+            // RIS: margins back to the full screen with the rest.
+            if let Some(v) = c.vga.as_mut() {
+                v.reset_margins();
                 v.set_attr(ansi::vga_attr(ansi::SGR_RESET));
                 v.erase_display(2);
                 v.cursor_to(0, 0);
             }
             if let Some(f) = c.fb.as_mut() {
+                f.reset_margins();
                 f.set_sgr(7, 0, false);
                 f.erase_display(2);
                 f.cursor_to(0, 0);
