@@ -466,4 +466,39 @@ impl Surface {
         self.rect_raw(0, (y1 - dy) as i32, self.w as i32, dy as i32, bg);
         self.mark(0, y0, self.w, y1);
     }
+
+    /// Scroll the pixel band [y0, y1) DOWN by `dy` pixels, filling the
+    /// rows freed at the top with `bg` -- the mirror of `scroll_up`, the
+    /// framebuffer side of a reverse index (ESC M).
+    pub fn scroll_down(&mut self, y0: usize, y1: usize, dy: usize, bg: u32) {
+        let y1 = y1.min(self.h);
+        if dy == 0 || y0 + dy >= y1 {
+            self.rect_raw(0, y0 as i32, self.w as i32, (y1.saturating_sub(y0)) as i32, bg);
+            self.mark(0, y0, self.w, y1);
+            return;
+        }
+        let rows = y1 - y0 - dy;
+        // SAFETY: both ranges lie inside the surface; dst > src so a
+        // backward walk is correct even where they overlap (memmove
+        // semantics, `copy` handles it).
+        unsafe {
+            if self.pitch == self.w * 4 {
+                core::ptr::copy(
+                    self.base.add(y0 * self.pitch),
+                    self.base.add((y0 + dy) * self.pitch),
+                    rows * self.pitch,
+                );
+            } else {
+                for r in (0..rows).rev() {
+                    core::ptr::copy(
+                        self.base.add((y0 + r) * self.pitch),
+                        self.base.add((y0 + dy + r) * self.pitch),
+                        self.w * 4,
+                    );
+                }
+            }
+        }
+        self.rect_raw(0, y0 as i32, self.w as i32, dy as i32, bg);
+        self.mark(0, y0, self.w, y1);
+    }
 }

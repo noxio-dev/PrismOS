@@ -7,6 +7,7 @@ use core::fmt;
 use core::ptr::addr_of_mut;
 
 use crate::boot::{BootInfo, FLAG_FB, FLAG_VGATEXT};
+use crate::console::ansi::{self, Action, Out};
 use crate::console::fb::FbConsole;
 use crate::hw::serial;
 use crate::console::vga::Vga;
@@ -92,119 +93,226 @@ pub fn _print(args: fmt::Arguments) {
     }
 }
 
-// ---------------------------------------------- escape sequences / column
+// ---------------------------------------------- escape sequences
 
-/// 0 = normal, 1 = just after ESC, 2 = inside a CSI sequence.
-static mut ESC_STATE: u8 = 0;
-/// First numeric parameter of the CSI sequence under way.
-static mut ESC_PARAM: u32 = 0;
-/// Approximate cursor column, tracked from what ring 3 writes (the
-/// Vga / FbConsole types expose no cursor query, so we follow it here).
-static mut COL: usize = 0;
+/// The ANSI interpreter both user write paths share: they write the same
+/// screens, so one state machine (its SGR attribute included) is right.
+static mut PARSER: ansi::Parser = ansi::Parser::new();
 
-/// Update the tracked column for one character that reaches the screen.
-fn track_col(ch: char) {
-    // SAFETY: single CPU; output paths are serialized by the callers.
-    let col = unsafe { &mut *addr_of_mut!(COL) };
-    let (cols, _) = text_dims();
-    match ch {
-        '\n' | '\r' => *col = 0,
-        '\x08' => *col = col.saturating_sub(1),
-        '\t' => *col = ((*col + 8) & !7).min(cols.saturating_sub(1)),
-        c => {
-            *col += char_width(c).max(1);
-            if *col >= cols {
-                *col = 0;
+/// Where save-cursor (CSI s / u, ESC 7 / 8) parks the position.
+static mut SAVED: (usize, usize) = (0, 0);
+
+/// The raw character stream to the serial line, untranslated -- escapes
+/// included.  A real terminal applies its own colors; the kernel's screens
+/// apply theirs through the interpreter (write_bytes below).
+fn serial_tee(ch: char) {
+    let mut buf = [0u8; 4];
+    for &b in ch.encode_utf8(&mut buf).as_bytes() {
+        if b == b'\n' {
+            serial::write_byte(b'\r');
+        }
+        serial::write_byte(b);
+    }
+}
+
+/// One character on the screens only: what both write paths print a
+/// ground character through (the serial copy is the caller's business).
+fn screen_char(ch: char) {
+    // Keep IRQ-context prints from interleaving, like _print does; the
+    // flush below needs the same single-flight discipline.
+    let _guard = crate::arch::io::IrqGuard::new();
+    let _cross = PRINT_LOCK.lock();
+    // SAFETY: single CPU; the guard serializes output paths.
+    let c = unsafe { &mut *addr_of_mut!(CONSOLE) };
+    if let Some(v) = c.vga.as_mut() {
+        v.put_char(ch);
+    }
+    if let Some(f) = c.fb.as_mut() {
+        f.put_char(ch);
+        f.flush();
+    }
+}
+
+/// Carry out one finished escape action on every active screen.
+fn apply(a: Action) {
+    let _guard = crate::arch::io::IrqGuard::new();
+    let _cross = PRINT_LOCK.lock();
+    // SAFETY: single CPU; the guard serializes output paths.
+    let c = unsafe { &mut *addr_of_mut!(CONSOLE) };
+    match a {
+        Action::Sgr(s) => {
+            if let Some(v) = c.vga.as_mut() {
+                v.set_attr(ansi::vga_attr(s));
+            }
+            if let Some(f) = c.fb.as_mut() {
+                f.set_sgr(s.fg, s.bg, s.reverse);
+                f.flush();
             }
         }
-    }
-}
-
-fn current_col() -> usize {
-    // SAFETY: single CPU; plain read.
-    unsafe { *addr_of_mut!(COL) }
-}
-
-/// Erase from the cursor to the end of the line, cursor stays put: spaces
-/// over the rest of the line, then the same number of backspaces.  The very
-/// last cell of the line is left alone (writing it would wrap the cursor).
-fn erase_eol(emit: &mut dyn FnMut(char)) {
-    let (cols, _) = text_dims();
-    let n = cols.saturating_sub(current_col() + 1);
-    for _ in 0..n {
-        emit(' ');
-    }
-    for _ in 0..n {
-        emit('\x08');
-    }
-}
-
-/// Interprets the few CSI sequences we can honour: `ESC[nD` (cursor left),
-/// `ESC[K` / `ESC[J` (erase to end of line).  Everything else is swallowed.
-/// `emit` prints one character the way the caller does.  Returns true when
-/// `ch` was consumed by the sequence.
-fn eat_escape(ch: char, emit: &mut dyn FnMut(char)) -> bool {
-    // SAFETY: single CPU; output paths are serialized by the callers.
-    let (st, param) = unsafe { (&mut *addr_of_mut!(ESC_STATE), &mut *addr_of_mut!(ESC_PARAM)) };
-    match *st {
-        0 => {
-            if ch == '\x1b' {
-                *st = 1;
-                true
+        Action::Cup(row, col) => {
+            if let Some(v) = c.vga.as_mut() {
+                v.cursor_to(row, col);
+            }
+            if let Some(f) = c.fb.as_mut() {
+                f.cursor_to(row, col);
+                f.flush();
+            }
+        }
+        Action::Move(drow, dcol) => {
+            if let Some(v) = c.vga.as_mut() {
+                v.move_rel(drow, dcol);
+            }
+            if let Some(f) = c.fb.as_mut() {
+                f.move_rel(drow, dcol);
+                f.flush();
+            }
+        }
+        Action::Col(col) => {
+            if let Some(v) = c.vga.as_mut() {
+                v.col_set(col);
+            }
+            if let Some(f) = c.fb.as_mut() {
+                f.col_set(col);
+                f.flush();
+            }
+        }
+        Action::Row(row) => {
+            if let Some(v) = c.vga.as_mut() {
+                v.row_set(row);
+            }
+            if let Some(f) = c.fb.as_mut() {
+                f.row_set(row);
+                f.flush();
+            }
+        }
+        Action::EraseLine(mode) => {
+            if let Some(v) = c.vga.as_mut() {
+                v.erase_line(mode);
+            }
+            if let Some(f) = c.fb.as_mut() {
+                f.erase_line(mode);
+                f.flush();
+            }
+        }
+        Action::EraseDisplay(mode) => {
+            if let Some(v) = c.vga.as_mut() {
+                v.erase_display(mode);
+            }
+            if let Some(f) = c.fb.as_mut() {
+                f.erase_display(mode);
+                f.flush();
+            }
+        }
+        Action::SaveCursor => {
+            let pos = if let Some(v) = c.vga.as_ref() {
+                v.cursor_pos()
+            } else if let Some(f) = c.fb.as_ref() {
+                f.cursor_pos()
             } else {
-                false
+                (0, 0)
+            };
+            // SAFETY: single CPU; the lock serializes the writers.
+            unsafe { *addr_of_mut!(SAVED) = pos };
+        }
+        Action::RestoreCursor => {
+            // SAFETY: single CPU; plain read.
+            let (row, col) = unsafe { *addr_of_mut!(SAVED) };
+            if let Some(v) = c.vga.as_mut() {
+                v.cursor_to(row, col);
+            }
+            if let Some(f) = c.fb.as_mut() {
+                f.cursor_to(row, col);
+                f.flush();
             }
         }
-        1 => {
-            if ch == '[' {
-                *st = 2;
-                *param = 0;
-                true
-            } else {
-                *st = 0; // lone ESC: drop it, the next char prints normally
-                false
+        Action::HideCursor => {
+            if let Some(v) = c.vga.as_mut() {
+                v.hide_cursor();
             }
         }
-        _ => {
-            if let Some(d) = ch.to_digit(10) {
-                *param = param.saturating_mul(10).saturating_add(d).min(500);
-            } else if ('\u{40}'..='\u{7e}').contains(&ch) {
-                *st = 0;
-                let n = (*param).max(1);
-                match ch {
-                    'D' => {
-                        for _ in 0..n.min(current_col() as u32) {
-                            emit('\x08');
-                        }
-                    }
-                    'K' | 'J' => erase_eol(emit),
-                    _ => {}
+        Action::ShowCursor => {
+            if let Some(v) = c.vga.as_mut() {
+                v.show_cursor();
+            }
+        }
+        Action::Index => {
+            if let Some(v) = c.vga.as_mut() {
+                v.index();
+            }
+            if let Some(f) = c.fb.as_mut() {
+                f.index();
+                f.flush();
+            }
+        }
+        Action::ReverseIndex => {
+            if let Some(v) = c.vga.as_mut() {
+                v.reverse_index();
+            }
+            if let Some(f) = c.fb.as_mut() {
+                f.reverse_index();
+                f.flush();
+            }
+        }
+        Action::Nel => {
+            if let Some(v) = c.vga.as_mut() {
+                v.col_set(0);
+                v.index();
+            }
+            if let Some(f) = c.fb.as_mut() {
+                f.col_set(0);
+                f.index();
+                f.flush();
+            }
+        }
+        Action::ScrollUp(n) => {
+            if let Some(v) = c.vga.as_mut() {
+                for _ in 0..n {
+                    v.index();
                 }
             }
-            true
+            if let Some(f) = c.fb.as_mut() {
+                for _ in 0..n {
+                    f.index();
+                }
+                f.flush();
+            }
+        }
+        Action::Reset => {
+            if let Some(v) = c.vga.as_mut() {
+                v.set_attr(ansi::vga_attr(ansi::SGR_RESET));
+                v.erase_display(2);
+                v.cursor_to(0, 0);
+            }
+            if let Some(f) = c.fb.as_mut() {
+                f.set_sgr(7, 0, false);
+                f.erase_display(2);
+                f.cursor_to(0, 0);
+                f.flush();
+            }
         }
     }
 }
 
-/// Print one char on screen *and* serial (the /dev/console path).
-fn emit_tee(c: char) {
-    track_col(c);
-    crate::kprint!("{}", c);
-}
-
-/// Fixed-capacity formatting target for the console tee (1 KiB, no alloc).
-struct LogBuf {
-    buf: [u8; 1024],
-    len: usize,
+/// Run one character through the interpreter, then carry out or print
+/// what it says.  The screen half of both user write paths.
+fn feed_screen(ch: char) {
+    // SAFETY: single CPU; output paths are serialized by the callers.
+    let out = unsafe { (&mut *addr_of_mut!(PARSER)).feed(ch) };
+    match out {
+        Out::Print(c) => screen_char(c),
+        Out::Swallow => {}
+        Out::Act(a) => apply(a),
+    }
 }
 
 /// Print raw bytes on the console (phase 2.6): every write to the console
 /// device -- fd 1 / fd 2 of a process, `/dev/console`, -- funnels here.
-/// Valid UTF-8 goes through as is; backspace, newline and tab are kept,
-/// `\r` returns to the start of the line, a few CSI sequences are honoured
-/// (see eat_escape); other control characters and invalid sequences print
-/// as '?', so a user program cannot inject terminal escapes into the
-/// console.  Incomplete multi-byte sequences are decoded across the chunk
+/// The serial line sees the stream raw (escapes included, so a real
+/// terminal keeps its colors); the screens run the ANSI interpreter --
+/// ground characters print, sequences become cursor and attribute
+/// operations, and stray control characters print as '?', so a user
+/// program cannot garble the screens with half-formed sequences.
+/// Incomplete multi-byte sequences are decoded across the chunk
 /// boundaries the callers copy with.
 pub fn write_bytes(mut b: &[u8]) {
     while !b.is_empty() {
@@ -218,31 +326,21 @@ pub fn write_bytes(mut b: &[u8]) {
             }
         };
         for ch in valid.chars() {
-            if eat_escape(ch, &mut emit_tee) {
-                continue;
-            }
-            match ch {
-                '\r' => {
-                    for _ in 0..current_col() {
-                        emit_tee('\x08');
-                    }
-                }
-                c if c.is_control() && c != '\n' && c != '\t' && c != '\x08' => emit_tee('?'),
-                c => emit_tee(c),
-            }
+            serial_tee(ch);
+            feed_screen(ch);
         }
         if bad {
-            emit_tee('?');
+            screen_char('?');
         }
         b = &b[skip.min(b.len())..];
     }
 }
 
 /// The console session's own output (phase 3.3.5): the text screen and
-/// only it -- no serial copy.  Kernel messages and /dev/console writes
-/// keep the serial tee (write_bytes above); what the console terminal
-/// (/dev/tty0) and its line discipline echo would land on ttyS0 twice,
-/// because the serial session echoes the same keystrokes there itself.
+/// only it -- the interpreted write_bytes path minus its serial tee, which
+/// is what keeps a console session's prompt off ttyS0 (the serial session
+/// is busy answering the same keystrokes there itself).  Same rules as
+/// write_bytes otherwise: escapes become operations, stray controls '?'.
 pub fn write_local(mut b: &[u8]) {
     while !b.is_empty() {
         let (valid, skip, bad) = match core::str::from_utf8(b) {
@@ -255,44 +353,12 @@ pub fn write_local(mut b: &[u8]) {
             }
         };
         for ch in valid.chars() {
-            if eat_escape(ch, &mut local_char) {
-                continue;
-            }
-            if ch == '\r' {
-                for _ in 0..current_col() {
-                    local_char('\x08');
-                }
-                continue;
-            }
-            local_char(ch);
+            feed_screen(ch);
         }
         if bad {
-            local_char('?');
+            screen_char('?');
         }
         b = &b[skip.min(b.len())..];
-    }
-}
-
-/// One character on the text screens only (the serial tee skipped).
-fn local_char(mut ch: char) {
-    // Keep IRQ-context prints from interleaving, like _print does; the
-    // ring buffer flush below needs the same single-flight discipline.
-    let _guard = crate::arch::io::IrqGuard::new();
-    let _cross = PRINT_LOCK.lock();
-    // SAFETY: single CPU; the guard serializes output paths.
-    let c = unsafe { &mut *addr_of_mut!(CONSOLE) };
-    if ch.is_control() && ch != '\n' && ch != '\t' && ch != '\x08' {
-        ch = '?';
-    }
-    track_col(ch);
-    if let Some(v) = c.vga.as_mut() {
-        v.put_char(ch);
-    }
-    if let Some(f) = c.fb.as_mut() {
-        f.put_char(ch);
-    }
-    if let Some(f) = c.fb.as_mut() {
-        f.flush();
     }
 }
 
@@ -300,6 +366,12 @@ impl Default for LogBuf {
     fn default() -> Self {
         LogBuf { buf: [0; 1024], len: 0 }
     }
+}
+
+/// Fixed-capacity formatting target for the console tee (1 KiB, no alloc).
+struct LogBuf {
+    buf: [u8; 1024],
+    len: usize,
 }
 
 impl LogBuf {
@@ -353,8 +425,6 @@ pub fn clear() {
         f.clear();
         f.flush();
     }
-    // SAFETY: single CPU; the cursor is back at the origin.
-    unsafe { *addr_of_mut!(COL) = 0 };
 }
 
 /// Put the text cursor back at the top-left corner without erasing the
@@ -369,8 +439,6 @@ pub fn home() {
     if let Some(f) = c.fb.as_mut() {
         f.home();
     }
-    // SAFETY: single CPU; the cursor is back at the origin.
-    unsafe { *addr_of_mut!(COL) = 0 };
 }
 
 /// Switch the framebuffer console to a RAM back buffer.  Needs the PMM and

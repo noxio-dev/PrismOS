@@ -5,6 +5,7 @@
 // and the `Console` abstraction that fans text out to all of them.  The
 // console API (`init`, `clear`, `char_width`, `_print`) is re-exported here.
 
+pub mod ansi;
 pub mod fb;
 #[allow(dead_code)] // graphics primitives: not every one is used yet
 pub mod gfx;
