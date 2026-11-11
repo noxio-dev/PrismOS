@@ -143,10 +143,14 @@ impl Parser {
                 self.st = 1;
                 Out::Swallow
             }
-            // The controls the screens already carry out go through; the
-            // rest shows as '?' like it always did.
+            // The controls the screens already carry out go through.  BEL
+            // and DEL are noise here -- the line editor's failed-completion
+            // beep and vi's error bell ring on the serial line (a real
+            // terminal acts on them), on our own screens they only ever
+            // printed as '?' -- so they are swallowed.
             '\n' | '\r' | '\t' | '\x08' => Out::Print(ch),
-            c if (c as u32) < 0x20 || c == '\u{7F}' => Out::Print('?'),
+            '\x07' | '\x7f' => Out::Swallow,
+            c if (c as u32) < 0x20 => Out::Print('?'),
             c => Out::Print(c),
         }
     }
