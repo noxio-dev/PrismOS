@@ -3,6 +3,7 @@
 #include <mlibc-config.h>
 #include <string.h>
 
+#include <abi-bits/access.h>
 #include <abi-bits/fd_set.h>
 #include <abi-bits/fcntl.h>
 #include <abi-bits/ioctls.h>
@@ -484,6 +485,65 @@ int Sysdeps<Stat>::operator()(fsfd_target fsfdt, int fd, const char *path, int f
                 /* fd_path would be fstatat(); the kernel has no *at calls. */
                 return ENOSYS;
         }
+}
+
+/* The permission test behind Access / Faccessat: the kernel has no access
+ * syscall, so the answer is computed from a stat, the way the classics do
+ * it on such kernels.  The port is single-user root -- getuid is a fixed
+ * zero (syscall.h) -- so the real-vs-effective split access() normally
+ * makes has nothing to split: root reads and writes everything, and
+ * executes only when an x bit exists somewhere (the Linux rule).  The
+ * uid/gid triple is still spelled out so a multi-user kernel drops in
+ * without rewriting the tag. */
+static int access_check(const struct stat &st, int mode) {
+        if(mode & ~(R_OK | W_OK | X_OK))
+                return EINVAL;
+        if(mode == F_OK)
+                return 0; // existence was the whole question
+        if(st.st_uid == 0) {
+                if((mode & X_OK) && !(st.st_mode & 0111))
+                        return EACCES;
+                return 0;
+        }
+        unsigned want = 0;
+        if(mode & R_OK)
+                want |= 4;
+        if(mode & W_OK)
+                want |= 2;
+        if(mode & X_OK)
+                want |= 1;
+        unsigned have;
+        if(st.st_uid == static_cast<uid_t>(sys(PRISM_SYS_GETUID)))
+                have = (st.st_mode >> 6) & 7;
+        else if(st.st_gid == static_cast<gid_t>(sys(PRISM_SYS_GETGID)))
+                have = (st.st_mode >> 3) & 7;
+        else
+                have = st.st_mode & 7;
+        return (have & want) == want ? 0 : EACCES;
+}
+
+int Sysdeps<Access>::operator()(const char *path, int mode) {
+        /* access() follows symlinks: stat(), not lstat(). */
+        struct stat st;
+        if(int e = sysdep<Stat>(fsfd_target::path, -1, path, 0, &st); e)
+                return e;
+        return access_check(st, mode);
+}
+
+int Sysdeps<Faccessat>::operator()(int dirfd, const char *path, int mode, int flags) {
+        /* No *at syscalls in the kernel: only AT_FDCWD resolves (the
+         * port's contract), and AT_EACCESS is moot on a root-only
+         * system.  AT_SYMLINK_NOFOLLOW is lstat's spelling, the Linux
+         * value the Stat tag already knows. */
+        if(dirfd != AT_FDCWD)
+                return ENOSYS;
+        if(flags & ~AT_SYMLINK_NOFOLLOW)
+                return EINVAL;
+        struct stat st;
+        if(int e = sysdep<Stat>(fsfd_target::path, -1, path,
+                        flags & AT_SYMLINK_NOFOLLOW ? 0x100 : 0, &st); e)
+                return e;
+        return access_check(st, mode);
 }
 
 int Sysdeps<OpenDir>::operator()(const char *path, int *handle) {

@@ -37,6 +37,11 @@ struct PrismOSSysdepTags :
         /* the rest of what the kernel serves */
         Isatty,
         Stat,
+        /* the file-test pair the stat-backed check serves (ar and the
+         * other binutils tools ask access() on every invocation); the
+         * Faccessat half stays AT_FDCWD-only, the port's *at() contract */
+        Access,
+        Faccessat,
         VmProtect,
         GetPid,
         GetTid,
