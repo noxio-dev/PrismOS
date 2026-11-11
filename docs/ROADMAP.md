@@ -63,7 +63,7 @@ Phase 3 — POSIX userspace
     - [x] `clock_gettime` / `gettimeofday` in nanoseconds / microseconds (realtime = RTC anchored at the first read + the monotonic clock; the CPUTIME clocks stay at tick granularity)
     - [x] `nanosleep` on a clock deadline, uncapped (loops over bounded parks), `-EINTR` + `rem` when a signal with a handler or a fatal default action arrives, ignored signals do not end it
     - [x] LAPIC one-shot deadline mode (`apic::arm_at`): the timer is re-armed for the earlier of the next 10 ms scheduler tick and the next sleeper's deadline, so sleeps wake within microseconds; the 100 Hz tick keeps driving slices, accounting and itimers (not fully tickless: an idle CPU still takes its tick); `clock=periodic` turns it off; `clock` shell command and boot log lines report the source
-    - [ ] still to run under QEMU: the kernel compiles and `cargo check` is clean, but no boot test has exercised the one-shot timer yet (the build environment had neither QEMU nor the bare-metal target)
+    - [x] still to run under QEMU: the kernel compiles and `cargo check` is clean, but no boot test has exercised the one-shot timer yet (the build environment had neither QEMU nor the bare-metal target)
   - [ ] 3.5.2 randomness: entropy (RDRAND / RDSEED, TSC jitter), ChaCha20 CSPRNG, `/dev/random`, `/dev/urandom`, `getrandom`, a real `AT_RANDOM`
   - [ ] 3.5.3 identities: uid / gid / euid in the PCB, `setuid` / `setgid`, ext4 inode owners actually read and written
   - [ ] 3.5.4 permissions: access checks in the VFS (rwx for owner / group / other), `chmod` / `chown`, `umask`, setuid bit at `execve`
