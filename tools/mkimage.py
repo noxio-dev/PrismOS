@@ -138,9 +138,9 @@ def validate_root(root_dir):
     for f in ("ld.so", "libc.so"):
         if not os.path.isfile(os.path.join(root_dir, "usr", "lib", f)):
             sys.exit("root tree: /usr/lib/%s missing (the dynamic half)" % f)
-    # The four /usr-merge symlinks: bin, sbin -> usr/bin; lib, lib64 -> usr/lib.
-    for name, target in (("bin", "usr/bin"), ("sbin", "usr/bin"),
-                         ("lib", "usr/lib"), ("lib64", "usr/lib")):
+    # The four /usr-merge symlinks.
+    for name, target in (("bin", "usr/bin"), ("sbin", "usr/sbin"),
+                        ("lib", "usr/lib"), ("lib64", "usr/lib")):
         p = os.path.join(root_dir, name)
         if not os.path.islink(p):
             sys.exit("root tree: /%s is not a symlink (the usr-merge)" % name)

@@ -218,11 +218,11 @@ $B/busybox.stamp: $B/toolchain/usr/.stamp $B/mlibc-port.md5 $(BUSYBOX_PORT_FILES
 # the new syscall 66 answering with the child's own user / system ticks.
 # `sh` is in the list on purpose: busybox's ash owns the name now, what
 # every #!/bin/sh and every PATH walk means on this system.
-BUSYBOX_APPLETS := sh ash ls cat echo printf test mkdir rmdir rm cp mv ln \
-	           touch chmod readlink pwd true false env sleep uname wc \
-	           head tail id whoami basename dirname time ps mount \
-	           umount df grep sed awk tar vi loadkmap dumpkmap kbd_mode showkey hostname \
-			   clear
+BUSYBOX_APPLETS := sh ash ls cat echo printf test [ mkdir rmdir rm cp mv ln \
+                   touch chmod readlink pwd true false env sleep uname wc \
+                   head tail id whoami basename dirname time ps mount \
+                   umount df grep sed awk tar vi loadkmap dumpkmap kbd_mode showkey hostname \
+                   clear setsid cttyhack
 
 # ---- mlibc toolchain + sysroot (phase 3.2, steps 3 + 4) ---------------------
 # ports/toolchain drives the phase's third and fourth steps: the
@@ -364,7 +364,7 @@ $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
 		-o $B/root/usr/lib/libc.so $(SYSROOT)/usr/lib/libc.so
 	chmod 755 $B/root/usr/lib/ld.so $B/root/usr/lib/libc.so
 	ln -s usr/bin $B/root/bin
-	ln -s usr/bin $B/root/sbin
+	ln -s usr/sbin $B/root/sbin
 	ln -s usr/lib $B/root/lib
 	ln -s usr/lib $B/root/lib64
 	touch $@

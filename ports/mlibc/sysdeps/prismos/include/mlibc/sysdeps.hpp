@@ -67,6 +67,7 @@ struct PrismOSSysdepTags :
         Sigaction,
         Sigprocmask,
         ThreadSigmask,
+        Sigtimedwait,
         OpenDir,
         ReadEntries,
         Tcgetattr,
@@ -124,7 +125,12 @@ struct PrismOSSysdepTags :
         Statvfs,
         SetHostname,
         SetItimer,
-        GetItimer
+        GetItimer,
+
+        /* the init step's shutdown half: reboot / poweroff ride the
+         * kernel's 57, the cmd passed raw (the linux-reboot option's
+         * tag, phase 3.4's option lands with it). */
+        Reboot
 {};
 
 struct SysdepTraits {

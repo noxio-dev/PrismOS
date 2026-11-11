@@ -17,3 +17,8 @@ for script in /etc/rc.d/*; do
 done
 
 echo "rc: done"
+
+printf "\nWelcome to PrismOS!\n\n"
+printf "The whole operating system is fully written from scratch in C/Rust\n"
+printf "And it can run some things like Busybox or small programs.\n"
+printf "Enjoy!\n"

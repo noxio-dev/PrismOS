@@ -353,6 +353,7 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         69 => sysc::sys_sethostname(a0, a1),
         70 => process::sys_setitimer(a0, a1, a2),
         71 => process::sys_getitimer(a0, a1),
+        72 => signal::sys_sigtimedwait(a0, a1, a2, frame.r10),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

@@ -861,6 +861,20 @@ int Sysdeps<Kill>::operator()(pid_t pid, int sig) {
         return 0;
 }
 
+int Sysdeps<Sigtimedwait>::operator()(const sigset_t *__restrict set,
+                siginfo_t *__restrict info,
+                const struct timespec *__restrict timeout, int *out_signal) {
+    long r = __do_syscall4(72, (long)set, (long)info, (long)timeout, 8);
+    if (r < 0) return -r;           // errno positif
+    *out_signal = (int)r;
+    return 0;
+}
+
+int Sysdeps<Reboot>::operator()(int cmd) {
+    long r = __do_syscall1(57, cmd);
+    return r < 0 ? -r : 0;
+}
+
 // ------------------------------------------------------------------ signals
 
 int Sysdeps<Sigaction>::operator()(int signum, const struct sigaction *act,

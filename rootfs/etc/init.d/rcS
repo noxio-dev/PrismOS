@@ -1,0 +1,9 @@
+#!/bin/sh
+
+echo "PrismOS: system startup"
+
+if [ -x /etc/rc ]; then
+    /etc/rc
+fi
+
+echo "PrismOS: startup complete"

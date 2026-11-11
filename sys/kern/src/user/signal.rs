@@ -411,6 +411,85 @@ pub fn sys_kill(pid: u64, sig: u64) -> i64 {
     0 // everything else is ignored by default (no core dumps)
 }
 
+pub fn sys_sigtimedwait(set_p: u64, info_p: u64, ts_p: u64, sz: u64) -> i64 {
+    if sz != 8 {
+        return -EINVAL;
+    }
+
+    let Some(cur) = process::current() else { return -EFAULT };
+    let Some(aspace) = cur.aspace.as_ref() else { return -EFAULT };
+
+    let mut w = [0u8; 8];
+    if !aspace.read(set_p, &mut w) {
+        return -EFAULT;
+    }
+
+    let set64 = u64::from_le_bytes(w);
+    let set = (set64 & ((1u64 << NSIG) - 1) & !(1u64 << SIGKILL)) as u32;
+
+    if cur.signals.blocked & set != set {
+        return -EINVAL;
+    }
+
+    let deadline = if ts_p == 0 {
+        None
+    } else {
+        let mut t = [0u8; 16];
+        if !aspace.read(ts_p, &mut t) {
+            return -EFAULT;
+        }
+
+        let sec = u64::from_le_bytes(t[0..8].try_into().unwrap());
+        let nsec = u64::from_le_bytes(t[8..16].try_into().unwrap());
+
+        if nsec >= 1_000_000_000 {
+            return -EINVAL;
+        }
+
+        Some(
+            crate::hw::pit::uptime_ms()
+                .saturating_add(sec.saturating_mul(1000))
+                .saturating_add(nsec / 1_000_000)
+        )
+    };
+
+    loop {
+        let hit = cur.signals.pending & set;
+
+        if hit != 0 {
+            let sig = hit.trailing_zeros() as u64;
+            cur.signals.pending &= !(1u32 << sig);
+
+            if info_p != 0 {
+                let mut si = [0u8; 128];
+                si[0..4].copy_from_slice(&(sig as i32).to_le_bytes());
+
+
+
+                if !aspace.ensure_writable(info_p)
+                    || !aspace.write(info_p, &si, false)
+                {
+                    return -EFAULT;
+                }
+            }
+
+            return sig as i64;
+        }
+
+        if cur.signals.pending & !cur.signals.blocked != 0 {
+            return -4; // EINTR
+        }
+
+        if let Some(d) = deadline {
+            if crate::hw::pit::uptime_ms() >= d {
+                return -11; // EAGAIN
+            }
+        }
+
+        process::sleep_current(1);
+    }
+}
+
 /// The `kill(getpid(), sig)` path, shared with the group delivery below
 /// (the caller may be a member of its own target group).  A default
 /// disposition acts right away (this call never returns then); a handler
