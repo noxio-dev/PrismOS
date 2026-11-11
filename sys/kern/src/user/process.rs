@@ -31,9 +31,11 @@
 //     when its slice is used up or a strictly better process became ready,
 //     switches away from inside the interrupt frame -- the whole trap frame
 //     stays on the process's private kernel stack, exactly like a `yield`;
-//   * sleep / wakeup: `sleep(ms)` parks the process (`State::Sleeping`); the
-//     tick wakes it when its time is up, and a woken process that beats the
-//     running one preempts it at once;
+//   * sleep / wakeup: `sleep(ms)` / `nanosleep` park the process
+//     (`State::Sleeping`) on a clock deadline (hw::clock, nanoseconds); the
+//     LAPIC timer wakes it when the deadline is up -- within microseconds in
+//     one-shot mode (hw/apic.rs), on the next tick in periodic mode -- and a
+//     woken process that beats the running one preempts it at once;
 //   * a process also leaves the CPU with `yield` (to its own level or
 //     better), ends with `exit`, or is killed by the watchdog (CPU budget in
 //     ticks, charged only while it runs: sleeping is free) or by a ring 3
@@ -117,7 +119,7 @@ pub enum State {
     Ready,
     /// On the CPU right now.
     Running,
-    /// Parked by `sleep` until `wake_at`.
+    /// Parked by `sleep` until `wake_ns` (a clock deadline).
     Sleeping,
     /// Parked by `wait` until a matching child dies (phase 2.5).
     Waiting,
@@ -263,8 +265,10 @@ pub struct Process {
     pub child_sys: u64,
     /// Watchdog: CPU ticks the process may use in total.
     budget: u64,
-    /// Tick at which a sleeping process becomes ready again.
-    wake_at: u64,
+    /// Clock time (ns, hw::clock) at which a sleeping process becomes ready
+    /// again; 0 when it is not sleeping on a deadline (phase 3.5.1: this
+    /// was a tick count, which made every sleep a multiple of 10 ms).
+    wake_ns: u64,
     /// ITIMER_REAL: tick at which SIGALRM is raised (0 = disarmed) and the
     /// reload interval in ticks (0 = one shot).  setitimer / alarm.
     pub itimer_next: u64,
@@ -549,7 +553,7 @@ fn spawn_common(
         child_user: 0,
         child_sys: 0,
         budget: if timeout_ticks == 0 { DEFAULT_TIMEOUT_TICKS } else { timeout_ticks },
-        wake_at: 0,
+        wake_ns: 0,
         itimer_next: 0,
         itimer_interval: 0,
         switches: 0,
@@ -1174,11 +1178,25 @@ fn pick_ready(after: u64, limit: u8) -> Option<*mut Process> {
     }
 }
 
-/// Park the running process for at least `ms` milliseconds (rounded up to
-/// the tick, plus the partial tick in progress) and run somebody else; the
-/// call returns once the process is woken and scheduled again.  `sleep(0)`
-/// is a `yield`.
+/// Park the running process for at least `ms` milliseconds and run somebody
+/// else; the call returns once the process is woken and scheduled again.
+/// `sleep(0)` is a `yield`.  A millisecond wrapper of `sleep_current_ns`.
 pub fn sleep_current(ms: u64) {
+    sleep_current_ns(ms.min(MAX_SLEEP_MS) * 1_000_000)
+}
+
+/// Park the running process for at least `ns` nanoseconds (one park is
+/// capped at `MAX_SLEEP_MS`: the caller loops for longer sleeps) and run
+/// somebody else; the call returns once the process is woken and scheduled
+/// again.  `ns == 0` is a `yield`.
+///
+/// The wake-up is a clock deadline, not a tick count: with the one-shot
+/// timer (hw/apic.rs) the process is woken within microseconds of it, and
+/// in periodic mode by the first tick after it -- never before.  A process
+/// can also be woken early (a signal, a futex wake): the call then returns
+/// before the deadline, and callers that need the whole span re-check the
+/// clock.
+pub fn sleep_current_ns(ns: u64) {
     // SAFETY: as `yield_current`: interrupts are masked in the syscall path,
     // so the tick cannot slip between the state change and the switch.
     unsafe {
@@ -1186,12 +1204,18 @@ pub fn sleep_current(ms: u64) {
         if cur.is_null() {
             return;
         }
-        if ms == 0 {
+        if ns == 0 {
             return yield_current();
         }
-        let ticks = ms.min(MAX_SLEEP_MS).div_ceil(10) + 1;
-        (*cur).wake_at = crate::hw::pit::ticks() + ticks;
+        let ns = ns.min(MAX_SLEEP_MS * 1_000_000);
+        // Without a fine clock `now_ns` is the tick count and can read up to
+        // a tick behind the real time: pad by one so the sleep is never early.
+        let pad = if crate::hw::clock::precise() { 0 } else { crate::hw::pit::TICK_NS };
+        let wake = crate::hw::clock::now_ns() + ns + pad;
+        (*cur).wake_ns = wake;
         (*cur).state = State::Sleeping;
+        // One-shot timer: make sure it fires by then (no-op in periodic mode).
+        crate::hw::apic::arm_at(wake);
         match pick_ready((*cur).pid, u8::MAX) {
             Some(next) => {
                 cpu_state_for(next);
@@ -1220,27 +1244,36 @@ pub fn setprio_current(new: u64) -> i64 {
     old as i64
 }
 
-/// Wake every sleeper whose time is up.  Tick handler, IF=0; only flips
-/// `state`, never changes the table's structure.
-fn wake_sleepers(now: u64) {
+/// Wake every sleeper whose deadline is `now_ns` or earlier, and answer the
+/// earliest deadline among those still asleep (None when nobody sleeps on
+/// one) -- the one-shot timer arms itself for it.  Timer handler, IF=0;
+/// only flips `state`, never changes the table's structure.
+pub fn wake_due(now_ns: u64) -> Option<u64> {
+    let mut earliest: Option<u64> = None;
     // SAFETY: structure changes are made with interrupts masked (spawn,
     // reap, kill), so this walk cannot overlap one.
     unsafe {
         for p in (*addr_of_mut!(TABLE)).iter_mut() {
-            if p.state == State::Sleeping && now >= p.wake_at {
+            if p.state != State::Sleeping || p.wake_ns == 0 {
+                continue;
+            }
+            if now_ns >= p.wake_ns {
                 p.state = State::Ready;
+            } else {
+                earliest = Some(earliest.map_or(p.wake_ns, |e| e.min(p.wake_ns)));
             }
         }
     }
+    earliest
 }
 
 /// Raise SIGALRM for every process whose real-time interval timer is due.
 /// Tick handler, IF=0: only flips signal bits and `state`, like
-/// `wake_sleepers`; the death of a default-action process happens later,
+/// `wake_due`; the death of a default-action process happens later,
 /// in process context.
 fn fire_itimers(now: u64) {
     const SIGALRM_BIT: u32 = 1 << signal::SIGALRM;
-    // SAFETY: as wake_sleepers.
+    // SAFETY: as wake_due.
     unsafe {
         for p in (*addr_of_mut!(TABLE)).iter_mut() {
             if p.itimer_next == 0 || now < p.itimer_next || p.state == State::Zombie {
@@ -1343,7 +1376,7 @@ pub fn sys_setitimer(which: u64, new_p: u64, old_p: u64) -> i64 {
         cur.itimer_next = 0;
         cur.itimer_interval = 0;
     } else {
-        // +1 like sleep_current: never fire early by a partial tick.
+        // +1: never fire early by a partial tick (itimers count ticks).
         cur.itimer_next = crate::hw::pit::ticks() + value + 1;
         cur.itimer_interval = interval;
     }
@@ -1529,7 +1562,7 @@ pub fn post_signal(pid: u64, sig: u64) -> bool {
                     // `interrupt_pending` after every park and answer
                     // -EINTR (phase 3.3, the unix rule for interruptible
                     // waits).  Flipping the state only short-circuits the
-                    // park -- the wake_at bookkeeping needs no undo.
+                    // park -- the wake_ns bookkeeping needs no undo.
                     if p.state == State::Sleeping {
                         p.state = State::Ready;
                     }
@@ -1689,7 +1722,7 @@ pub fn on_tick(from_user: bool) {
     // SAFETY: handler context with IF=0; `CURRENT` and the table are only
     // changed with interrupts masked.
     unsafe {
-        wake_sleepers(crate::hw::pit::ticks());
+        wake_due(crate::hw::clock::now_ns());
         fire_itimers(crate::hw::pit::ticks());
 
         let cur = CURRENT;
@@ -1746,6 +1779,33 @@ pub fn on_tick(from_user: bool) {
                     (*cur).slice_left = SLICE_TICKS; // alone at our level: new slice
                 }
             }
+        }
+    }
+}
+
+/// A timer interrupt that is not a scheduler tick: the one-shot timer
+/// (hw/apic.rs) fired for a sleeper's deadline and `wake_due` has already
+/// made it Ready.  Nothing is charged -- the 10 ms cadence of `on_tick`
+/// still owns time slices and CPU accounting -- but a woken process that is
+/// strictly better than the running one takes the CPU at once, exactly as it
+/// would at a tick (same-level processes wait for the slice to end).  Same
+/// context as `on_tick`: the EOI is sent, interrupts are masked, and the
+/// kernel is not preemptible (`from_user` false: leave).
+pub fn on_wake(from_user: bool) {
+    // SAFETY: handler context with IF=0; `CURRENT` and the table are only
+    // changed with interrupts masked.
+    unsafe {
+        let cur = CURRENT;
+        if cur.is_null() || !from_user || (*cur).prio == 0 {
+            return;
+        }
+        if let Some(next) = pick_ready((*cur).pid, (*cur).prio - 1) {
+            (*cur).state = State::Ready;
+            (*cur).preempts += 1;
+            cpu_state_for(next);
+            switch_ctx(&mut (*cur).saved, &(*next).saved);
+            // Resumed: whoever switched back republished our CPU state.
+            (*CURRENT).state = State::Running;
         }
     }
 }

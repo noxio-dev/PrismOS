@@ -17,7 +17,7 @@
 //
 //   36 arch_prctl(code, addr)         the FS/GS base pair TLS lives on
 //   40 mprotect(addr, len, prot)      re-protect mapped pages (COW-aware)
-//   43 clock_gettime(clk, ts)         uptime / RTC time in POSIX clothes
+//   43 clock_gettime(clk, ts)         the nanosecond clock / RTC time (3.5.1)
 //
 // (The futex, sigaction / sigprocmask, poll / select halves of the phase
 // live in user/futex.rs, user/signal.rs and user/fd.rs.)
@@ -64,6 +64,7 @@ use crate::user::process;
 use crate::user::usermode::{self, EBADF, EFAULT, EINVAL, ENOSYS};
 
 const ENOENT: i64 = 2;
+const EINTR: i64 = 4;
 const ENOMEM: i64 = 12;
 const EACCES: i64 = 13;
 const ENODEV: i64 = 19;
@@ -531,25 +532,33 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
 
 // ---------------------------------------------------------- clock_gettime
 
-/// Boot-time realtime anchor in unix milliseconds, read from the RTC once
-/// on first use (0 when the RTC had nothing sane to say -- realtime then
-/// runs off the monotonic clock alone; there is no NTP here).
-static RTC_EPOCH_MS: AtomicU64 = AtomicU64::new(0);
+/// Unix nanoseconds at the clock's zero (boot): the RTC's reading, taken
+/// once on first use, minus the monotonic time at which it was taken.  0
+/// when the RTC had nothing sane to say -- realtime then runs off the
+/// monotonic clock alone (there is no NTP here).  The anchor is the RTC's
+/// whole second: realtime is right to a second at best, with nanosecond
+/// *resolution*.
+static RTC_ZERO_NS: AtomicU64 = AtomicU64::new(0);
 static RTC_READ: AtomicBool = AtomicBool::new(false);
 
-/// Milliseconds since the epoch, RTC + uptime.
-fn realtime_ms() -> u64 {
+/// Nanoseconds since the epoch: the RTC anchor plus the monotonic clock.
+fn realtime_ns() -> u64 {
     if !RTC_READ.load(Ordering::Acquire) {
         // The CMOS reads must not be stretched by a tick storm: mask them.
         let flags = crate::arch::io::cli_save();
         if let Some(dt) = crate::hw::rtc::read() {
-            RTC_EPOCH_MS.store(unix_ms(&dt), Ordering::Relaxed);
+            // Anchor on the moment of the read, not on boot: realtime
+            // before 3.5.1 was the RTC plus the uptime *at that point of
+            // the first call*, i.e. ahead by however long the first caller
+            // took to show up.
+            let unix_ns = unix_ms(&dt) * 1_000_000;
+            RTC_ZERO_NS.store(unix_ns.saturating_sub(crate::hw::clock::now_ns()), Ordering::Relaxed);
         }
         RTC_READ.store(true, Ordering::Release);
         // SAFETY: flags came from cli_save on this stack.
         unsafe { crate::arch::io::restore_flags(flags) };
     }
-    RTC_EPOCH_MS.load(Ordering::Relaxed) + crate::hw::pit::uptime_ms()
+    RTC_ZERO_NS.load(Ordering::Relaxed) + crate::hw::clock::now_ns()
 }
 
 /// A DateTime in unix milliseconds (days_from_civil, Howard Hinnant's
@@ -568,26 +577,27 @@ fn unix_ms(dt: &crate::hw::rtc::DateTime) -> u64 {
     (secs.max(0) * 1000) as u64
 }
 
-/// `clock_gettime(clk, ts)` (syscall 43, phase 3.2): the uptime clock in
-/// POSIX clothes.  CLOCK_MONOTONIC (and its raw / coarse / boottime
-/// aliases) comes straight from the tick counter; CLOCK_REALTIME (and its
-/// coarse alias) is anchored at the RTC's read of boot -- a lazy once, the
-/// first caller pays the CMOS reads; the two CPUTIME ids are the process's
-/// charged ticks.  Millisecond precision, `struct timespec` (i64 sec, i64
-/// nsec) written to `ts`; -EINVAL for a clock we do not keep.
+/// `clock_gettime(clk, ts)` (syscall 43): nanosecond resolution since phase
+/// 3.5.1.  CLOCK_MONOTONIC (and its raw / coarse / boottime aliases) is the
+/// system clock (hw/clock.rs: the calibrated TSC, the HPET or, failing both,
+/// the 10 ms tick count); CLOCK_REALTIME (and its coarse alias) is that
+/// clock anchored on the RTC; the two CPUTIME ids are the process's charged
+/// ticks, so they stay at the 10 ms the scheduler charges in.  `struct
+/// timespec` (i64 sec, i64 nsec) written to `ts`; -EINVAL for a clock we do
+/// not keep.
 pub fn sys_clock_gettime(clk: u64, ts: u64) -> i64 {
-    let ms = match clk {
-        0 | 5 => realtime_ms(),          // REALTIME, REALTIME_COARSE
-        1 | 4 | 6 | 7 => crate::hw::pit::uptime_ms(), // MONOTONIC & friends
+    let ns = match clk {
+        0 | 5 => realtime_ns(),                         // REALTIME, REALTIME_COARSE
+        1 | 4 | 6 | 7 => crate::hw::clock::now_ns(),    // MONOTONIC & friends
         2 | 3 => {
             // PROCESS / THREAD CPUTIME: the charged ticks (100 Hz -> 10 ms;
             // single-threaded, so the two are the same number).
             let Some(cur) = process::current() else { return -EFAULT };
-            cur.used * 10
+            cur.used * crate::hw::pit::TICK_NS
         }
         _ => return -EINVAL,
     };
-    let pair = [(ms / 1000) as i64, ((ms % 1000) * 1_000_000) as i64];
+    let pair = [(ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64];
     let mut b = [0u8; 16];
     b[0..8].copy_from_slice(&pair[0].to_le_bytes());
     b[8..16].copy_from_slice(&pair[1].to_le_bytes());
@@ -761,8 +771,8 @@ pub fn sys_umask(mask: u64) -> i64 {
 /// `clock_gettime(CLOCK_REALTIME)` in `struct timeval` clothes (i64 sec,
 /// i64 usec).  `tz` is accepted and ignored, like on Linux.
 pub fn sys_gettimeofday(tv_p: u64, _tz_p: u64) -> i64 {
-    let ms = realtime_ms();
-    let pair = [(ms / 1000) as i64, ((ms % 1000) * 1000) as i64];
+    let ns = realtime_ns();
+    let pair = [(ns / 1_000_000_000) as i64, ((ns % 1_000_000_000) / 1000) as i64];
     if tv_p == 0 {
         return 0; // a NULL tv is a plain "what time is it" probe
     }
@@ -777,11 +787,19 @@ pub fn sys_gettimeofday(tv_p: u64, _tz_p: u64) -> i64 {
     0
 }
 
-/// `nanosleep(req, rem)` (syscall 54): park the caller for the requested
-/// span.  `rem` is accepted and cleared: a sleep cannot be interrupted --
-/// nothing here can shorten one except a signal that wakes the process
-/// early, and the remainder bookkeeping is not worth the machinery (the
-/// answer stays "slept it all").  House-capped like every sleep.
+/// `nanosleep(req, rem)` (syscall 54): sleep until the requested span has
+/// elapsed on the system clock.  Phase 3.5.1 made it honest on both counts
+/// it used to fudge: the span is nanoseconds (the wake-up is a clock
+/// deadline the one-shot timer arms itself for, see hw/apic.rs -- the old
+/// version rounded to the 10 ms tick and added one), and it is not "house
+/// capped" any more: one park is bounded (`MAX_SLEEP_MS`) but the call
+/// loops until the deadline, so `sleep 60` sleeps 60 s.
+///
+/// A sleep is cut short by a signal that is going to act -- a handler to run
+/// or a default action that ends the process (`signal::sleep_should_end`):
+/// the call then answers -EINTR with the time left in `rem`.  Anything else
+/// that wakes the process early (an ignored signal, a futex wake) just goes
+/// back to sleep.  `rem` is zeroed on a complete sleep.
 pub fn sys_nanosleep(req_p: u64, rem_p: u64) -> i64 {
     let read_i64 = |p: u64, out: &mut i64| -> bool {
         let Some(cur) = process::current() else { return false };
@@ -793,6 +811,17 @@ pub fn sys_nanosleep(req_p: u64, rem_p: u64) -> i64 {
         *out = i64::from_le_bytes(b);
         true
     };
+    let write_rem = |ns: u64| -> bool {
+        if rem_p == 0 {
+            return true;
+        }
+        let Some(cur) = process::current() else { return false };
+        let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return false };
+        let mut b = [0u8; 16];
+        b[0..8].copy_from_slice(&((ns / 1_000_000_000) as i64).to_le_bytes());
+        b[8..16].copy_from_slice(&((ns % 1_000_000_000) as i64).to_le_bytes());
+        aspace.ensure_writable(rem_p) && aspace.write(rem_p, &b, false)
+    };
     let (mut sec, mut nsec) = (0i64, 0i64);
     if !read_i64(req_p, &mut sec) || !read_i64(req_p + 8, &mut nsec) {
         return -EFAULT;
@@ -800,17 +829,27 @@ pub fn sys_nanosleep(req_p: u64, rem_p: u64) -> i64 {
     if nsec < 0 || nsec >= 1_000_000_000 || sec < 0 {
         return -EINVAL;
     }
-    let ms = (sec as u64).saturating_mul(1000) + (nsec as u64) / 1_000_000;
-    process::sleep_current(ms);
-    if rem_p != 0 {
-        let Some(cur) = process::current() else { return -EFAULT };
-        let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return -EFAULT };
-        let zeros = [0u8; 16];
-        if !aspace.ensure_writable(rem_p) || !aspace.write(rem_p, &zeros, false) {
-            return -EFAULT;
-        }
+    let ns = (sec as u64).saturating_mul(1_000_000_000).saturating_add(nsec as u64);
+    if ns == 0 {
+        process::yield_current();
+        return if write_rem(0) { 0 } else { -EFAULT };
     }
-    0
+    let deadline = crate::hw::clock::now_ns().saturating_add(ns);
+    loop {
+        let now = crate::hw::clock::now_ns();
+        if now >= deadline {
+            break;
+        }
+        if crate::user::signal::sleep_should_end() {
+            return if write_rem(deadline - now) { -EINTR } else { -EFAULT };
+        }
+        process::sleep_current_ns(deadline - now);
+    }
+    if write_rem(0) {
+        0
+    } else {
+        -EFAULT
+    }
 }
 
 /// `sethostname(name, len)` (syscall 69): the node name `uname` reports.

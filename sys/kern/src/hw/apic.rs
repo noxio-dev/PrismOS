@@ -10,8 +10,19 @@
 //    stubs and handler registry in int.rs are unchanged), honouring the MADT
 //    interrupt source overrides.
 //  * Timer: the LAPIC timer is calibrated against the HPET (or PIT channel 2
-//    when there is none) and then runs periodically at pit::HZ on vector
-//    0x30; it replaces the PIT as the system tick.
+//    when there is none) and replaces the PIT as the system tick, on vector
+//    0x30.  Two modes (phase 3.5.1):
+//      - one-shot (the default once the nanosecond clock has a fine
+//        counter): the timer is re-armed at every interrupt for the earlier
+//        of the next 10 ms scheduler tick and the next sleeper's deadline,
+//        so `nanosleep` wakes within microseconds instead of on a tick
+//        boundary.  The scheduler tick keeps its 100 Hz cadence (time
+//        slices, CPU accounting and interval timers count ticks); the
+//        deadline interrupts in between wake sleepers and nothing else.
+//        Not tickless: an idle CPU still takes its 100 Hz tick.
+//      - periodic at pit::HZ, the pre-3.5.1 behaviour: `clock=pit` or
+//        `clock=periodic` on the command line, or no fine clock.
+//    The application processors always run periodic timers of their own.
 //
 // After init() the 8259 is fully masked and EOIs go to the LAPIC.
 
@@ -56,6 +67,20 @@ static TIMER_PER_MS: AtomicU64 = AtomicU64::new(0);
 static TIMER_INITIAL: AtomicU32 = AtomicU32::new(0);
 static CAL_SOURCE: AtomicU32 = AtomicU32::new(0); // 1 = HPET, 2 = PIT
 
+/// One-shot deadline mode (see the header) is permitted / active.
+static ONESHOT_ALLOWED: AtomicBool = AtomicBool::new(true);
+static ONESHOT: AtomicBool = AtomicBool::new(false);
+/// Clock time (ns) the next 10 ms scheduler tick is due at.
+static NEXT_TICK_NS: AtomicU64 = AtomicU64::new(0);
+/// Clock time (ns) the one-shot timer is armed to fire at (u64::MAX: unarmed).
+/// Invariant outside the interrupt handler: ARMED_NS <= NEXT_TICK_NS, so a
+/// tick can never be missed.
+static ARMED_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Shortest shot armed: a deadline that is already due fires at once, but
+/// a zero count would stop the timer instead.
+const MIN_SHOT_NS: u64 = 1_000;
+
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
 }
@@ -79,6 +104,17 @@ pub fn calibration_source() -> &'static str {
         2 => "PIT ch2",
         _ => "none",
     }
+}
+
+/// `clock=periodic` on the command line turns the one-shot mode off.  Call
+/// before `init`.
+pub fn allow_oneshot(on: bool) {
+    ONESHOT_ALLOWED.store(on, Ordering::Relaxed);
+}
+
+/// Whether the boot CPU's timer runs in one-shot deadline mode.
+pub fn oneshot() -> bool {
+    ONESHOT.load(Ordering::Relaxed)
 }
 
 // ------------------------------------------------------------------ LAPIC
@@ -264,35 +300,6 @@ fn set_isa_mask(irq: u8, masked: bool) {
 
 // ------------------------------------------------------------------ timer
 
-/// Wait `ms` using the HPET main counter.  False if it does not tick.
-fn hpet_wait_ms(a: &acpi::Acpi, ms: u64) -> bool {
-    let Some(va) = crate::mem::vmm::phys_access(a.hpet_addr) else { return false };
-    let base = va as *mut u8;
-    // SAFETY: HPET register block, 1 KiB of MMIO.
-    unsafe {
-        let cap = (base as *const u64).read_volatile();
-        let period_fs = cap >> 32;
-        if period_fs == 0 || period_fs > 100_000_000 {
-            return false;
-        }
-        let wide = cap & (1 << 13) != 0;
-        let mask: u64 = if wide { u64::MAX } else { 0xFFFF_FFFF };
-        let cfg = base.add(0x10) as *mut u64;
-        cfg.write_volatile(cfg.read_volatile() | 1); // ENABLE_CNF
-        let cnt = base.add(0xF0) as *const u64;
-        let ticks = ms * 1_000_000_000_000 / period_fs;
-        let start = cnt.read_volatile();
-        let mut spins = 0u64;
-        while cnt.read_volatile().wrapping_sub(start) & mask < ticks {
-            spins += 1;
-            if spins > 100_000_000 {
-                return false;
-            }
-        }
-        true
-    }
-}
-
 fn calibrate(ms: u32) -> Option<u64> {
     lwrite(REG_TIMER_DIV, 0x3); // divide by 16
     lwrite(REG_LVT_TIMER, LVT_MASKED | TIMER_VECTOR as u32); // one-shot, masked
@@ -300,7 +307,7 @@ fn calibrate(ms: u32) -> Option<u64> {
     lwrite(REG_TIMER_INIT, 0xFFFF_FFFF);
     let mut ok = false;
     if let Some(a) = acpi::info() {
-        if a.hpet && hpet_wait_ms(a, ms as u64) {
+        if a.hpet && crate::hw::hpet::wait_ms(ms as u64) {
             ok = true;
             src = 1;
         }
@@ -323,10 +330,109 @@ fn calibrate(ms: u32) -> Option<u64> {
     Some(per_ms)
 }
 
-/// Periodic tick: this handler is the new PIT.
+/// Re-measure the LAPIC timer against the nanosecond clock over 5 ms, when
+/// that clock is TSC driven: the first estimate (one HPET / PIT window, with
+/// the start and stop skew of a port or MMIO access) is good to a fraction
+/// of a percent, and a one-shot deadline armed from it would fire a few
+/// microseconds early on a 10 ms shot -- harmless (the handler re-arms for
+/// the remainder) but needless.  The refinement only replaces the first
+/// estimate when the two agree within 5%.
+fn refine_per_ms(first: u64) -> u64 {
+    if !crate::hw::clock::is_tsc() {
+        return first;
+    }
+    lwrite(REG_TIMER_DIV, 0x3);
+    lwrite(REG_LVT_TIMER, LVT_MASKED | TIMER_VECTOR as u32);
+    lwrite(REG_TIMER_INIT, 0xFFFF_FFFF);
+    let t0 = crate::hw::clock::now_ns();
+    let end = t0 + 5_000_000;
+    let mut t1 = t0;
+    while t1 < end {
+        core::hint::spin_loop();
+        t1 = crate::hw::clock::now_ns();
+    }
+    let cur = lread(REG_TIMER_CUR);
+    lwrite(REG_TIMER_INIT, 0);
+    let counts = 0xFFFF_FFFFu64 - cur as u64;
+    let elapsed = t1 - t0;
+    if elapsed == 0 {
+        return first;
+    }
+    let per_ms = counts * 1_000_000 / elapsed;
+    if per_ms >= first - first / 20 && per_ms <= first + first / 20 {
+        per_ms
+    } else {
+        first
+    }
+}
+
+/// Program the one-shot timer to fire at clock time `deadline_ns`, but never
+/// more than one tick from now (the tick is due by then anyway).  Counts are
+/// rounded up so the shot cannot land early.  Interrupts must be masked.
+fn program(deadline_ns: u64) {
+    let now = crate::hw::clock::now_ns();
+    let delta = deadline_ns
+        .saturating_sub(now)
+        .clamp(MIN_SHOT_NS, crate::hw::pit::TICK_NS);
+    // delta <= 10 ms and per_ms is at most ~1e6: the product fits in u64.
+    let counts = (delta * TIMER_PER_MS.load(Ordering::Relaxed)).div_ceil(1_000_000);
+    let counts = counts.clamp(1, u32::MAX as u64) as u32;
+    ARMED_NS.store(now + delta, Ordering::Relaxed);
+    lwrite(REG_TIMER_INIT, counts);
+}
+
+/// Make sure the timer fires no later than `deadline_ns` (clock time): a
+/// sleeper's wake-up.  A no-op unless the one-shot mode is on -- in periodic
+/// mode sleepers are woken by the tick that follows their deadline.
+pub fn arm_at(deadline_ns: u64) {
+    if !ONESHOT.load(Ordering::Relaxed) {
+        return;
+    }
+    let flags = crate::arch::io::cli_save();
+    if deadline_ns < ARMED_NS.load(Ordering::Relaxed) {
+        program(deadline_ns);
+    }
+    // SAFETY: flags came from cli_save on this stack.
+    unsafe { crate::arch::io::restore_flags(flags) };
+}
+
+/// The LAPIC timer interrupt: this handler is the new PIT.
+///
+/// Periodic mode: every interrupt is a scheduler tick.  One-shot mode: the
+/// interrupt is a tick when the 10 ms cadence is due, a sleeper's deadline
+/// otherwise (or both).  Either way the sleepers that are due are woken, the
+/// timer is re-armed, and only then does the scheduler run -- it may switch
+/// to another process and not come back for a while, so the re-arm has to be
+/// behind us before it.
 pub fn on_timer(from_user: bool) {
     lapic_eoi();
-    crate::hw::pit::on_tick(from_user);
+    if !ONESHOT.load(Ordering::Relaxed) {
+        crate::hw::pit::on_tick(from_user);
+        return;
+    }
+    let now = crate::hw::clock::now_ns();
+    ARMED_NS.store(u64::MAX, Ordering::Relaxed); // the shot just fired
+    let mut next_tick = NEXT_TICK_NS.load(Ordering::Relaxed);
+    let tick_due = now >= next_tick;
+    if tick_due {
+        next_tick += crate::hw::pit::TICK_NS;
+        if next_tick <= now {
+            // More than a period behind (a long masked section): restart
+            // the cadence rather than replay the ticks in a storm.
+            next_tick = now + crate::hw::pit::TICK_NS;
+        }
+        NEXT_TICK_NS.store(next_tick, Ordering::Relaxed);
+    }
+    let mut next = next_tick;
+    if let Some(d) = crate::user::process::wake_due(now) {
+        next = next.min(d);
+    }
+    program(next);
+    if tick_due {
+        crate::hw::pit::on_tick(from_user);
+    } else {
+        crate::user::process::on_wake(from_user);
+    }
 }
 
 // ------------------------------------------------------------------- init
@@ -395,6 +501,7 @@ pub fn init() -> bool {
         ENABLED.store(false, Ordering::Release);
         return false;
     };
+    let per_ms = refine_per_ms(per_ms);
     TIMER_PER_MS.store(per_ms, Ordering::Relaxed);
     let initial = (per_ms * 1000 / crate::hw::pit::HZ) as u32;
     TIMER_INITIAL.store(initial, Ordering::Relaxed);
@@ -409,7 +516,17 @@ pub fn init() -> bool {
     }
     crate::hw::pit::stop();
     lwrite(REG_TIMER_DIV, 0x3);
-    lwrite(REG_LVT_TIMER, LVT_PERIODIC | TIMER_VECTOR as u32);
-    lwrite(REG_TIMER_INIT, initial);
+    if ONESHOT_ALLOWED.load(Ordering::Relaxed) && crate::hw::clock::precise() {
+        // One-shot deadline mode: the first shot is the first tick, every
+        // later one is armed by the handler (and by sleepers, `arm_at`).
+        let now = crate::hw::clock::now_ns();
+        NEXT_TICK_NS.store(now + crate::hw::pit::TICK_NS, Ordering::Relaxed);
+        ONESHOT.store(true, Ordering::Relaxed);
+        lwrite(REG_LVT_TIMER, TIMER_VECTOR as u32); // mode 00: one-shot
+        program(now + crate::hw::pit::TICK_NS);
+    } else {
+        lwrite(REG_LVT_TIMER, LVT_PERIODIC | TIMER_VECTOR as u32);
+        lwrite(REG_TIMER_INIT, initial);
+    }
     true
 }

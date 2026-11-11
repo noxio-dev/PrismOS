@@ -39,7 +39,7 @@ mod user;
 use arch::{cpu, gdt, idt, intr, vm};
 use boot::BootInfo;
 use fs::fsys;
-use hw::{acpi, ahci, apic, blk, kbd, pci, pic, pit, serial, smp};
+use hw::{acpi, ahci, apic, blk, clock, hpet, kbd, pci, pic, pit, serial, smp};
 use mem::{heap, pmm, vmm};
 use user::process;
 use user::tty;
@@ -243,6 +243,18 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     } else {
         vprintln!("acpi     : no usable tables (staying on the 8259)");
     }
+    // --- Clock (phase 3.5.1) -----------------------------------------------------
+    // The nanosecond clock: the TSC measured against the HPET (or PIT channel
+    // 2), the HPET itself, or the tick count.  It needs the ACPI tables (the
+    // HPET's address) and runs before the APIC because the LAPIC timer's
+    // one-shot mode arms itself against it.  `clock=pit` / `clock=periodic`
+    // on the command line are the escape hatches (see hw/clock.rs).
+    match bi.cmdline().split_whitespace().find_map(|o| o.strip_prefix("clock=")) {
+        Some("pit") => clock::force_pit(true),
+        Some("periodic") => apic::allow_oneshot(false),
+        _ => {}
+    }
+    let clock_src = clock::init();
     if apic::init() {
         vprintln!(
             "apic     : lapic id {} at {:#x} ({}), 8259 masked, timer {} Hz ({} counts/ms via {})",
@@ -259,6 +271,26 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         pic::unmask(pic::IRQ_TIMER);
         pic::unmask(pic::IRQ_COM1);
     }
+    match clock_src {
+        clock::Source::Tsc => vprintln!(
+            "clock    : tsc {}.{:03} MHz (measured on {}, {}{}), nanosecond resolution",
+            clock::tsc_hz() / 1_000_000,
+            (clock::tsc_hz() / 1000) % 1000,
+            clock::calibration_ref(),
+            if clock::invariant() { "invariant" } else { "NOT invariant" },
+            if clock::noisy() { ", noisy samples" } else { "" }
+        ),
+        clock::Source::Hpet => vprintln!("clock    : hpet {} Hz (no usable tsc)", hpet::freq_hz()),
+        clock::Source::Pit => vprintln!("clock    : pit tick count, 10 ms resolution"),
+    }
+    vprintln!(
+        "timer    : {}",
+        if apic::oneshot() {
+            "lapic one-shot deadlines + 100 Hz scheduler tick"
+        } else {
+            "periodic 100 Hz tick"
+        }
+    );
 
     // --- Keyboard ------------------------------------------------------------
     let ks = kbd::init();

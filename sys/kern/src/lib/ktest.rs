@@ -40,6 +40,8 @@ pub static TESTS: &[Test] = &[
     Test { name: "spinlock", f: t_spinlock },
     Test { name: "trampoline-layout", f: t_trampoline_layout },
     Test { name: "percpu-slots", f: t_percpu_slots },
+    Test { name: "clock-scale", f: t_clock_scale },
+    Test { name: "clock-monotonic", f: t_clock_monotonic },
 ];
 
 #[macro_export]
@@ -424,6 +426,47 @@ fn t_percpu_slots() -> Result<(), String> {
     check!(info[0].lapic < 256);
     for c in &info[..n] {
         check!(c.index < crate::hw::acpi::MAX_CPUS);
+    }
+    Ok(())
+}
+
+/// The fixed-point cycles -> nanoseconds conversion (phase 3.5.1): exact for
+/// round frequencies, no overflow after years of uptime, and the HPET's
+/// wrap-safe elapsed count.
+fn t_clock_scale() -> Result<(), String> {
+    use crate::hw::{clock, hpet};
+    // 1 GHz: one cycle is one ns.  2 GHz: two cycles per ns.
+    let m = clock::mult_for(1_000_000_000);
+    check_eq!(clock::scale(1_000_000_000, m), 1_000_000_000);
+    let m = clock::mult_for(2_000_000_000);
+    check_eq!(clock::scale(2_000_000_000, m), 1_000_000_000);
+    // 3 GHz for ten years of cycles: must not overflow, and stay within 1 ppm.
+    let m = clock::mult_for(3_000_000_000);
+    let secs = 10u64 * 365 * 86_400;
+    let ns = clock::scale(secs * 3_000_000_000, m);
+    let want = secs * 1_000_000_000;
+    check!(ns <= want && want - ns < want / 1_000_000);
+    // HPET: a 32-bit counter that wrapped between two reads.
+    check_eq!(hpet::elapsed_masked(0xFFFF_FFF0, 0x10, 0xFFFF_FFFF), 0x20);
+    check_eq!(hpet::elapsed_masked(5, 9, u64::MAX), 4);
+    Ok(())
+}
+
+/// `now_ns` never goes backwards and advances (busy loop, ~1 ms budget on
+/// a fine clock; on the tick-count fallback only monotonicity is checked).
+fn t_clock_monotonic() -> Result<(), String> {
+    use crate::hw::clock;
+    let a = clock::now_ns();
+    let mut last = a;
+    for _ in 0..10_000 {
+        let n = clock::now_ns();
+        check!(n >= last);
+        last = n;
+    }
+    if clock::precise() {
+        let t0 = clock::now_ns();
+        while clock::now_ns() - t0 < 1_000_000 {}
+        check!(clock::now_ns() - t0 >= 1_000_000);
     }
     Ok(())
 }

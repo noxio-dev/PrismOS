@@ -3,9 +3,11 @@
 //
 // 8253/8254 programmable interval timer.  Channel 0 gives a 100 Hz heartbeat
 // until the APIC takes over (apic.rs, which then also drives on_tick); channel 2
-// is used as a calibration stopwatch for the LAPIC timer.  Formerly the only
-// timer, now a fallback and a calibration source.  The tick counter drives uptime and
-// the `sleep` primitive used by the shell.
+// is used as a calibration stopwatch for the LAPIC timer and the TSC.  Formerly
+// the only timer, now a fallback and a calibration source.  The tick counter
+// is the scheduler's heartbeat (time slices, CPU accounting, interval
+// timers); the uptime is read from the nanosecond clock (clock.rs) whenever
+// that has a fine counter, and falls back to this tick count otherwise.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,6 +20,8 @@ const MODE_CMD: u16 = 0x43;
 pub const BASE_HZ: u64 = 1_193_182;
 /// Requested heartbeat.
 pub const HZ: u64 = 100;
+/// One tick in nanoseconds.
+pub const TICK_NS: u64 = 1_000_000_000 / HZ;
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static BOOT_MS: AtomicU64 = AtomicU64::new(0);
@@ -93,9 +97,20 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
-/// Milliseconds since the PIT started.
-pub fn uptime_ms() -> u64 {
+/// Milliseconds of the tick count: 10 ms steps, whatever the clock source.
+pub fn tick_ms() -> u64 {
     BOOT_MS.load(Ordering::Relaxed)
+}
+
+/// Milliseconds since boot: the nanosecond clock when it has a fine counter
+/// (so the uptime does not lose the ticks a masked section swallowed),
+/// the tick count otherwise.
+pub fn uptime_ms() -> u64 {
+    if crate::hw::clock::precise() {
+        crate::hw::clock::now_ns() / 1_000_000
+    } else {
+        tick_ms()
+    }
 }
 
 /// Busy-sleep `ms` milliseconds on the tick counter.  Requires IRQ0.

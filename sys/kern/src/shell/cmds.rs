@@ -29,6 +29,7 @@ const COMMANDS: &[Cmd] = &[
     Cmd { name: "echo", usage: "<text>", desc: "print text", run: cmd_echo },
     Cmd { name: "lsmem", usage: "", desc: "show the memory map from the loader", run: shmem::cmd_lsmem },
     Cmd { name: "cpu", usage: "", desc: "show CPU / VM information", run: cmd_cpu },
+    Cmd { name: "clock", usage: "", desc: "system clock source, TSC and timer mode", run: cmd_clock },
     Cmd { name: "regs", usage: "", desc: "show CRs, flags and stack pointer", run: cmd_regs },
     Cmd { name: "peek", usage: "<addr> [w]", desc: "read memory (w = 8|16|32|64 bits)", run: shmem::cmd_peek },
     Cmd { name: "poke", usage: "<addr> <val> [w]", desc: "write memory (w = 8|16|32|64 bits)", run: shmem::cmd_poke },
@@ -165,6 +166,30 @@ fn cmd_version(_args: &mut Args) {
 
 fn cmd_echo(args: &mut Args) {
     crate::kprintln!("{}", args.rest());
+}
+
+fn cmd_clock(_args: &mut Args) {
+    use crate::hw::{apic, clock, hpet};
+    crate::kprintln!("source   : {}", clock::source().name());
+    if clock::is_tsc() {
+        crate::kprintln!(
+            "tsc      : {} Hz, measured on {}, {}{}",
+            clock::tsc_hz(),
+            clock::calibration_ref(),
+            if clock::invariant() { "invariant" } else { "NOT invariant" },
+            if clock::noisy() { ", noisy samples" } else { "" }
+        );
+    }
+    if hpet::ready() {
+        crate::kprintln!(
+            "hpet     : {} Hz, {}-bit counter",
+            hpet::freq_hz(),
+            if hpet::is_wide() { 64 } else { 32 }
+        );
+    }
+    crate::kprintln!("timer    : {}", if apic::oneshot() { "one-shot deadlines + 100 Hz tick" } else { "periodic 100 Hz" });
+    let t = clock::now_ns();
+    crate::kprintln!("now      : {}.{:09} s since boot", t / 1_000_000_000, t % 1_000_000_000);
 }
 
 fn cmd_cpu(_args: &mut Args) {

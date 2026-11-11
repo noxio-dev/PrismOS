@@ -204,6 +204,24 @@ pub fn interrupt_pending() -> bool {
     with_current(|s| s.pending & !s.blocked != 0).unwrap_or(false)
 }
 
+/// Whether the running process has a signal that must end a sleep (phase
+/// 3.5.1, `nanosleep`): a default action that terminates it (`dflt_pending`,
+/// which dies at the syscall return), or an unblocked pending signal with a
+/// real handler.  Unlike `interrupt_pending`, a pending bit whose
+/// disposition is SIG_IGN does not count: POSIX has an ignored signal leave
+/// a sleep alone, and `post_signal` flips the sleeper to Ready for it all
+/// the same, so the caller must be able to tell and go back to sleep.
+pub fn sleep_should_end() -> bool {
+    with_current(|s| {
+        if s.dflt_pending & !s.blocked != 0 {
+            return true;
+        }
+        let live = s.pending & !s.blocked;
+        (1..NSIG).any(|sig| live & (1u32 << sig) != 0 && s.actions[sig].handler != SIG_IGN)
+    })
+    .unwrap_or(false)
+}
+
 /// `signal(sig, handler)`: install a handler (0 = default action, 1 =
 /// SIG_IGN) and return the old disposition.  A handler must live in user
 /// space: a kernel address there would either fault on `sysretq` or hand
