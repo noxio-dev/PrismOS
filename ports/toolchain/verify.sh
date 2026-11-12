@@ -47,6 +47,14 @@ LC_ALL=C; export LC_ALL
 #     __do_syscall6 / malloc, carrying the hello program's syscalls (now
 #     that they live in the library, not the binary) and the restorer
 #
+# The mode takes knobs for programs that ride more than hello's chain
+# (the ports' dynamic builds): PRISM_VERIFY_NEEDED (the DT_NEEDED records
+# to demand, default libc.so), PRISM_VERIFY_RAW (0 skips the prism_raw
+# trio for programs that never included prism_raw.h), and
+# PRISM_VERIFY_DSO / PRISM_VERIFY_DSO_SONAME / PRISM_VERIFY_DSO_SYMBOLS
+# (a section for the port's own DSO: ET_DYN, no PT_INTERP, its SONAME,
+# its RELATIVE relocations, its exports).
+#
 # Usage: verify.sh <elf> [<sysroot>] [<program> | dyn]
 set -e
 
@@ -194,6 +202,17 @@ reaches() { reaches_file "$1" "$BIN"; }
 if [ "$PROG" = dyn ]; then
         LDSO=${2:?verify.sh dyn: <sysroot> required}/usr/lib/ld.so
         LIBC=${2:?}/usr/lib/libc.so
+        # The knobs, for programs that ride more than hello's chain (the
+        # ports' dynamic builds): PRISM_VERIFY_NEEDED is the DT_NEEDED
+        # record set to demand (default libc.so); PRISM_VERIFY_RAW=0
+        # skips the prism_raw trio (programs that do not include
+        # prism_raw.h); PRISM_VERIFY_DSO + DSO_SONAME + DSO_SYMBOLS add a
+        # section for the port's own DSO, checked the way ld.so is
+        NEEDED=${PRISM_VERIFY_NEEDED:-libc.so}
+        RAW=${PRISM_VERIFY_RAW:-1}
+        DSO=${PRISM_VERIFY_DSO:-}
+        DSO_SONAME=${PRISM_VERIFY_DSO_SONAME:-}
+        DSO_SYMBOLS=${PRISM_VERIFY_DSO_SYMBOLS:-}
 
         echo "== the executable (what the loader's PT_INTERP path checks) =="
 
@@ -208,10 +227,12 @@ if [ "$PROG" = dyn ]; then
         dyn=$($READELF -lW "$BIN" | grep -c ' DYNAMIC ' || true)
         [ "$dyn" -ge 1 ] && ok "has PT_DYNAMIC" || bad "no PT_DYNAMIC"
 
-        needed=$($READELF -dW "$BIN" | grep '(NEEDED)' | grep -c 'libc\.so' || true)
-        [ "$needed" -ge 1 ] \
-                && ok "DT_NEEDED libc.so (ld.so finds it in /lib and /usr/lib)" \
-                || bad "no DT_NEEDED libc.so"
+        for lib in $NEEDED; do
+                needed=$($READELF -dW "$BIN" | grep '(NEEDED)' | grep -c "$lib" || true)
+                [ "$needed" -ge 1 ] \
+                        && ok "DT_NEEDED $lib (ld.so finds it in /lib and /usr/lib)" \
+                        || bad "no DT_NEEDED $lib"
+        done
 
         jmprel=$($READELF -dW "$BIN" | grep -c '(JMPREL)' || true)
         [ "$jmprel" -ge 1 ] \
@@ -264,13 +285,51 @@ EOF
         # The PrismOS-only calls of pkg/include/prism_raw.h are inlined into the
         # program itself -- dynamic linking changes where the *library* calls
         # live, not these (uptime_ms / yield / the millisecond sleep: 3 4 5).
-        for n in 3 4 5; do
-                if reaches_file "$n" "$BIN"; then
-                        ok "$(scname "$n") reaches syscall $n (prism_raw, in the binary)"
+        # PRISM_VERIFY_RAW=0 skips the trio for programs that never included
+        # prism_raw.h (the ports).
+        if [ "$RAW" = 1 ]; then
+                for n in 3 4 5; do
+                        if reaches_file "$n" "$BIN"; then
+                                ok "$(scname "$n") reaches syscall $n (prism_raw, in the binary)"
+                        else
+                                bad "no syscall $n ($(scname "$n")) in the binary"
+                        fi
+                done
+        else
+                ok "prism_raw trio skipped (PRISM_VERIFY_RAW=0: this program does not ride prism_raw.h)"
+        fi
+
+        # The port's own DSO, when one is named (PRISM_VERIFY_DSO): what
+        # the rtld maps for the DT_NEEDED record -- the same shape ld.so
+        # itself is held to, minus the reloc exclusivity (a DSO carries
+        # GLOB_DAT / JUMP_SLOT records of its own, for libc.so's answer;
+        # only the data-image relocations are expected to be RELATIVE).
+        if [ -n "$DSO" ]; then
+                echo "== the port's DSO (what the rtld maps for DT_NEEDED ${DSO_SONAME:-?}) =="
+
+                if [ -f "$DSO" ]; then
+                        ok "$DSO installed"
                 else
-                        bad "no syscall $n ($(scname "$n")) in the binary"
+                        bad "$DSO missing"
                 fi
-        done
+                type=$($READELF -h "$DSO" | sed -n 's/.*Type:.*\(DYN\|EXEC\).*/\1/p')
+                [ "$type" = DYN ] && ok "the DSO is ET_DYN (mapped by the rtld)" \
+                        || bad "the DSO ELF type is $type"
+                interp=$($READELF -lW "$DSO" | grep -c INTERP || true)
+                [ "$interp" = 0 ] && ok "the DSO has no PT_INTERP" || bad "the DSO has a PT_INTERP"
+                soname=$($READELF -dW "$DSO" | grep '(SONAME)' | sed 's/.*\[\(.*\)\]/\1/')
+                [ "$soname" = "$DSO_SONAME" ] \
+                        && ok "SONAME $DSO_SONAME (what DT_NEEDED asks for, the basename ld.so looks up)" \
+                        || bad "SONAME is '${soname:-missing}', wanted $DSO_SONAME"
+                nrel=$($OBJDUMP -R "$DSO" | grep -c 'R_X86_64_RELATIVE' || true)
+                [ "$nrel" -gt 0 ] \
+                        && ok "$nrel R_X86_64_RELATIVE relocations (the data image)" \
+                        || bad "no R_X86_64_RELATIVE relocations"
+                for s in $DSO_SYMBOLS; do
+                        $READELF --dyn-syms -W "$DSO" | awk -v sym="$s" '$8 == sym { found = 1 } END { exit !found }' \
+                                && ok "the DSO exports $s" || bad "the DSO does not export $s"
+                done
+        fi
 
         echo "== ld.so (the interpreter the kernel maps) =="
 

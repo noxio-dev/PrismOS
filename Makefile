@@ -213,17 +213,23 @@ $B/busybox.stamp: $B/toolchain/usr/.stamp $B/mlibc-port.md5 $(BUSYBOX_PORT_FILES
 
 # ---- phase 4.2: nano, a full-screen editor on the console -------------------
 # ports/nano cross-builds GNU nano 9.3 on ncurses 6.6 -- the curses layer
-# is part of the port: static libncursesw (terminfo core included) into the
-# port's own sysroot, then nano against it, one static PIE stripped under
-# the kernel's 4 MiB whole-file read -- plus the TERM=prism terminfo entry,
-# the host tic compiling ports/nano/prism.src (the faithful description of
-# what console/ansi.rs implements, keymap strings included).  The mlibc
-# port checksum is a dependency like the other ports': an edited sysdep
-# (or the UTF-8 charcode patch) rebuilds the library, and this stamp
-# follows.
+# is part of the port and ships DYNAMIC: ncurses builds both models
+# (libncursesw.a for the static twin, the DSO libncursesw.so.6 -- SONAME
+# libncursesw.so.6 -- for the image), then nano twice against the port's
+# own sysroot, the dynamic PIE for the image (PT_INTERP /lib/ld.so,
+# DT_NEEDED libc.so + libncursesw.so.6, BIND_NOW) and a static twin that
+# stays out of it (the smoke vehicle prism_emu can run).  Both stripped
+# under the kernel's 4 MiB whole-file read -- plus the TERM=prism
+# terminfo entry, the host tic compiling ports/nano/prism.src (the
+# faithful description of what console/ansi.rs implements, keymap strings
+# included).  The mlibc port checksum is a dependency like the other
+# ports': an edited sysdep (or the UTF-8 charcode patch) rebuilds the
+# library, and this stamp follows.
 #
-#   make nano         build/nano-out/{nano,terminfo}, verified
-#   make root         installs the editor into /usr/bin and the entry into
+#   make nano         build/nano-out/{nano,libncursesw.so.6,terminfo},
+#                     the couple verified + the twin smoked
+#   make root         installs the editor into /usr/bin, the DSO beside
+#                     ld.so and libc.so in /usr/lib, the entry into
 #                     /usr/share/terminfo/p/prism below
 
 NANO_PORT_FILES := $(shell find ports/nano -type f | sort)
@@ -380,13 +386,18 @@ $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
 	for a in $(BUSYBOX_APPLETS); do \
 		ln -s busybox $B/root/usr/bin/$$a; \
 	done
-	# Phase 4.2: nano on ncurses, the image's full-screen editor -- the
-	# terminfo entry (TERM=prism) travels beside it: ncurses looks the
-	# console up in /usr/share/terminfo/<letter>/<name>.
+	# Phase 4.2: nano on ncurses, the image's full-screen editor -- a
+	# dynamic PIE: the curses layer travels with it as /usr/lib/
+	# libncursesw.so.6, the image's first own DSO beside ld.so and
+	# libc.so (the rtld's default paths look there), its file name
+	# exactly the SONAME its DT_NEEDED record says.  The terminfo entry
+	# (TERM=prism) travels beside it: ncurses looks the console up in
+	# /usr/share/terminfo/<letter>/<name>.
 	cp $B/nano-out/nano $B/root/usr/bin/nano
+	cp $B/nano-out/libncursesw.so.6 $B/root/usr/lib/libncursesw.so.6
 	mkdir -p $B/root/usr/share/terminfo/p
 	cp $B/nano-out/terminfo/p/prism $B/root/usr/share/terminfo/p/prism
-	chmod 755 $B/root/usr/bin/*
+	chmod 755 $B/root/usr/bin/* $B/root/usr/lib/libncursesw.so.6
 	$(TOOLCHAIN)/bin/x86_64-prismos-strip --strip-all \
 		-o $B/root/usr/lib/ld.so $(SYSROOT)/usr/lib/ld.so
 	$(TOOLCHAIN)/bin/x86_64-prismos-strip --strip-all \
