@@ -1,24 +1,59 @@
 #!/bin/sh
-# /etc/rc -- the system start-up script.
+# /etc/rc -- PrismOS system startup
 #
-# init (pid 1) runs this once, as `sh /etc/rc`, after it has mounted /proc
-# and /tmp and before it starts the first login shell.  It is plain ash:
-# edit it in rootfs/etc/rc on the host and rebuild the image.
-#
-# A failing script is reported by init and never stops the boot.  Anything
-# left running in the background is reaped by init like any other orphan.
+# Runs once during system initialization.
+# Compatible with BusyBox ash.
 
-echo "rc: system start-up"
+RESET='\033[0m'
+BOLD='\033[1m'
+DIM='\033[2m'
 
-# Start-up scripts dropped by packages: every executable /etc/rc.d/<name>
-# runs here, in name order (prefix them S10, S20... to order them).
+BLACK='\033[30m'
+RED='\033[31m'
+GREEN='\033[32m'
+YELLOW='\033[33m'
+BLUE='\033[34m'
+MAGENTA='\033[35m'
+CYAN='\033[36m'
+WHITE='\033[37m'
+
+LIGHT_BLACK='\033[90m'
+LIGHT_RED='\033[91m'
+LIGHT_GREEN='\033[92m'
+LIGHT_YELLOW='\033[93m'
+LIGHT_BLUE='\033[94m'
+LIGHT_MAGENTA='\033[95m'
+LIGHT_CYAN='\033[96m'
+LIGHT_WHITE='\033[97m'
+
+printf "${RESET}"
+
+echo -e "${BOLD}${CYAN}PrismOS${RESET}: system start-up"
+
+# Run package startup scripts
 for script in /etc/rc.d/*; do
-	test -x "$script" && "$script"
+    if [ -x "$script" ]; then
+        echo -e "  ${LIGHT_CYAN}→${RESET} Running ${WHITE}$script${RESET}"
+        "$script"
+    fi
 done
 
-echo "rc: done"
+echo -e "${BOLD}${GREEN}PrismOS${RESET}: startup complete"
 
-printf "\nWelcome to PrismOS!\n\n"
-printf "The whole operating system is fully written from scratch in C/Rust\n"
-printf "And it can run some things like Busybox or small programs.\n"
-printf "Enjoy!\n\n"
+if [ -x /etc/keyboard-setup ]; then
+	/etc/keyboard-setup
+else
+    printf "[${RED}Error${RESET}] Cannot run /etc/keyboard-setup \n"
+fi
+
+clear
+
+printf '\n'
+printf "${BOLD}${MAGENTA}Welcome to PrismOS!${RESET}\n\n"
+
+printf "${LIGHT_CYAN}The whole operating system is fully written from scratch in "
+printf "${BOLD}${BLUE}C/Rust${RESET}\n"
+
+printf "${LIGHT_YELLOW}And it can run some things like Busybox or small programs.${RESET}\n\n"
+
+printf "${BOLD}${LIGHT_GREEN}Enjoy!${RESET}\n\n"

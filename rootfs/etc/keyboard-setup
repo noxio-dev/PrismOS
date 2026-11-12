@@ -1,0 +1,52 @@
+#!/bin/sh
+
+# PrismOS Keyboard Setup
+
+RESET='\033[0m'
+BOLD='\033[1m'
+CYAN='\033[36m'
+GREEN='\033[32m'
+YELLOW='\033[33m'
+MAGENTA='\033[35m'
+WHITE='\033[37m'
+
+clear
+
+printf "\n${BOLD}${MAGENTA}PrismOS Keyboard Setup${RESET}\n\n"
+printf "${CYAN}Choose your keyboard layout:${RESET}\n\n"
+
+printf "${GREEN}  1.${RESET} French (AZERTY)\n"
+printf "${GREEN}  2.${RESET} US English (QWERTY)\n"
+printf "${GREEN}  3.${RESET} UK English (QWERTY)\n"
+printf "${GREEN}  4.${RESET} German (QWERTZ)\n"
+printf "${GREEN}  5.${RESET} Spanish (QWERTY)\n\n"
+
+printf "${YELLOW}Select [1-6]: ${RESET}"
+read choice
+
+case "$choice" in
+    1) layout="fr" ;;
+    2) layout="us" ;;
+    3) layout="uk" ;;
+    4) layout="de" ;;
+    5) layout="es" ;;
+    *)
+        printf "${YELLOW}Invalid selection.${RESET}\n"
+        exit 1
+        ;;
+esac
+
+if [ ! -f "/usr/share/keymaps/$layout.bkmap" ]; then
+    printf "${YELLOW}Keyboard map not found!${RESET}\n"
+    exit 1
+fi
+
+loadkmap < "/usr/share/keymaps/$layout.bkmap"
+
+if [ $? -eq 0 ]; then
+    echo "KEYMAP=$layout" > /etc/keyboard.conf
+    printf "\n${GREEN}Keyboard layout successfully loaded!${RESET}\n"
+else
+    printf "\n${YELLOW}Failed to load keyboard layout.${RESET}\n"
+    exit 1
+fi
