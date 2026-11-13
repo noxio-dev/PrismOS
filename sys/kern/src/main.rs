@@ -39,7 +39,7 @@ mod user;
 use arch::{cpu, gdt, idt, intr, vm};
 use boot::BootInfo;
 use fs::fsys;
-use hw::{acpi, ahci, apic, blk, clock, hpet, kbd, pci, pic, pit, serial, smp};
+use hw::{acpi, ahci, apic, blk, clock, disk, hpet, kbd, nvme, pci, pic, pit, serial, smp, xhci};
 use mem::{heap, pmm, vmm};
 use user::process;
 use user::tty;
@@ -365,6 +365,25 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 d.sectors() >> 11,
                 d.model()
             );
+        }
+    }
+
+    // NVMe and USB (xHCI: keyboard + mass storage).  `nvme=off` / `xhci=off`
+    // on the command line skip them.
+    let opt = |name: &str| bi.cmdline().split_whitespace().any(|o| o == name);
+    if !opt("nvme=off") {
+        let n = nvme::init();
+        vprintln!("nvme     : {} namespace(s)", n);
+    }
+    if !opt("xhci=off") {
+        let n = xhci::init();
+        vprintln!("xhci     : {} controller(s)", n);
+    }
+    disk::rescan();
+    for i in 0..disk::count() {
+        if let Some(d) = disk::get(i) {
+            use blk::BlockDev;
+            vprintln!("disk {:2}  : {} {} MiB, \"{}\"", i, d.bus().name(), d.sectors() >> 11, d.model());
         }
     }
 

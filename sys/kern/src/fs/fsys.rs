@@ -6,7 +6,7 @@
 // wall clock feeding the inode timestamps.  The VFS and ext4 code themselves
 // (vfs.rs, ext4/) know nothing about the kernel.
 
-use crate::hw::ahci;
+use crate::hw::disk::{self, Disk};
 use crate::hw::blk::{read_gpt, BlockDev, GptEntry, Partition};
 use crate::fs::devfs::DevFs;
 use crate::fs::ext4::Ext4;
@@ -104,7 +104,7 @@ impl core::fmt::Display for Stamp {
 
 // ------------------------------------------------------- device discovery
 
-/// An ext2/3/4 volume found on an AHCI disk.
+/// An ext2/3/4 volume found on a disk (SATA, NVMe or USB).
 #[derive(Clone, Copy)]
 pub struct Found {
     pub disk: usize,
@@ -114,7 +114,7 @@ pub struct Found {
     pub sectors: u64,
 }
 
-fn gpt_of(d: &ahci::AhciDisk) -> ([GptEntry; 16], usize) {
+fn gpt_of(d: &Disk) -> ([GptEntry; 16], usize) {
     let mut e = [GptEntry { type_guid: [0; 16], first: 0, last: 0 }; 16];
     let n = read_gpt(d, &mut e);
     (e, n)
@@ -124,8 +124,8 @@ fn gpt_of(d: &ahci::AhciDisk) -> ([GptEntry; 16], usize) {
 /// partitions in table order).
 pub fn scan() -> Vec<Found> {
     let mut out = Vec::new();
-    for i in 0..ahci::MAX_DISKS {
-        let Some(d) = ahci::disk(i) else { continue };
+    for i in 0..disk::count() {
+        let Some(d) = disk::get(i) else { continue };
         if Ext4::probe(&d) {
             out.push(Found { disk: i, part: None, first: 0, sectors: d.sectors() });
             continue;
@@ -143,7 +143,7 @@ pub fn scan() -> Vec<Found> {
 }
 
 fn open_dev(f: &Found) -> Option<Box<dyn BlockDev>> {
-    let d = ahci::disk(f.disk)?;
+    let d = disk::get(f.disk)?;
     Some(match f.part {
         None => Box::new(d),
         Some(_) => Box::new(Partition { dev: d, start: f.first, len: f.sectors }),

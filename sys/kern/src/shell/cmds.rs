@@ -44,6 +44,8 @@ const COMMANDS: &[Cmd] = &[
     Cmd { name: "meminfo", usage: "", desc: "PMM / heap statistics", run: shmem::cmd_meminfo },
     Cmd { name: "acpi", usage: "", desc: "ACPI tables, CPUs, IOAPICs, HPET, APIC timer", run: cmd_acpi },
     Cmd { name: "lspci", usage: "[-v]", desc: "list PCI devices (-v: BARs)", run: cmd_lspci },
+    Cmd { name: "disks", usage: "", desc: "every disk: SATA, NVMe, USB", run: cmd_disks },
+    Cmd { name: "usb", usage: "[rescan]", desc: "USB (xHCI) devices; rescan the root ports", run: cmd_usb },
     Cmd { name: "ahci", usage: "[read <disk> <lba> [n]]", desc: "AHCI controller / disks; read sectors", run: cmd_ahci },
     Cmd { name: "heaptest", usage: "[n]", desc: "stress the heap with n objects (default 100000)", run: shmem::cmd_heaptest },
     Cmd { name: "mount", usage: "[-r] [-l] [<disk>[:<part>] <path>]", desc: "list / mount ext2/3/4 volumes (-l: volumes found)", run: shfs::cmd_mount },
@@ -402,6 +404,46 @@ fn cmd_lspci(args: &mut Args) {
                 }
             }
         }
+    }
+}
+
+fn cmd_disks(_args: &mut Args) {
+    use crate::hw::blk::BlockDev;
+    use crate::hw::disk;
+    if disk::count() == 0 {
+        return crate::kprintln!("disks    : none");
+    }
+    for i in 0..disk::count() {
+        if let Some(d) = disk::get(i) {
+            crate::kprintln!("disk {}   : {:4} {} sectors ({}), block {}, \"{}\" serial {}",
+                i, d.bus().name(), d.sectors(), Size(d.sectors() * 512), d.block_size(), d.model(), d.serial());
+        }
+    }
+}
+
+fn cmd_usb(args: &mut Args) {
+    use crate::hw::{disk, xhci};
+    match args.next() {
+        None => {
+            let n = xhci::controllers();
+            if n == 0 {
+                return crate::kprintln!("usb      : no xHCI controller");
+            }
+            crate::kprintln!("usb      : {} xHCI controller(s)", n);
+            for d in xhci::list() {
+                crate::kprintln!("  ctrl {} slot {} port {:2} {:6} {:04x}:{:04x} {}",
+                    d.h.ctrl, d.h.slot, d.port, d.speed, d.vid, d.pid, d.class);
+            }
+            if xhci::port_event_pending() {
+                crate::kprintln!("  (port change pending: `usb rescan`)");
+            }
+        }
+        Some("rescan") => {
+            let n = xhci::rescan();
+            disk::rescan();
+            crate::kprintln!("usb      : rescanned, {} new storage device(s), {} disk(s) in all", n, disk::count());
+        }
+        Some(_) => usage("usb"),
     }
 }
 

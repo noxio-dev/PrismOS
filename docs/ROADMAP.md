@@ -94,7 +94,7 @@ Phase 5 — self-hosting
 Beyond (nice to have)
 - [ ] hidden kernel prerequisites that the phases above keep running into: file-backed `MAP_SHARED` with a page cache, Unix domain sockets, `epoll` -- move them before 4.2 / 5.2 when they block
 - [ ] networking: virtio-net or e1000, ARP/IP/UDP/TCP, a tiny `ping` and `wget`
-- [ ] USB (xHCI) keyboard and mass storage, NVMe
+- [x] USB (xHCI) keyboard and mass storage, NVMe (polling drivers; root ports only, no hubs -- see docs/USB-NVME.md)
 - [ ] other file systems: FAT32 R/W in the kernel
 - [ ] graphics: framebuffer userspace API, a minimal window system
 - [ ] desktop (Xorg, then KDE): mlibc is the entry ticket, not the whole price -- also Unix domain sockets, `epoll`, shared memory (`MAP_SHARED` of files, `shm`), a display / input device interface (KMS-style), and a lot of the Linux surface (`/proc`, `/sys`, `udev`-like discovery)

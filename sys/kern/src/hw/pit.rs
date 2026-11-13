@@ -90,6 +90,7 @@ pub fn on_tick(from_user: bool) {
     if t % 250 == 0 { // TEMP heartbeat: proves IRQ0 + scheduling alive
         // crate::kprintln!("[hb] t={} from_user={}", t * 10, from_user as u8);
     }
+    crate::hw::xhci::poll(); // USB keyboard reports (try_lock, never waits)
     crate::user::process::on_tick(from_user);
 }
 

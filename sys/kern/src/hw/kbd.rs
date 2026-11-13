@@ -859,6 +859,42 @@ pub fn poll() -> bool {
     true
 }
 
+/// Inject one key event from a keyboard that is not on the i8042 (USB HID),
+/// already normalised the way `handle_byte` normalises PS/2 bytes: a set-1
+/// scancode (7 bits) plus the extended (E0) flag.  It goes through the same
+/// keymap / modifier engine as a PS/2 key, so layouts, Shift/Ctrl/AltGr,
+/// Caps Lock and `kbd_mode -s` raw mode behave identically.
+///
+/// Runs with local interrupts masked, so it cannot interleave with IRQ1 on
+/// the same CPU.  (A PS/2 and a USB keyboard typed on at the very same
+/// instant from two CPUs could still interleave; the ring is SPSC.)
+pub fn inject_key(sc: u8, ext: bool, release: bool) {
+    let _irq = crate::arch::io::IrqGuard::new();
+    // SAFETY: interrupts are masked; see the note above for the SMP case.
+    let kbd = unsafe { &mut *addr_of_mut!(KBD) };
+    let queue = unsafe { &mut *addr_of_mut!(QUEUE) };
+    let km = unsafe { &*addr_of_mut!(KEYMAP) };
+    if kbd.engine.mode == keymap::K_RAW {
+        // showkey: hand over what a PS/2 keyboard would have sent (set 1).
+        if ext {
+            queue.push_bytes(&[0xE0]);
+        }
+        queue.push_bytes(&[(sc & 0x7F) | if release { 0x80 } else { 0 }]);
+        return;
+    }
+    let kc = keymap::keycode_of(sc & 0x7F, ext);
+    if kc == 0 {
+        return;
+    }
+    let leds_before = kbd.engine.leds;
+    let mut out = kbd.engine.new_out();
+    kbd.engine.key(km, kc, !release, &mut out);
+    queue.push_bytes(out.bytes());
+    if kbd.engine.leds != leds_before {
+        kbd.kick_leds(); // no-op without a PS/2 keyboard (LED_CAPABLE unset)
+    }
+}
+
 /// Modifier snapshot for the `kbd` command: (shift, ctrl, alt, altgr, caps).
 pub fn modifiers() -> (bool, bool, bool, bool, bool) {
     // SAFETY: read-only snapshot of the decoder state.

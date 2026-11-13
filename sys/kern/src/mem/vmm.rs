@@ -600,6 +600,45 @@ pub fn phys_access(phys: u64) -> Option<u64> {
     None
 }
 
+/// Window for device registers that live above the 4 GiB identity map (the
+/// 64-bit BARs of NVMe / xHCI controllers on firmware that places them high).
+/// PDPT slot 511 of the kernel PML4 slot: free (the image, heap and back
+/// buffer all sit in PDPT slots below it), and shared by every address space.
+const MMIO_BASE: u64 = 0xFFFF_FFFF_C000_0000;
+const MMIO_END: u64 = 0xFFFF_FFFF_E000_0000; // 512 MiB
+static MMIO_NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(MMIO_BASE);
+/// Page-cache disable + write-through: PAT index 3, strong uncacheable (only
+/// PAT entry 1 is ever reprogrammed, see `enable_pat_wc`).
+const PCD: u64 = 0x10;
+
+/// Kernel virtual address through which the `len` bytes of device registers
+/// at physical `phys` can be accessed, uncached.  Below 4 GiB that is the
+/// identity map; above it, a fresh mapping in the MMIO window.  Mappings are
+/// never torn down (drivers map their BARs once, at boot).  None when the
+/// window is exhausted, the tables are not up, or a page cannot be mapped.
+pub fn map_mmio(phys: u64, len: u64) -> Option<u64> {
+    let end = phys.checked_add(len)?;
+    if end <= (1 << 32) {
+        return Some(phys);
+    }
+    if !READY.load(Ordering::Acquire) {
+        return None;
+    }
+    let off = phys & (PAGE - 1);
+    let pages = (off + len).div_ceil(PAGE);
+    let _guard = crate::arch::io::IrqGuard::new();
+    let va = MMIO_NEXT.fetch_add(pages * PAGE, Ordering::Relaxed);
+    if va + pages * PAGE > MMIO_END {
+        return None;
+    }
+    for i in 0..pages {
+        if !map_4k(va + i * PAGE, (phys - off) + i * PAGE, RW | PCD | PWT | NX) {
+            return None;
+        }
+    }
+    Some(va + off)
+}
+
 pub fn pages_mapped() -> u64 {
     // SAFETY: read-only counter.
     unsafe { PAGES_MAPPED }
