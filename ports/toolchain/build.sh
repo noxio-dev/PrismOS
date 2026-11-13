@@ -265,7 +265,21 @@ do_dynlib() {
 # The crt sandwich is the dynamic one: Scrt1 (the PIE _start) + crti/crtn +
 # crtbeginS/crtendS (gcc's -shared halves).
 do_dyn() {
-        [ -f "$SYSROOT/usr/lib/ld.so" ] || do_dynlib
+        # The dynamic half must be as fresh as the port: the sysroot's
+        # libc.so is what the image ships (usr/lib/libc.so) and every
+        # dynamic program answers through it -- a stale one turns any
+        # sysdep added after its build into mlibc's missing-sysdep
+        # ENOSYS at run time (a nano whose ncurses could not load the
+        # terminfo, its access() riding an Access-less libc -- found the
+        # hard way, phase 4.2).  Current when nothing under ports/mlibc
+        # is newer than the libc.so this stage produced; the static half
+        # is the stamp's business (bootstrap.sh).
+        if [ -f "$SYSROOT/usr/lib/libc.so" ] \
+                        && [ -z "$(find "$REPO/ports/mlibc" -newer "$SYSROOT/usr/lib/libc.so" -print -quit)" ]; then
+                say dyn "dynamic libc current with the port -- keep it"
+        else
+                do_dynlib
+        fi
         CC=$PREFIX/bin/x86_64-prismos-gcc
         LD=$PREFIX/bin/x86_64-prismos-ld
         GCCINC=$($CC -print-file-name=include)

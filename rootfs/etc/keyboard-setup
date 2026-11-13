@@ -22,19 +22,27 @@ printf "${GREEN}  4.${RESET} German (QWERTZ)\n"
 printf "${GREEN}  5.${RESET} Spanish (QWERTY)\n\n"
 
 printf "${YELLOW}Select [1-6]: ${RESET}"
-read choice
-
-case "$choice" in
-    1) layout="fr" ;;
-    2) layout="us" ;;
-    3) layout="uk" ;;
-    4) layout="de" ;;
-    5) layout="es" ;;
-    *)
-        printf "${YELLOW}Invalid selection.${RESET}\n"
-        exit 1
-        ;;
-esac
+# An 8 s ceiling, not a boot blocker: the boot tests and the serial
+# sessions are headless (nobody can answer here, the input queue stays
+# empty), so the silence falls back to /etc/keymap -- the layout
+# S10keymap already loaded -- and the boot goes on.
+if read -t 8 choice; then
+    case "$choice" in
+        1) layout="fr" ;;
+        2) layout="us" ;;
+        3) layout="uk" ;;
+        4) layout="de" ;;
+        5) layout="es" ;;
+        *)
+            printf "${YELLOW}Invalid selection.${RESET}\n"
+            exit 1
+            ;;
+    esac
+else
+    printf "\n${YELLOW}No answer (headless boot) -- keeping the /etc/keymap layout.${RESET}\n"
+    layout=$(cat /etc/keymap 2>/dev/null)
+    test -n "$layout" || layout="us"
+fi
 
 if [ ! -f "/usr/share/keymaps/$layout.bkmap" ]; then
     printf "${YELLOW}Keyboard map not found!${RESET}\n"

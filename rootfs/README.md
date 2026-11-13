@@ -7,6 +7,11 @@ holds the files you edit by hand: `/etc/passwd`, `/etc/profile`, `/etc/rc`
 
 - Add a file here and the next `make` puts it in the image, at the same path.
 - Scripts start with `#!/bin/sh` and need the executable bit (`chmod +x`).
+- The pid-1 mounts (`/proc`, `/tmp`) are made by `/etc/rc.d/S00mounts` at
+  boot, through mount(2) -- the kernel keeps `/` and `/dev`; a start-up
+  script that needs them runs after that one (S10name and up).  Nothing
+  else in the boot path mounts a file system: keep it that way, `ps`, `df`
+  and `mount` all read `/proc/mounts`.
 - Directories that must exist but stay empty (`/dev`, `/proc`, `/tmp`) and
   the usr-merge symlinks are created by the Makefile, not stored here.
 - Compiled programs do not belong here: they are packages (`pkg/`), built

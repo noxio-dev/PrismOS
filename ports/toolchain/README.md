@@ -80,7 +80,11 @@ the same patched mlibc tree with `-Ddefault_library=both`: the static
 `libc.a` and the four programs never notice, and the sysroot gains
 `libc.so` (the C library as an `ET_DYN`, `SONAME libc.so`) and `ld.so`
 (the rtld: `-nostdlib`, `SONAME ld.so`, self-relocating).  `build.sh
-stage dyn` (`make hello-dyn`) then links the *same* `pkg/hello`
+stage dyn` (`make hello-dyn`) re-runs `dynlib` first whenever the port
+(`ports/mlibc`) is newer than the installed `libc.so` -- a stale shared
+library ships in the image and turns every sysdep added after its build
+into the missing-sysdep ENOSYS at run time -- then links the *same*
+`pkg/hello`
 sources against `libc.so` instead of `libc.a` -- `--dynamic-linker
 /lib/ld.so`, `-z now` (mlibc's rtld zeroes `GOT[1]/GOT[2]`: BIND NOW or
 nothing) -- and `stage dynverify` runs `verify.sh <elf> <sysroot> dyn`:

@@ -1,0 +1,11 @@
+#!/bin/sh
+# The pid-1 mounts (phase 3.3.7): /proc is the generated kernel state the
+# ps, df and mount applets read, /tmp the RAM scratch pad.  Since busybox
+# init took the session keeper's chair, this script makes them -- through
+# mount(2) (the libc's syscall), exactly what the C init did before it;
+# the kernel keeps / and /dev, the devtmpfs split.  Both are idempotent at
+# the kernel's side (a busy target answers EBUSY) and a failure is a
+# notice, not a stop: the shells still run, and busybox's own mount line
+# says what went wrong.
+mount -t procfs none /proc
+mount -t tmpfs none /tmp
