@@ -522,6 +522,9 @@ fn yn(b: bool) -> &'static str {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     intr::cli();
+    // A panic raised while printing would otherwise deadlock on PRINT_LOCK.
+    // SAFETY: the panic handler never returns to the interrupted code.
+    unsafe { crate::console::break_print_lock() };
     kprintln!("\nKERNEL PANIC: {}", info);
     // A proper backtrace: the frame-pointer chain, symbolized through the
     // build-time kallsyms table (phase 1.5).

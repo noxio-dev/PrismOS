@@ -68,6 +68,17 @@ pub fn init(bi: Option<&BootInfo>) {
 /// interleave on the serial line and the framebuffer.
 static PRINT_LOCK: crate::lib::spin::SpinLock<()> = crate::lib::spin::SpinLock::new(());
 
+/// Break the console lock before printing a FATAL diagnostic (#PF/exception
+/// report, panic).  The faulting code may itself have been inside `_print`
+/// holding PRINT_LOCK; without this the report would spin on it forever and
+/// the machine would freeze silently instead of showing the crash.
+///
+/// # Safety
+/// Call only on a path that never resumes the interrupted code.
+pub unsafe fn break_print_lock() {
+    PRINT_LOCK.force_unlock();
+}
+
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
     // Keep IRQ-context prints from interleaving with task-context ones, on

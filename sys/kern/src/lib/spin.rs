@@ -63,6 +63,17 @@ impl<T: ?Sized> SpinLock<T> {
         self.locked.load(Ordering::Relaxed)
     }
 
+    /// Release the lock without owning its guard.
+    ///
+    /// # Safety
+    /// Only for a fatal path that never returns to the interrupted holder
+    /// (exception report, panic): it lets the diagnostic print proceed
+    /// instead of spinning forever on a lock the interrupted code on this
+    /// CPU still "holds".
+    pub unsafe fn force_unlock(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
+
     fn release(&self) {
         self.locked.store(false, Ordering::Release);
     }

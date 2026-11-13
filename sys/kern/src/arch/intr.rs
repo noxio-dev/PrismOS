@@ -321,6 +321,10 @@ fn handle_exception(frame: &mut IsrFrame) {
             frame.rip += 3;
         }
         _ => {
+            // Fatal: the interrupted code may hold the console lock and never
+            // resumes, so break it or this report would spin forever.
+            // SAFETY: this arm ends in park().
+            unsafe { crate::console::break_print_lock() };
             crate::kprintln!(
                 "\nexception {} ({}) at {:#x}, errcode {:#x}",
                 v,

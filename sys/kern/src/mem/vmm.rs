@@ -108,8 +108,10 @@ unsafe extern "C" {
     static __text_end: u8;
     static __rodata_start: u8;
     static __rodata_end: u8;
+    static __kallsyms_end: u8;
     static __data_start: u8;
     static __bss_end: u8;
+    static __kernel_end: u8;
 }
 
 // ------------------------------------------------------ table access helpers
@@ -298,14 +300,22 @@ pub fn init(bi: &BootInfo) -> bool {
         core::ptr::addr_of!(__text_start) as u64,
         core::ptr::addr_of!(__text_end) as u64,
     );
+    // Read-only range: .rodata AND the fixed-size .kallsyms that follows it
+    // (the padding between them is mapped too, as one contiguous range).
     let (ro_s, ro_e) = (
         core::ptr::addr_of!(__rodata_start) as u64,
-        core::ptr::addr_of!(__rodata_end) as u64,
+        core::ptr::addr_of!(__kallsyms_end) as u64,
     );
+    // Writable range: .data, .got and .bss, up to the page-aligned end of the
+    // image (__kernel_end).  Mapping only to __bss_end was wrong: the linker
+    // placed .got right after it, and its last bytes could land on a page
+    // that was never mapped.
     let (data_s, data_e) = (
         core::ptr::addr_of!(__data_start) as u64,
-        core::ptr::addr_of!(__bss_end) as u64,
+        core::ptr::addr_of!(__kernel_end) as u64,
     );
+    debug_assert!(ro_e >= core::ptr::addr_of!(__rodata_end) as u64);
+    debug_assert!(data_e >= core::ptr::addr_of!(__bss_end) as u64);
 
     let mut ok = true;
     // SAFETY: boot-time table building through the identity map.
@@ -1394,6 +1404,12 @@ pub fn handle_page_fault(frame: &mut IsrFrame) {
             }
         }
     }
+
+    // Fatal from here on: the fault may have hit code inside console::_print
+    // (PRINT_LOCK held by the interrupted context, which never resumes).
+    // Break the lock or the report below would spin forever, silently.
+    // SAFETY: this path ends in park(); the interrupted code never runs again.
+    unsafe { crate::console::break_print_lock() };
 
     let why = match () {
         _ if err & 1 == 0 => "not present",
