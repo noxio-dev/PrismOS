@@ -171,7 +171,7 @@ mod hw {
                 // Num Lock on (boot default): digits
                 assert_eq!(s(typed(&[0x47, 0xC7, 0x52, 0xD2])), "70");
                 assert_eq!(s(typed(&[0x4E, 0xCE, 0x37, 0xB7])), "+*");
-                assert_eq!(s(typed(&[0xE0, 0x35, 0xE0, 0xB5, 0xE0, 0x1C, 0xE0, 0x9C])), "/\n");
+                assert_eq!(s(typed(&[0xE0, 0x35, 0xE0, 0xB5, 0xE0, 0x1C, 0xE0, 0x9C])), "/\r");
                 assert_eq!(s(typed(&[0x53, 0xD3])), ".");
                 // Num Lock off: navigation
                 typed(&[0x45, 0xC5]);
@@ -230,7 +230,7 @@ mod hw {
                 assert_eq!(typed(&[0x1D, 0x1A, 0x9A, 0x9D]), vec![0x1B]); // Ctrl-[
                 assert_eq!(typed(&[0xE0, 0x1D, 0x16, 0x96, 0xE0, 0x9D]), vec![0x15]); // right ctrl + u
                 assert_eq!(typed(&[0x38, 0x2D, 0xAD, 0xB8]), vec![0x1B, b'x']); // Alt-x = ESC x
-                assert_eq!(typed(&[0x1C, 0x9C]), vec![b'\n']);
+                assert_eq!(typed(&[0x1C, 0x9C]), vec![b'\r']);
                 assert_eq!(typed(&[0x0E, 0x8E]), vec![0x7F]);
                 assert_eq!(typed(&[0x0F, 0x8F]), vec![b'\t']);
                 assert_eq!(typed(&[0x01, 0x81]), vec![0x1B]);

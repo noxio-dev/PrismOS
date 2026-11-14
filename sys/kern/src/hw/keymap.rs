@@ -130,9 +130,10 @@ const FUNC: [&[u8]; 30] = [
     b"\x1b[P", // Pause
 ];
 
-/// Keypad characters with Num Lock on (Linux's pad_chars; Enter is '\n' here
-/// like the main Enter key, which the line discipline expects).
-const PAD_CHARS: &[u8; 21] = b"0123456789+-*/\n,.?()#";
+/// Keypad characters with Num Lock on (Linux's pad_chars; Enter is '\r' here
+/// like the main Enter key: the tty's ICRNL turns it into '\n' in canonical
+/// mode, and raw-mode programs such as nano see the CR they expect).
+const PAD_CHARS: &[u8; 21] = b"0123456789+-*/\r,.?()#";
 
 /// Dead-key accents, standalone form (Linux's ret_diacr).
 const ACCENT: [char; 6] = ['`', '\'', '^', '~', '"', ','];
@@ -736,7 +737,7 @@ impl Engine {
             KT_SPEC => {
                 if down {
                     match sym {
-                        K_ENTER => self.emit(out, '\n'),
+                        K_ENTER => self.emit(out, '\r'), // CR like Linux: ICRNL makes it '\n' when cooked
                         K_CAPS if !rep => self.leds ^= LED_CAP,
                         K_NUM if !rep => self.leds ^= LED_NUM,
                         K_HOLD if !rep => self.leds ^= LED_SCR,
