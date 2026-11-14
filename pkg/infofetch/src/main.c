@@ -122,10 +122,10 @@ static void print_cpu(char *buffer, size_t size)
 static void print_row(const char *logo_line, const char *color, const char *label, const char *value)
 {
     if (logo_line && color) {
-        // Affiche le logo avec sa couleur et complète avec des espaces pour atteindre LOGO_WIDTH
+        // Displays the logo in its color and pads it with spaces to reach LOGO_WIDTH
         printf("%s%-*s" RESET "   ", color, LOGO_WIDTH, logo_line);
     } else {
-        // Lignes vides sous le logo pour garder l'alignement
+        // Empty lines below the logo to maintain alignment
         printf("%-*s   ", LOGO_WIDTH, "");
     }
 
