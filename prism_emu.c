@@ -112,20 +112,28 @@ static int load_elf(const char *path, struct image *im)
         fseek(f, 0, SEEK_SET);
         im->bytes = malloc(im->size);
         if (!im->bytes || fread(im->bytes, 1, im->size, f) != im->size) {
-                fprintf(stderr, "emu: short read\n"); return -1;
+                fprintf(stderr, "emu: short read\n"); fclose(f); return -1;
         }
         fclose(f);
 
         uint8_t *e = im->bytes;
-        if (memcmp(e, "\x7f""ELF", 4)) { fprintf(stderr, "emu: not an ELF\n"); return -1; }
+        /* The file is untrusted: nothing below may read outside im->bytes. */
+        if (im->size < 64) { fprintf(stderr, "emu: ELF header truncated\n"); free(im->bytes); im->bytes = NULL; return -1; }
+        if (memcmp(e, "\x7f""ELF", 4)) { fprintf(stderr, "emu: not an ELF\n"); free(im->bytes); im->bytes = NULL; return -1; }
         im->entry     = u64at(e + 0x18);
         im->phoff     = u64at(e + 0x20);
         im->phentsize = *(uint16_t *)(e + 0x36);
         im->phnum     = *(uint16_t *)(e + 0x38);
         im->dyn_vaddr = 0;
         im->nph = 0;
+        /* Each Phdr is read up to offset 56; the whole table must lie inside
+         * the file (checked without letting phoff + n * entsize wrap). */
+        if (im->phnum && (im->phentsize < 56 || im->phoff > im->size ||
+            (uint64_t)im->phnum * im->phentsize > im->size - im->phoff)) {
+                fprintf(stderr, "emu: program header table out of bounds\n"); free(im->bytes); im->bytes = NULL; return -1;
+        }
         for (unsigned i = 0; i < im->phnum; i++) {
-                uint8_t *p = e + im->phoff + i * im->phentsize;
+                uint8_t *p = e + im->phoff + (uint64_t)i * im->phentsize;
                 struct ph s;
                 s.type   = *(uint32_t *)(p + 0);
                 s.flags  = *(uint32_t *)(p + 4);
@@ -136,6 +144,14 @@ static int load_elf(const char *path, struct image *im)
                 s.align  = u64at(p + 48);
                 if (s.type == 2) { im->dyn_vaddr = s.vaddr; continue; }
                 if (s.type != 1) continue;
+                /* ph[] holds 32 entries: more PT_LOAD used to run off the
+                 * end of it and smash the tracer's stack. */
+                if (im->nph >= (int)(sizeof im->ph / sizeof im->ph[0])) {
+                        fprintf(stderr, "emu: too many PT_LOAD segments (max %zu)\n",
+                                sizeof im->ph / sizeof im->ph[0]);
+                        free(im->bytes); im->bytes = NULL;
+                        return -1;
+                }
                 im->ph[im->nph++] = s;
         }
         return 0;

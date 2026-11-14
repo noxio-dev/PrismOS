@@ -2009,7 +2009,13 @@ pub fn sys_poll(fds_p: u64, nfds: u64, timeout_ms: u64) -> i64 {
     }
     // The array in kernel memory (8 KB worst case -- the heap, not the
     // 16 KiB kernel stack).
-    let mut buf: Vec<u8> = alloc::vec![0u8; n * 8];
+    // Fallible allocation: an exhausted heap is -ENOMEM for the caller, not a
+    // panic (= abort) of the whole kernel.
+    let mut buf: Vec<u8> = Vec::new();
+    if buf.try_reserve_exact(n * 8).is_err() {
+        return -12; // -ENOMEM
+    }
+    buf.resize(n * 8, 0);
     if n > 0 {
         let Some(cur) = process::current() else { return -EFAULT };
         let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return -EFAULT };
@@ -2019,7 +2025,11 @@ pub fn sys_poll(fds_p: u64, nfds: u64, timeout_ms: u64) -> i64 {
     }
     let start = uptime_ms();
     let mut deadline = wait_deadline(timeout_ms, start);
-    let mut revents: Vec<i32> = alloc::vec![0; n];
+    let mut revents: Vec<i32> = Vec::new();
+    if revents.try_reserve_exact(n).is_err() {
+        return -12; // -ENOMEM
+    }
+    revents.resize(n, 0);
     loop {
         let mut ready = 0i64;
         for i in 0..n {

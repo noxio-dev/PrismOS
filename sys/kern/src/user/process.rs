@@ -65,7 +65,7 @@
 // are not, so every process carries an FXSAVE area (user/fpu.rs) that is saved
 // when it leaves the CPU and restored when it gets it back.
 
-use alloc::alloc::{alloc_zeroed, dealloc, Layout};
+use alloc::alloc::{alloc as alloc_raw, alloc_zeroed, dealloc, Layout};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -109,6 +109,14 @@ const EFAULT: i64 = 14;
 const EINVAL: i64 = 22;
 const ECHILD: i64 = 10;
 const ENOMEM: i64 = 12;
+const EAGAIN: i64 = 11;
+
+/// Most process table entries alive at once, zombies included (the RLIMIT_NPROC
+/// of this kernel).  A zombie keeps its 16 KiB kernel stack and its PCB until
+/// its parent reaps it, so this is also what bounds the heap a fork()/exit()
+/// loop without wait() can pin: 256 * 16 KiB = 4 MiB of the 16 MiB kernel
+/// heap, the rest staying available to the kernel's own allocations.
+pub const MAX_PROCS: usize = 256;
 
 // ------------------------------------------------------------------- state
 
@@ -503,6 +511,23 @@ fn spawn_common(
     if prio >= PRIO_LEVELS {
         return Err("bad priority");
     }
+    // The tick walks the table to wake sleepers, and the shell calls us with
+    // interrupts on: growing the table (which may reallocate) must not be
+    // interrupted, so the guard covers the whole spawn.
+    let _g = crate::arch::io::IrqGuard::new();
+    // Process limit (zombies count: they still hold a kernel stack), and the
+    // table slot reserved up front so the push below cannot abort the kernel
+    // on an exhausted heap.
+    // SAFETY: interrupts masked by the guard, single CPU.
+    unsafe {
+        let table = &mut *addr_of_mut!(TABLE);
+        if table.len() >= MAX_PROCS {
+            return Err("too many processes");
+        }
+        if table.try_reserve(1).is_err() {
+            return Err("out of memory (process table)");
+        }
+    }
     let layout = Layout::from_size_align(KSTACK_SIZE, 4096).map_err(|_| "bad layout")?;
     // SAFETY: valid non-zero layout.
     let kstack = unsafe { alloc_zeroed(layout) };
@@ -560,14 +585,20 @@ fn spawn_common(
         preempts: 0,
         exit_seq: 0,
     };
-    // The tick walks the table to wake sleepers, and the shell calls us with
-    // interrupts on: the push (which may reallocate) must not be interrupted.
-    let _g = crate::arch::io::IrqGuard::new();
-    // SAFETY: interrupts masked by the guard, single CPU.
+    // SAFETY: interrupts masked by the guard taken above, single CPU.
     unsafe {
+        // Fallible Box::new: a null from the heap is an error for the caller
+        // (-ENOMEM / -EAGAIN), not a panic = abort of the whole machine.
+        let blayout = Layout::new::<Process>();
+        let raw = alloc_raw(blayout) as *mut Process;
+        if raw.is_null() {
+            dealloc(kstack, layout);
+            return Err("out of memory (process control block)");
+        }
+        raw.write(proc);
         let pid = NEXT_PID;
         NEXT_PID += 1;
-        let mut b = Box::new(proc);
+        let mut b = Box::from_raw(raw);
         b.pid = pid;
         // A fresh process is a group of one and a session of one (the
         // kernel-spawned init included); `setsid` and `setpgid` from ring 3
@@ -667,6 +698,12 @@ pub fn fork_current(frame: &IsrFrame) -> i64 {
     if cur.aspace.is_none() {
         return -EFAULT; // a kernel thread cannot fork
     }
+    // Process limit (RLIMIT_NPROC): refuse before paying for the COW clone.
+    // Zombies count, they keep a kernel stack until their parent waits.
+    // SAFETY: syscall context, read-only length probe of the table.
+    if unsafe { (*addr_of_mut!(TABLE)).len() } >= MAX_PROCS {
+        return -EAGAIN;
+    }
     // Rough pre-check: the COW clone needs its own page-table tree (PML4
     // plus one table per 2 MiB of image).  The walk also fails per page
     // under pressure, which self-heals (no child, parent COW bits clear
@@ -744,6 +781,7 @@ pub fn fork_current(frame: &IsrFrame) -> i64 {
             });
             pid as i64
         }
+        Err("too many processes") => -EAGAIN,
         Err(_) => -ENOMEM,
     }
 }
