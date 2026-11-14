@@ -19,7 +19,7 @@
 #define WHITE   "\033[37m"
 #define GRAY    "\033[90m"
 
-// Largeur fixe réservée pour le bloc logo (ajustée pour éviter les décalages)
+// Fixed width reserved for the logo block (adjusted to prevent shifts)
 #define LOGO_WIDTH 14
 
 static const char *logo[] = {
