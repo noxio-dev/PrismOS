@@ -37,6 +37,9 @@ pub struct FbConsole {
     /// grid.
     top: usize,
     bot: usize,
+    /// Text cursor visibility (CSI ?25h / ?25l, what nano's civis / cnorm
+    /// send): a block in inverse video at (x, y) when set.
+    cursor_on: bool,
 }
 
 impl FbConsole {
@@ -64,6 +67,7 @@ impl FbConsole {
             pending: false,
             top: 0,
             bot: fb.height as usize / cell_h,
+            cursor_on: true,
         };
         c.clear();
         c.flush();
@@ -91,9 +95,21 @@ impl FbConsole {
         self.surf.enable_backbuffer()
     }
 
-    /// Make everything printed so far visible.
+    /// Make everything printed so far visible, then the cursor on top.
     pub fn flush(&mut self) {
-        self.surf.present();
+        self.surf.present(); // also takes the previous cursor off the screen
+        if self.cursor_on {
+            self.surf.cursor_draw(self.x * self.cell_w, self.y * self.cell_h, self.cell_w, self.cell_h);
+        }
+    }
+
+    /// CSI ?25l / ?25h.
+    pub fn hide_cursor(&mut self) {
+        self.cursor_on = false;
+    }
+
+    pub fn show_cursor(&mut self) {
+        self.cursor_on = true;
     }
 
     pub fn clear(&mut self) {

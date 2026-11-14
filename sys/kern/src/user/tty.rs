@@ -611,10 +611,11 @@ pub fn set_termios(which: Term, bytes: &[u8; TERMIOS_LEN]) {
     unsafe {
         let t = tty_of(which);
         let was_canon = t.lflag & ICANON != 0;
-        // Input translations: CR -> NL stays on whatever a program asks
-        // for -- the serial terminals send CR, and the other directions
-        // are not modelled here.
-        t.iflag = ICRNL;
+        // Input translations: ICRNL is honoured as the program asks.  A
+        // curses program (nano) turns it off with nonl() so that Enter
+        // (CR) stays distinct from Ctrl-J (NL); forcing it on made every
+        // Enter arrive as ^J.  The other directions are not modelled here.
+        t.iflag = read_u32(0) & ICRNL;
         t.oflag = oflag;
         t.cflag = cflag;
         t.lflag = lflag;

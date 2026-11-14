@@ -240,10 +240,18 @@ fn apply(a: Action) {
             if let Some(v) = c.vga.as_mut() {
                 v.hide_cursor();
             }
+            if let Some(f) = c.fb.as_mut() {
+                f.hide_cursor();
+                f.flush();
+            }
         }
         Action::ShowCursor => {
             if let Some(v) = c.vga.as_mut() {
                 v.show_cursor();
+            }
+            if let Some(f) = c.fb.as_mut() {
+                f.show_cursor();
+                f.flush();
             }
         }
         Action::Index => {

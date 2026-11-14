@@ -41,6 +41,11 @@ pub struct Surface {
     dy0: usize,
     dx1: usize,
     dy1: usize,
+    /// Software text cursor currently painted on the *screen*: (x, y, w, h).
+    /// It lives on the front buffer only -- the back buffer always holds the
+    /// clean picture -- so erasing it is a copy of that cell back from the
+    /// back buffer (see `cursor_restore` / `cursor_draw`).
+    cursor: Option<(usize, usize, usize, usize)>,
     r_shift: u8,
     r_bits: u8,
     g_shift: u8,
@@ -77,6 +82,7 @@ impl Surface {
             dy0: usize::MAX,
             dx1: 0,
             dy1: 0,
+            cursor: None,
             r_shift: fb.red_shift,
             r_bits: fb.red_bits,
             g_shift: fb.green_shift,
@@ -164,8 +170,56 @@ impl Surface {
         self.dy1 = self.dy1.max(y1);
     }
 
+    /// Take the software cursor off the screen: the cell it covered is
+    /// copied back from the back buffer.  A no-op when none is shown.
+    pub fn cursor_restore(&mut self) {
+        let Some((x, y, w, h)) = self.cursor.take() else { return };
+        if !self.buffered {
+            return;
+        }
+        for yy in y..(y + h).min(self.h) {
+            // SAFETY: the cell was clamped to the surface when it was drawn.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.base.add(yy * self.pitch + x * 4),
+                    self.front.add(yy * self.front_pitch + x * 4),
+                    w.min(self.w - x) * 4,
+                );
+            }
+        }
+    }
+
+    /// Paint the software cursor over the cell at pixel (x, y), size w x h:
+    /// the cell's own pixels inverted, so a glyph under it stays readable.
+    /// Drawn on the screen only (never in the back buffer), and only once a
+    /// back buffer exists -- without one there is no clean copy to restore.
+    /// Call it after `present()`; `present()` takes the old one off first.
+    pub fn cursor_draw(&mut self, x: usize, y: usize, w: usize, h: usize) {
+        if !self.buffered {
+            return;
+        }
+        let (x1, y1) = ((x + w).min(self.w), (y + h).min(self.h));
+        if x >= x1 || y >= y1 {
+            return;
+        }
+        let mask = self.rgb(0xFF, 0xFF, 0xFF);
+        for yy in y..y1 {
+            for xx in x..x1 {
+                // SAFETY: (xx, yy) is inside the surface (clamped above).
+                unsafe {
+                    let s = (self.base.add(yy * self.pitch + xx * 4) as *const u32).read();
+                    (self.front.add(yy * self.front_pitch + xx * 4) as *mut u32).write(s ^ mask);
+                }
+            }
+        }
+        self.cursor = Some((x, y, x1 - x, y1 - y));
+    }
+
     /// Copy everything drawn since the last call to the screen.
     pub fn present(&mut self) {
+        // The old cursor goes first: whatever was drawn since may or may not
+        // cover its cell, and a stale one must not be left behind.
+        self.cursor_restore();
         if self.dx0 >= self.dx1 || self.dy0 >= self.dy1 {
             return;
         }
