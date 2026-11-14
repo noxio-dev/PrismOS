@@ -1,0 +1,28 @@
+# The manifest of a PrismOS app -- read by tools/prism.py.  This one builds
+# in the builtin mode: prism compiles the sources against the mlibc sysroot
+# and links the static PIE the kernel's loader expects, then verify.sh
+# checks the loader contract, then the stripped binary is staged for the
+# image.  See pkg/README.md for every field.
+[package]
+name = "infofetch"
+version = "0.1.0"
+description = "a PrismOS app"
+
+[build]
+sources = ["src/main.c"]
+# cflags = []                      # extra compile flags
+# ldflags = []                     # extra link flags
+# output = "build/infofetch"        # app-relative; where the binary lands
+# strip = true                     # the kernel reads whole files (4 MiB cap)
+# verify = true                    # verify.sh after every build
+
+[install]
+path = "/usr/bin/infofetch"
+
+# The program's ABI, checked under disassembly: every syscall it makes and
+# a symbol or two those paths live in (verify.sh's reaches).  The scaffold
+# speaks through printf (syscall 1 at flush time) and the raw uptime clock
+# (3); keep the diet honest as you rewrite main.c.
+[verify]
+syscalls = [1]
+symbols = ["printf"]
