@@ -184,6 +184,29 @@ pub fn with<R>(f: impl FnOnce(&mut Device) -> R) -> Option<R> {
     unsafe { (*addr_of_mut!(DEV)).as_mut().map(f) }
 }
 
+/// A text-mode virtual terminal became active: the console takes the
+/// screen back (and repaints) even if a client still has a CRTC lit -- the
+/// fbcon takeover.  The client's next SETCRTC / page flip / atomic commit
+/// (after it is made master again) takes the screen once more.
+pub fn console_takeover() {
+    scanout::set_owned(false);
+}
+
+/// `KDSETMODE(KD_TEXT)` on the active VT: same, but only when no client
+/// holds DRM master (a master that is merely between two modesets keeps
+/// its picture).
+pub fn console_takeover_unmastered() {
+    let held = with(|d| d.master.is_some()).unwrap_or(false);
+    if !held {
+        scanout::set_owned(false);
+    }
+}
+
+/// The panel size (what sysfs's `modes` shows), if there is a device.
+pub fn panel_size() -> Option<(u32, u32)> {
+    with(|d| (d.native.width(), d.native.height()))
+}
+
 /// Is there a DRM device (is /dev/dri/card0 openable)?
 pub fn present() -> bool {
     with(|_| ()).is_some()

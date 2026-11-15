@@ -353,7 +353,7 @@ $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
 	$(HELLO_DYN) $B/pkgs.stamp $B/binutils.stamp $B/busybox.stamp $B/nano.stamp $(ROOTFS_FILES)
 	rm -rf $B/root
 	mkdir -p $B/root/boot/lua $B/root/boot/defaults $B/root/boot/kernel \
-                 $B/root/dev $B/root/etc $B/root/proc $B/root/tmp \
+                 $B/root/dev $B/root/etc $B/root/proc $B/root/sys $B/root/tmp \
                  $B/root/usr/bin $B/root/usr/lib
 	chmod 1777 $B/root/tmp
 	# The hand-edited files live in rootfs/ and are copied verbatim, before
@@ -552,3 +552,5 @@ drmtest:
 	$(B)/drm_host --test-threads=1
 	rustc --edition 2021 --test tests/drm_kms_host.rs -o $(B)/drm_kms_host
 	$(B)/drm_kms_host --test-threads=1
+	rustc --edition 2021 --test tests/input_vt_host.rs -o $(B)/input_vt_host
+	$(B)/input_vt_host --test-threads=1

@@ -431,6 +431,8 @@ impl Kbd {
         if kc == 0 {
             return; // fake shift, multimedia key...
         }
+        // evdev sees every key, whatever the console's keyboard mode is.
+        crate::input::key(kc, !release);
 
         let leds_before = self.engine.leds;
         let mut out = self.engine.new_out();
@@ -790,7 +792,137 @@ pub fn init() -> Status {
     }
 
     STATUS_PRESENT.store(self_test || port_test || acked, Ordering::Release);
+    if self_test || port_test || acked {
+        init_mouse();
+    }
     status_snapshot()
+}
+
+
+// ------------------------------------------------------- PS/2 mouse (aux port)
+//
+// The second i8042 port.  The keyboard code above kept it off ("mouse
+// stays off") because aux bytes used to poison the key stream; now the IRQ
+// handler routes every byte by the AUX status bit (bit 5), so the two
+// streams cannot mix.  Bring-up is bounded and paced like the keyboard's:
+// a machine without a mouse costs one reset timeout and leaves the aux
+// port disabled, exactly as before.
+
+static MOUSE_PRESENT: AtomicBool = AtomicBool::new(false);
+static mut MOUSE: crate::input::ps2::Decoder = crate::input::ps2::Decoder::new();
+
+/// A PS/2 mouse answered and is streaming (main.rs unmasks IRQ12 on this).
+pub fn mouse_present() -> bool {
+    MOUSE_PRESENT.load(Ordering::Acquire)
+}
+
+/// One byte from the aux port (IRQ context).
+fn mouse_byte(b: u8) {
+    if !MOUSE_PRESENT.load(Ordering::Relaxed) {
+        return;
+    }
+    // SAFETY: single IRQ context owns the decoder.
+    let dec = unsafe { &mut *addr_of_mut!(MOUSE) };
+    if let Some(p) = dec.feed(b) {
+        crate::input::mouse(p.dx, p.dy, p.wheel, p.buttons);
+    }
+}
+
+/// IRQ12 entry: the same drain as IRQ1 (it routes by the AUX bit).
+pub fn on_irq12() {
+    on_irq();
+}
+
+/// Send a command byte to the mouse (0xD4 prefix) and wait for its ACK.
+fn aux_cmd(cmd: u8, budget: u32) -> bool {
+    for _attempt in 0..2 {
+        if !wait_clear(0x02, CTL_TIMEOUT) {
+            return false;
+        }
+        // SAFETY: controller "write to aux device" command, fixed ports.
+        unsafe { outb(KBD_STATUS, 0xD4) };
+        if !wait_clear(0x02, CTL_TIMEOUT) {
+            return false;
+        }
+        // SAFETY: as above.
+        unsafe { outb(KBD_DATA, cmd) };
+        let mut noise = 0u32;
+        loop {
+            if !wait_set(0x01, budget) {
+                return false; // no mouse (the controller times the write out)
+            }
+            match data() {
+                0xFA => return true,
+                0xFE => break, // resend
+                _ => {
+                    noise += 1;
+                    if noise > 16 {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// One reply byte from the mouse, or None on timeout.
+fn aux_read(budget: u32) -> Option<u8> {
+    if wait_set(0x01, budget) {
+        Some(data())
+    } else {
+        None
+    }
+}
+
+/// Probe and start the mouse.  Called once the keyboard is up, IRQs masked.
+fn init_mouse() {
+    use crate::input::ps2;
+    ctl_outb(0xA8); // enable the aux port
+    drain();
+    // Reset: ACK, then BAT (0xAA) and the device id (0x00).
+    if !aux_cmd(0xFF, RESET_ACK_TIMEOUT) {
+        ctl_outb(0xA7);
+        drain();
+        return;
+    }
+    if aux_read(BAT_TIMEOUT) != Some(0xAA) {
+        ctl_outb(0xA7);
+        drain();
+        return;
+    }
+    let _ = aux_read(KBD_ACK_TIMEOUT); // device id 0
+    // IntelliMouse wheel magic: sample rates 200, 100, 80, then read the id.
+    let mut len = 3;
+    let mut magic = true;
+    for r in [200u8, 100, 80] {
+        magic = magic && aux_cmd(0xF3, KBD_ACK_TIMEOUT) && aux_cmd(r, KBD_ACK_TIMEOUT);
+    }
+    if magic && aux_cmd(0xF2, KBD_ACK_TIMEOUT) && aux_read(KBD_ACK_TIMEOUT) == Some(3) {
+        len = 4;
+    }
+    // Back to 100 samples/s, 4 counts/mm, stream mode on.
+    let _ = aux_cmd(0xF3, KBD_ACK_TIMEOUT) && aux_cmd(100, KBD_ACK_TIMEOUT);
+    let _ = aux_cmd(0xE8, KBD_ACK_TIMEOUT) && aux_cmd(2, KBD_ACK_TIMEOUT);
+    if !aux_cmd(0xF4, KBD_ACK_TIMEOUT) {
+        ctl_outb(0xA7);
+        drain();
+        return;
+    }
+    drain();
+    // SAFETY: IRQs masked, single CPU.
+    unsafe {
+        let d = &mut *addr_of_mut!(MOUSE);
+        *d = ps2::Decoder::new();
+        d.len = len;
+    }
+    // Aux IRQ on, aux clock running.
+    let mut cfg = read_config().unwrap_or(0);
+    cfg |= 0x02;
+    cfg &= !0x20;
+    let _ = write_config(cfg);
+    STATUS_CONFIG.store(read_config().unwrap_or(cfg), Ordering::Release);
+    MOUSE_PRESENT.store(true, Ordering::Release);
 }
 
 fn status_snapshot() -> Status {
@@ -817,7 +949,8 @@ pub fn on_irq() {
         }
         let b = data();
         if st & 0x20 != 0 {
-            continue; // mouse byte in the shared buffer: not ours
+            mouse_byte(b); // aux-port byte: the mouse's
+            continue;
         }
         // SAFETY: single IRQ context; the ring is SPSC.
         let kbd = unsafe { &mut *addr_of_mut!(KBD) };
@@ -874,6 +1007,10 @@ pub fn inject_key(sc: u8, ext: bool, release: bool) {
     let kbd = unsafe { &mut *addr_of_mut!(KBD) };
     let queue = unsafe { &mut *addr_of_mut!(QUEUE) };
     let km = unsafe { &*addr_of_mut!(KEYMAP) };
+    let ekc = keymap::keycode_of(sc & 0x7F, ext);
+    if ekc != 0 {
+        crate::input::key(ekc, !release);
+    }
     if kbd.engine.mode == keymap::K_RAW {
         // showkey: hand over what a PS/2 keyboard would have sent (set 1).
         if ext {

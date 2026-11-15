@@ -11,6 +11,7 @@ use crate::hw::blk::{read_gpt, BlockDev, GptEntry, Partition};
 use crate::fs::devfs::DevFs;
 use crate::fs::ext4::Ext4;
 use crate::fs::procfs::ProcFs;
+use crate::fs::sysfs::SysFs;
 use crate::fs::tmpfs::{TmpFs, MAX_BYTES, MAX_FILES};
 use crate::fs::vfs::{self, FsError, Vfs};
 use alloc::boxed::Box;
@@ -261,6 +262,17 @@ pub fn mount_proc_and_tmp() {
             Err(e) => crate::kprintln!("vfs      : cannot create /proc: {}", e.as_str()),
         }
     }
+    // /sys: the device tree libdrm / X look the DRM card and the input
+    // devices up in (fs/sysfs.rs).  Read-only, built from what the boot found.
+    if !mounted("/sys") {
+        match vfs().mkdir_p("/sys", 0o555) {
+            Ok(()) => match vfs().mount("/sys", Box::new(SysFs::new())) {
+                Ok(()) => crate::kprintln!("vfs      : sysfs on /sys (read-only)"),
+                Err(e) => crate::kprintln!("vfs      : cannot mount sysfs on /sys: {}", e.as_str()),
+            },
+            Err(e) => crate::kprintln!("vfs      : cannot create /sys: {}", e.as_str()),
+        }
+    }
 }
 
 // ------------------------------------------------ mount / umount (phase 3.3)
@@ -291,6 +303,13 @@ pub fn sys_mount(src_p: u64, tgt_p: u64, type_p: u64, flags: u64) -> i64 {
     // the mount table's fs_name column shows).
     if fstype == "procfs" {
         return vfs().mkdir_p(&tgt, 0o555).and_then(|_| vfs().mount(&tgt, Box::new(ProcFs::new()))).map_or_else(
+            |e| -crate::user::fd::fs_errno(e),
+            |_| 0,
+        );
+    }
+    // The device tree (init mounts it on /sys).
+    if fstype == "sysfs" {
+        return vfs().mkdir_p(&tgt, 0o555).and_then(|_| vfs().mount(&tgt, Box::new(SysFs::new()))).map_or_else(
             |e| -crate::user::fd::fs_errno(e),
             |_| 0,
         );

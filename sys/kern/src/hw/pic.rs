@@ -18,6 +18,7 @@ pub const IRQ_TIMER: u8 = 0;
 pub const IRQ_KBD: u8 = 1;
 pub const IRQ_CASCADE: u8 = 2;
 pub const IRQ_COM1: u8 = 4;
+pub const IRQ_MOUSE: u8 = 12;
 
 /// Live mask (what we believe is unmasked), for `sh` introspection.
 static MASK: AtomicU8 = AtomicU8::new(0xFF);

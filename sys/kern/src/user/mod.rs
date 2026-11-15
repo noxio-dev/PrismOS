@@ -42,3 +42,4 @@ pub mod sysc;
 pub mod syscall;
 pub mod tty;
 pub mod usermode;
+pub mod vt;

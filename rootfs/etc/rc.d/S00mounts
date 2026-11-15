@@ -9,3 +9,5 @@
 # says what went wrong.
 mount -t procfs none /proc
 mount -t tmpfs none /tmp
+# /sys: the device tree libdrm and X read (the DRM card, the input nodes).
+mount -t sysfs none /sys

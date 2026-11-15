@@ -13,11 +13,13 @@
 //             nodes, the full mutable surface, a byte + inode quota
 //   procfs.rs the generated /proc (phase 3.3): kernel + process state,
 //             regenerated on every read
+//   sysfs.rs  the /sys device tree (DRM card, input devices, active VT)
 //   fsys.rs   kernel glue: global VFS, cwd, GPT scan, boot-time mount, clock
 
 pub mod devfs;
 pub mod ext4;
 pub mod fsys;
 pub mod procfs;
+pub mod sysfs;
 pub mod tmpfs;
 pub mod vfs;

@@ -32,6 +32,7 @@ mod console;
 mod drm;
 mod fs;
 mod hw;
+mod input;
 mod lib;
 mod mem;
 mod shell;
@@ -177,6 +178,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         pit::on_tick(f.cs & 3 == 3)
     });
     intr::register_irq(pic::IRQ_KBD, |_f| kbd::on_irq());
+    intr::register_irq(pic::IRQ_MOUSE, |_f| kbd::on_irq12());
 
     // --- Memory management ----------------------------------------------------
     let Some(bi) = bi else {
@@ -321,6 +323,11 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             kprintln!("           keyboard did not ACK -- it may stay silent");
         }
         irq_unmask(pic::IRQ_KBD);
+        if kbd::mouse_present() {
+            vprintln!("mouse    : PS/2 on irq{}, evdev /dev/input/event1", pic::IRQ_MOUSE);
+            irq_unmask(pic::IRQ_MOUSE);
+            kbd::on_irq(); // a byte may already be waiting in the output buffer
+        }
     } else {
         vprintln!("kbd      : no PS/2 controller detected (USB-only machine?)");
         vprintln!("           console input stays on the serial line");

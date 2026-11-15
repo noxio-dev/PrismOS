@@ -1050,8 +1050,13 @@ pub fn dirtyfb(_f: &Rc<DrmFile>, b: &mut [u8]) -> i64 {
     });
     match jobs {
         Some(Ok(v)) => {
+            // While the text console has the screen (the client's VT is not
+            // the active one) a damage flush must not paint over it.
+            let owned = scanout::owned();
             for (nat, job) in v {
-                scanout::blit(&nat, &job);
+                if owned {
+                    scanout::blit(&nat, &job);
+                }
                 let _g = IrqGuard::new();
                 drop(job);
             }

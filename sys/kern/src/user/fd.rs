@@ -76,7 +76,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 
-use crate::fs::devfs::{DEV_CONSOLE, DEV_DRI_CARD0, DEV_FULL, DEV_NULL, DEV_TTYS0, DEV_TTY, DEV_TTY0, DEV_ZERO};
+use crate::fs::devfs::{
+    DEV_CONSOLE, DEV_DRI_CARD0, DEV_EVENT0, DEV_FULL, DEV_NULL, DEV_TTY, DEV_TTY0, DEV_TTY1, DEV_TTYS0, DEV_ZERO,
+    N_EVENT_NODES, N_VT_NODES,
+};
 use crate::fs::vfs::{
     DirEntry, FsError, FileType, O_APPEND, O_CLOEXEC, O_CREATE, O_EXCL, O_NONBLOCK, O_READ,
     O_TRUNC, O_WRITE, Opened, Whence,
@@ -171,6 +174,11 @@ enum Kind {
     DevFull,
     /// /dev/dri/card0: one open of the DRM device (drm/mod.rs).
     Drm(Rc<crate::drm::DrmFile>),
+    /// /dev/ttyN (N = 1..6): a virtual terminal -- the console line
+    /// discipline plus the VT_* / KD ioctls of user/vt.rs, per VT.
+    Vt(Rc<crate::user::vt::VtHandle>),
+    /// /dev/input/eventN: one open of an evdev node (input/mod.rs).
+    Evdev(Rc<crate::input::EvFile>),
     PipeRead(Rc<RefCell<Pipe>>),
     PipeWrite(Rc<RefCell<Pipe>>),
 }
@@ -178,7 +186,7 @@ enum Kind {
 /// Which terminal a descriptor talks to, if it is a terminal at all.
 fn term_of(kind: &Kind) -> Option<tty::Term> {
     match kind {
-        Kind::Console | Kind::VgaTty => Some(tty::Term::Console),
+        Kind::Console | Kind::VgaTty | Kind::Vt(_) => Some(tty::Term::Console),
         Kind::Serial => Some(tty::Term::Serial),
         _ => None,
     }
@@ -313,6 +321,8 @@ impl FdTable {
                     Kind::DevZero => String::from("/dev/zero"),
                     Kind::DevFull => String::from("/dev/full"),
                     Kind::Drm(_) => String::from("/dev/dri/card0"),
+                    Kind::Vt(h) => alloc::format!("/dev/tty{}", h.num()),
+                    Kind::Evdev(e) => alloc::format!("/dev/input/event{}", e.dev()),
                     Kind::PipeRead(_) | Kind::PipeWrite(_) => String::from("pipe"),
                 };
                 Some((i, name))
@@ -416,6 +426,15 @@ pub(crate) fn copy_in(buf: u64, done: usize, into: &mut [u8]) -> bool {
     aspace.read(buf + done as u64, into)
 }
 
+/// The evdev open behind descriptor `fd` of the current process, if it is one.
+pub fn evdev_file_of(fd: usize) -> Option<Rc<crate::input::EvFile>> {
+    let d = process::current()?.fds.get(fd)?;
+    match &d.kind {
+        Kind::Evdev(f) => Some(f.clone()),
+        _ => None,
+    }
+}
+
 /// The DRM open behind descriptor `fd` of the current process, if it is one.
 pub fn drm_file_of(fd: usize) -> Option<Rc<crate::drm::DrmFile>> {
     let d = process::current()?.fds.get(fd)?;
@@ -499,11 +518,12 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> i64 {
     }
     match &desc.kind {
         Kind::Vfs(slot) => read_vfs(*slot, buf, len),
-        Kind::Console | Kind::VgaTty => read_tty(tty::Term::Console, &desc, buf, len),
+        Kind::Console | Kind::VgaTty | Kind::Vt(_) => read_tty(tty::Term::Console, &desc, buf, len),
         Kind::Serial => read_tty(tty::Term::Serial, &desc, buf, len),
         Kind::DevNull => 0, // EOF: the buffer is not even looked at
         Kind::DevZero | Kind::DevFull => read_zero(buf, len),
         Kind::Drm(f) => crate::drm::read(f, buf, len, desc.flags() & O_NONBLOCK != 0),
+        Kind::Evdev(f) => crate::input::read(f, buf, len, desc.flags() & O_NONBLOCK != 0),
         Kind::PipeRead(p) => read_pipe(p, &desc, buf, len),
         Kind::PipeWrite(_) => -EBADF,
     }
@@ -687,13 +707,14 @@ pub fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
     match &desc.kind {
         Kind::Vfs(slot) => write_vfs(*slot, buf, len),
         Kind::Console => write_console(buf, len),
-        Kind::VgaTty => write_vga(buf, len),
+        Kind::VgaTty | Kind::Vt(_) => write_vga(buf, len),
         Kind::Serial => write_serial(buf, len),
         // The sinks still validate the buffer (an unreadable pointer is
         // -EFAULT, like on any unix) before reporting success.
         Kind::DevNull | Kind::DevZero => write_sink(buf, len),
         // A DRM fd has no write(): commands go through ioctl (Linux: EINVAL).
         Kind::Drm(_) => -EINVAL,
+        Kind::Evdev(f) => crate::input::write(f, buf, len),
         // /dev/full: the write no disk could make.
         Kind::DevFull => {
             let mut chunk = [0u8; CHUNK];
@@ -896,6 +917,18 @@ pub fn sys_open(path_p: u64, flags: u64) -> i64 {
             // /dev/ttyS0: the serial terminal, a line discipline of its
             // own on COM1's receive queue (phase 3.3.5).
             DEV_TTYS0 => Kind::Serial,
+            // /dev/ttyN: virtual terminal N.
+            n if (DEV_TTY1..DEV_TTY1 + N_VT_NODES).contains(&n) => match crate::user::vt::open((n - DEV_TTY1 + 1) as u8) {
+                Some(h) => Kind::Vt(h),
+                None => return -ENXIO,
+            },
+            // /dev/input/eventN: evdev.
+            n if (DEV_EVENT0..DEV_EVENT0 + N_EVENT_NODES).contains(&n) => {
+                match crate::input::open((n - DEV_EVENT0) as usize) {
+                    Ok(f) => Kind::Evdev(Rc::new(f)),
+                    Err(e) => return e,
+                }
+            }
             DEV_NULL => Kind::DevNull,
             DEV_ZERO => Kind::DevZero,
             DEV_FULL => Kind::DevFull,
@@ -1124,9 +1157,24 @@ pub fn sys_lstat(path_p: u64, buf: u64) -> i64 {
 /// and friends -- the id is the minor).
 fn dev_rdev(ftype: &FileType) -> u64 {
     match ftype {
-        FileType::Dev(id) if *id == DEV_DRI_CARD0 => crate::drm::DRM_MAJOR << 8,
-        FileType::Dev(id) => (1 << 8) | *id as u64,
+        FileType::Dev(id) => rdev_of_id(*id),
         _ => 0,
+    }
+}
+
+/// st_rdev of device id `id`: the numbers Linux uses where a program looks
+/// (DRM 226, tty 4:N, input 13:64+N; everything else keeps major 1).
+fn rdev_of_id(id: u32) -> u64 {
+    if id == DEV_DRI_CARD0 {
+        crate::drm::DRM_MAJOR << 8
+    } else if (DEV_TTY1..DEV_TTY1 + N_VT_NODES).contains(&id) {
+        (4 << 8) | (id - DEV_TTY1 + 1) as u64
+    } else if id == DEV_TTY0 {
+        4 << 8
+    } else if (DEV_EVENT0..DEV_EVENT0 + N_EVENT_NODES).contains(&id) {
+        (13 << 8) | (64 + id - DEV_EVENT0) as u64
+    } else {
+        (1 << 8) | id as u64
     }
 }
 
@@ -1158,6 +1206,8 @@ pub fn sys_fstat(fd: u64, buf: u64) -> i64 {
         Kind::DevZero => put_dev_stat(buf, DEV_ZERO, 0o666),
         Kind::DevFull => put_dev_stat(buf, DEV_FULL, 0o666),
         Kind::Drm(_) => put_dev_stat(buf, DEV_DRI_CARD0, 0o660),
+        Kind::Vt(h) => put_dev_stat(buf, DEV_TTY1 + h.num() as u32 - 1, 0o620),
+        Kind::Evdev(e) => put_dev_stat(buf, DEV_EVENT0 + e.dev() as u32, 0o660),
         // A pipe end fstats as a fifo: no inode, no size (the buffered
         // byte count is a snapshot nobody promises).
         Kind::PipeRead(_) | Kind::PipeWrite(_) => {
@@ -1173,7 +1223,7 @@ pub fn sys_fstat(fd: u64, buf: u64) -> i64 {
 fn put_dev_stat(buf: u64, id: u32, mode: u16) -> i64 {
     let now = crate::fs::vfs::now();
     let ftype = FileType::Dev(id);
-    let rdev = if id == DEV_DRI_CARD0 { crate::drm::DRM_MAJOR << 8 } else { (1 << 8) | id as u64 };
+    let rdev = rdev_of_id(id);
     if put_stat(buf, id as u64, mode, &ftype, 0, 1, rdev, 0, (now, now, now)) {
         0
     } else {
@@ -1379,7 +1429,11 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> i64 {
     if let Some(f) = drm_file_of(fd as usize) {
         return crate::drm::ioctl(&f, req as u32, arg);
     }
-    let (which, term_id) = {
+    // An evdev descriptor takes the ioctl space of type 'E'.
+    if let Some(f) = evdev_file_of(fd as usize) {
+        return crate::input::ioctl(&f, req as u32, arg);
+    }
+    let (which, term_id, vtn) = {
         let Some(cur) = process::current() else { return -EFAULT };
         let Some(d) = cur.fds.get(fd as usize) else { return -EBADF };
         let Some(w) = term_of(&d.kind) else { return -ENOTTY };
@@ -1389,7 +1443,11 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> i64 {
             tty::Term::Console => 1u8,
             tty::Term::Serial => 2u8,
         };
-        (w, id)
+        let vtn = match &d.kind {
+            Kind::Vt(h) => h.num(),
+            _ => 0, // /dev/tty0, /dev/console: the active VT
+        };
+        (w, id, vtn)
     };
     match req {
         TCGETS => {
@@ -1497,6 +1555,9 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> i64 {
             } else {
                 -EFAULT
             }
+        }
+        r if crate::user::vt::is_vt_request(r) && matches!(which, tty::Term::Console) => {
+            crate::user::vt::ioctl(vtn, r, arg)
         }
         KDGKBTYPE | KDGKBMODE | KDSKBMODE | KDGKBENT | KDSKBENT | KDGKBLED | KDSKBLED | KDGETLED
         | KDSETLED
@@ -1889,6 +1950,7 @@ fn fs_magic(fs_name: &str) -> u64 {
         "tmpfs" => 0x0102_1994,  // TMPFS_MAGIC
         "procfs" => 0x9FA0,      // PROC_SUPER_MAGIC
         "devfs" => 0x1373,       // DEVFS_SUPER_MAGIC
+        "sysfs" => 0x6265_6572,  // SYSFS_MAGIC
         _ => 0,                  // unknown: 0, like nothing claims it
     }
 }
@@ -1979,7 +2041,7 @@ fn desc_ready(desc: &Rc<FileDesc>) -> Ready {
         Kind::Vfs(_) => Ready { read: f & O_READ != 0, write: f & O_WRITE != 0, err: false, hup: false },
         // The terminal decides (phase 3.3): drain what arrived first, so
         // a line just completed counts, then ask for completed input.
-        Kind::Console | Kind::VgaTty => {
+        Kind::Console | Kind::VgaTty | Kind::Vt(_) => {
             tty::pump_term(tty::Term::Console);
             Ready { read: tty::readable(tty::Term::Console), write: f & O_WRITE != 0, err: false, hup: false }
         }
@@ -1992,6 +2054,7 @@ fn desc_ready(desc: &Rc<FileDesc>) -> Ready {
         }
         // POLLIN = a flip / vblank event is due; the device is never writable.
         Kind::Drm(d) => Ready { read: crate::drm::readable(d), write: false, err: false, hup: false },
+        Kind::Evdev(e) => Ready { read: crate::input::readable(e), write: f & O_WRITE != 0, err: false, hup: false },
         Kind::PipeRead(p) => {
             let p = p.borrow();
             let eof = p.writers == 0;
