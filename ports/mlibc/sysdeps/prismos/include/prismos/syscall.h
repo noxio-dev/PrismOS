@@ -92,6 +92,24 @@ enum {
         PRISM_SYS_SETHOSTNAME = 69, /* sethostname(name, len) -- uname's nodename */
         PRISM_SYS_SETITIMER = 70,   /* setitimer(which, &new, &old) -- ITIMER_REAL only */
         PRISM_SYS_GETITIMER = 71,   /* getitimer(which, &cur) */
+        /* Phase 3.5: randomness and identities (kernel user/ident.rs). */
+        PRISM_SYS_GETRANDOM = 73,    /* getrandom(buf, len, flags) */
+        PRISM_SYS_SETUID = 74,
+        PRISM_SYS_SETGID = 75,
+        PRISM_SYS_GETEUID = 76,
+        PRISM_SYS_GETEGID = 77,
+        PRISM_SYS_SETREUID = 78,
+        PRISM_SYS_SETREGID = 79,
+        PRISM_SYS_SETRESUID = 80,
+        PRISM_SYS_SETRESGID = 81,
+        PRISM_SYS_GETRESUID = 82,
+        PRISM_SYS_GETRESGID = 83,
+        PRISM_SYS_GETGROUPS = 84,
+        PRISM_SYS_SETGROUPS = 85,
+        PRISM_SYS_CHOWN = 86,
+        PRISM_SYS_FCHOWN = 87,
+        PRISM_SYS_LCHOWN = 88,
+        PRISM_SYS_ACCESS = 89,       /* access(path, mode): the real ids */
 };
 
 /* arch_prctl() codes -- the Linux x86-64 values the kernel expects. */

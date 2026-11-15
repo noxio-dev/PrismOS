@@ -77,6 +77,13 @@ struct PrismOSSysdepTags :
         ReadEntries,
         Tcgetattr,
         Tcgetwinsize,
+        Ttyname,
+        SetUid,
+        SetEuid,
+        SetGid,
+        SetEgid,
+        SetGroups,
+        Tcflush,
 
         /* the phase 3.3 step: the tty's write side, the identity pair and
          * the creation mask -- what an init and a shell lean on.  (The

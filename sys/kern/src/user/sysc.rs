@@ -824,12 +824,12 @@ pub fn sys_getppid() -> i64 {
 /// yet -- the fixed root identity every unix boots with, like the roadmap
 /// says (permission bits land with phase 3.5).
 pub fn sys_getuid() -> i64 {
-    0
+    crate::user::ident::sys_getuid()
 }
 
 /// `getgid()` (syscall 51): see `sys_getuid`.
 pub fn sys_getgid() -> i64 {
-    0
+    crate::user::ident::sys_getgid()
 }
 
 /// `umask(mask)` (syscall 52): exchange the file creation mask, answered

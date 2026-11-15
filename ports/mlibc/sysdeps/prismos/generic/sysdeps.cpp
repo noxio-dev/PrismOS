@@ -355,6 +355,90 @@ int Sysdeps<Isatty>::operator()(int fd) {
         return 0;
 }
 
+/* ttyname(): the kernel has no fd -> path call, so the name is found the
+ * way a minimal libc would: the fd's device number against the terminal
+ * nodes of /dev.  busybox's login / su / getty call it for the session
+ * line. */
+/* Phase 3.5 identity changes: the kernel's set*id family (syscalls 74..85).
+ * login drops root through setgroups + setgid + setuid; su and sudo-alikes
+ * use the effective-id pair. */
+int Sysdeps<SetUid>::operator()(uid_t uid) {
+        auto ret = sys(PRISM_SYS_SETUID, uid);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<SetEuid>::operator()(uid_t uid) {
+        /* seteuid(e) == setresuid(-1, e, -1). */
+        auto ret = sys(PRISM_SYS_SETRESUID, static_cast<uid_t>(-1), uid, static_cast<uid_t>(-1));
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<SetGid>::operator()(gid_t gid) {
+        auto ret = sys(PRISM_SYS_SETGID, gid);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<SetEgid>::operator()(gid_t gid) {
+        auto ret = sys(PRISM_SYS_SETRESGID, static_cast<gid_t>(-1), gid, static_cast<gid_t>(-1));
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<SetGroups>::operator()(size_t size, const gid_t *list) {
+        auto ret = sys(PRISM_SYS_SETGROUPS, size, list);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<Ttyname>::operator()(int fd, char *buf, size_t size) {
+        struct termios attrs;
+        if(auto r = sys(PRISM_SYS_IOCTL, fd, TCGETS, &attrs); sc_error(r))
+                return ENOTTY;
+        struct stat me;
+        if(int e = sysdep<Stat>(fsfd_target::fd, fd, nullptr, 0, &me); e)
+                return e;
+        static const char *const names[] = {
+                "/dev/tty0", "/dev/ttyS0", "/dev/tty1", "/dev/tty2", "/dev/tty3",
+                "/dev/tty4", "/dev/tty5", "/dev/tty6", "/dev/console"
+        };
+        for(const char *n : names) {
+                struct stat st;
+                if(sysdep<Stat>(fsfd_target::path, -1, n, 0, &st))
+                        continue;
+                if(st.st_rdev != me.st_rdev)
+                        continue;
+                size_t len = 0;
+                while(n[len])
+                        len++;
+                if(len + 1 > size)
+                        return ERANGE;
+                for(size_t i = 0; i <= len; i++)
+                        buf[i] = n[i];
+                return 0;
+        }
+        return ENODEV;
+}
+
+/* tcflush(): the kernel has no TCFLSH; the call is validated (it must be a
+ * terminal) and succeeds -- login's flush before the password prompt is
+ * a nicety, not a correctness need. */
+int Sysdeps<Tcflush>::operator()(int fd, int queue) {
+        if(queue < 0 || queue > 2)
+                return EINVAL;
+        struct termios attrs;
+        if(auto r = sys(PRISM_SYS_IOCTL, fd, TCGETS, &attrs); sc_error(r))
+                return ENOTTY;
+        return 0;
+}
+
 int Sysdeps<Tcgetattr>::operator()(int fd, struct termios *attr) {
         auto ret = sys(PRISM_SYS_IOCTL, fd, TCGETS, attr);
         if(int e = sc_error(ret); e)
@@ -523,11 +607,11 @@ static int access_check(const struct stat &st, int mode) {
 }
 
 int Sysdeps<Access>::operator()(const char *path, int mode) {
-        /* access() follows symlinks: stat(), not lstat(). */
-        struct stat st;
-        if(int e = sysdep<Stat>(fsfd_target::path, -1, path, 0, &st); e)
+        /* Phase 3.5: the kernel checks against the real ids (syscall 89). */
+        auto ret = sys(PRISM_SYS_ACCESS, path, mode);
+        if(int e = sc_error(ret); e)
                 return e;
-        return access_check(st, mode);
+        return 0;
 }
 
 int Sysdeps<Faccessat>::operator()(int dirfd, const char *path, int mode, int flags) {
@@ -537,13 +621,19 @@ int Sysdeps<Faccessat>::operator()(int dirfd, const char *path, int mode, int fl
          * value the Stat tag already knows. */
         if(dirfd != AT_FDCWD)
                 return ENOSYS;
-        if(flags & ~AT_SYMLINK_NOFOLLOW)
+        if(flags & ~(AT_SYMLINK_NOFOLLOW | AT_EACCESS))
                 return EINVAL;
-        struct stat st;
-        if(int e = sysdep<Stat>(fsfd_target::path, -1, path,
-                        flags & AT_SYMLINK_NOFOLLOW ? 0x100 : 0, &st); e)
+        if(flags & AT_SYMLINK_NOFOLLOW) {
+                /* The link itself: only its existence is checkable. */
+                struct stat st;
+                if(int e = sysdep<Stat>(fsfd_target::path, -1, path, 0x100, &st); e)
+                        return e;
+                return access_check(st, mode);
+        }
+        auto ret = sys(PRISM_SYS_ACCESS, path, mode);
+        if(int e = sc_error(ret); e)
                 return e;
-        return access_check(st, mode);
+        return 0;
 }
 
 int Sysdeps<OpenDir>::operator()(const char *path, int *handle) {
@@ -819,7 +909,7 @@ uid_t Sysdeps<GetUid>::operator()() {
 }
 
 uid_t Sysdeps<GetEuid>::operator()() {
-        return static_cast<uid_t>(sys(PRISM_SYS_GETUID));
+        return static_cast<uid_t>(sys(PRISM_SYS_GETEUID));
 }
 
 gid_t Sysdeps<GetGid>::operator()() {
@@ -827,22 +917,15 @@ gid_t Sysdeps<GetGid>::operator()() {
 }
 
 gid_t Sysdeps<GetEgid>::operator()() {
-        return static_cast<gid_t>(sys(PRISM_SYS_GETGID));
+        return static_cast<gid_t>(sys(PRISM_SYS_GETEGID));
 }
 
 int Sysdeps<GetGroups>::operator()(size_t size, gid_t *list, int *ret) {
-        /* One group identity per process (phase 3.4, busybox's `id`): the
-         * gid the kernel answers (syscall 51) is the whole supplementary
-         * set a single-user system has.  Answered in userspace -- there is
-         * no getgroups syscall to add for one number, and the count for a
-         * single group is exactly what `id` prints after the gid. */
-        gid_t gid = static_cast<gid_t>(sys(PRISM_SYS_GETGID));
-        if(size == 0) {
-                *ret = 1;
-                return 0;
-        }
-        list[0] = gid;
-        *ret = 1;
+        /* Phase 3.5: the kernel's supplementary group list (syscall 84). */
+        auto r = sys(PRISM_SYS_GETGROUPS, size, list);
+        if(int e = sc_error(r); e)
+                return e;
+        *ret = static_cast<int>(r);
         return 0;
 }
 

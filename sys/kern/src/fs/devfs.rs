@@ -41,6 +41,9 @@ pub const DEV_TTY: u32 = 4;
 pub const DEV_TTY0: u32 = 5;
 pub const DEV_FULL: u32 = 6;
 pub const DEV_TTYS0: u32 = 7;
+/// /dev/random and /dev/urandom (random.rs).
+pub const DEV_RANDOM: u32 = 9;
+pub const DEV_URANDOM: u32 = 10;
 /// /dev/dri/card0: the DRM device (drm/mod.rs).  Lives in the /dev/dri
 /// subdirectory, whose own inode is DRI_DIR_INO.
 pub const DEV_DRI_CARD0: u32 = 8;
@@ -65,7 +68,7 @@ const VT_NODES: [(&str, u32, u16); 6] = [
 const DRI_NODES: [(&str, u32, u16); 1] = [("card0", DEV_DRI_CARD0, 0o660)];
 
 /// Name and permission bits of each device node, in readdir order.
-const NODES: [(&str, u32, u16); 7] = [
+const NODES: [(&str, u32, u16); 9] = [
     ("console", DEV_CONSOLE, 0o620), // crw--w---- like every real unix
     ("null", DEV_NULL, 0o666),
     ("zero", DEV_ZERO, 0o666),
@@ -73,6 +76,8 @@ const NODES: [(&str, u32, u16); 7] = [
     ("tty0", DEV_TTY0, 0o620), // the console terminal, by its other name
     ("ttyS0", DEV_TTYS0, 0o620), // COM1, a queue of its own (phase 3.3.5)
     ("full", DEV_FULL, 0o666), // writes answer ENOSPC (phase 3.3)
+    ("random", DEV_RANDOM, 0o666),  // blocks until the CSPRNG is seeded (phase 3.5.2)
+    ("urandom", DEV_URANDOM, 0o666), // never blocks
 ];
 
 /// Inode of the /dev directory itself (devices start at 1).

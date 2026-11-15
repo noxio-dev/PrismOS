@@ -251,7 +251,7 @@ BUSYBOX_APPLETS := sh ash ls cat echo printf test [ mkdir rmdir rm cp mv ln \
                    touch chmod readlink pwd true false env sleep uname wc \
                    head tail id whoami basename dirname time ps mount \
                    umount df grep sed awk tar vi loadkmap dumpkmap kbd_mode showkey hostname \
-                   clear setsid cttyhack find
+                   clear setsid cttyhack find chown chgrp login su adduser addgroup
 
 # ---- mlibc toolchain + sysroot (phase 3.2, steps 3 + 4) ---------------------
 # ports/toolchain drives the phase's third and fourth steps: the
@@ -554,3 +554,7 @@ drmtest:
 	$(B)/drm_kms_host --test-threads=1
 	rustc --edition 2021 --test tests/input_vt_host.rs -o $(B)/input_vt_host
 	$(B)/input_vt_host --test-threads=1
+	rustc --edition 2021 --test tests/random_host.rs -o $(B)/random_host
+	$(B)/random_host --test-threads=1
+	rustc --edition 2021 --test tests/perm_host.rs -o $(B)/perm_host
+	$(B)/perm_host --test-threads=1

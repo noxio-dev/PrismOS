@@ -35,6 +35,7 @@ mod hw;
 mod input;
 mod lib;
 mod mem;
+mod random;
 mod shell;
 mod user;
 
@@ -269,6 +270,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         _ => {}
     }
     let clock_src = clock::init();
+    random::init(); // CSPRNG seed: RDSEED / RDRAND + TSC jitter (phase 3.5.2)
     if apic::init() {
         vprintln!(
             "apic     : lapic id {} at {:#x} ({}), 8259 masked, timer {} Hz ({} counts/ms via {})",
@@ -408,6 +410,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     // --- VFS / ext4 (phase 1.4) ---------------------------------------------
     fsys::init();
+    user::ident::init();
 
     // What /proc says about this boot (phase 3.3): the CPU probe and the
     // loader's command line (fsys recorded the root volume's name while

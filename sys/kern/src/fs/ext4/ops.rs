@@ -410,6 +410,21 @@ impl Ext4 {
         self.write_inode(&mut i)
     }
 
+    /// chown's payload (phase 3.5.3): the new owner and / or group (None
+    /// keeps the field), ctime refreshed.
+    pub(super) fn op_chown(&mut self, ino: u32, uid: Option<u32>, gid: Option<u32>) -> FsResult<()> {
+        self.check_rw()?;
+        let mut i = self.read_inode(ino)?;
+        if let Some(u) = uid {
+            i.set_uid(u);
+        }
+        if let Some(g) = gid {
+            i.set_gid(g);
+        }
+        i.set_ctime(now());
+        self.write_inode(&mut i)
+    }
+
     /// utimensat's payload (phase 3.4): the pair the syscall layer resolved
     /// (None = UTIME_OMIT, Some(second) = set).  The inode times are
     /// second-granular; ctime comes along, like every metadata change.

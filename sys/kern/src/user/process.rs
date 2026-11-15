@@ -225,6 +225,12 @@ pub struct Process {
     /// `fork` and `execve` (POSIX).  File creation through `open` keeps the
     /// VFS's fixed mode until chmod lands (roadmap 3.4.2).
     pub umask: u16,
+    /// Identity (phase 3.5.3): real/effective ids and supplementary groups,
+    /// plus the saved set-user/group ids.  Inherited by fork, changed by
+    /// set*id and by setuid/setgid binaries at execve.
+    pub cred: crate::fs::vfs::Cred,
+    pub suid: u32,
+    pub sgid: u32,
     /// Process group (phase 3.3.4): the processes a ^C or a SIGHUP is for
     /// as a group.  A fresh process starts as its own leader (pgid = pid);
     /// `fork` keeps the parent's group, `setsid` makes a new one.
@@ -562,6 +568,9 @@ fn spawn_common(
         argv: Vec::new(),
         exe: String::new(),
         umask: 0o022,
+        cred: crate::fs::vfs::Cred::ROOT,
+        suid: 0,
+        sgid: 0,
         pgid: 0, // assigned with the pid below: a fresh process leads its own
         sid: 0,
         ctty: 0,
@@ -726,6 +735,7 @@ pub fn fork_current(frame: &IsrFrame) -> i64 {
     // The child keeps the caller's command line, binary path and umask
     // (phase 3.3): /proc must show what the process tree is.
     let (argv, exe, umask) = (cur.argv.clone(), cur.exe.clone(), cur.umask);
+    let (cred, suid, sgid) = (cur.cred, cur.suid, cur.sgid);
     // And its session / process group / controlling terminal (phase 3.3.4):
     // a forked child joins nothing, it is born where the parent is.
     let (pgid, sid, ctty) = (cur.pgid, cur.sid, cur.ctty);
@@ -775,6 +785,9 @@ pub fn fork_current(frame: &IsrFrame) -> i64 {
                 c.argv = argv;
                 c.exe = exe;
                 c.umask = umask;
+                c.cred = cred;
+                c.suid = suid;
+                c.sgid = sgid;
                 c.pgid = pgid;
                 c.sid = sid;
                 c.ctty = ctty;

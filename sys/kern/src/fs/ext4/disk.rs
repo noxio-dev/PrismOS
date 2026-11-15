@@ -186,6 +186,15 @@ impl Inode {
     pub fn gid(&self) -> u32 {
         le16(&self.raw, 0x18) as u32 | (le16(&self.raw, 0x7A) as u32) << 16
     }
+    /// Owner / group (the 16-bit low halves plus the high halves at 0x78 / 0x7A).
+    pub fn set_uid(&mut self, u: u32) {
+        put16(&mut self.raw, 2, u as u16);
+        put16(&mut self.raw, 0x78, (u >> 16) as u16);
+    }
+    pub fn set_gid(&mut self, g: u32) {
+        put16(&mut self.raw, 0x18, g as u16);
+        put16(&mut self.raw, 0x7A, (g >> 16) as u16);
+    }
     pub fn size(&self) -> u64 {
         le32(&self.raw, 4) as u64 | (le32(&self.raw, 0x6C) as u64) << 32
     }

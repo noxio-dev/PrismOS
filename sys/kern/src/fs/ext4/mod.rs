@@ -1061,6 +1061,13 @@ impl FileSystem for Ext4 {
         self.finish(r)
     }
 
+    /// chown(2) / chgrp: the inode's owner / group fields, through the journal.
+    fn chown(&mut self, ino: u64, uid: Option<u32>, gid: Option<u32>) -> FsResult<()> {
+        self.begin_op();
+        let r = self.op_chown(ino32(ino)?, uid, gid);
+        self.finish(r)
+    }
+
     /// utimensat's payload (phase 3.4): atime / mtime by inode, ctime
     /// refreshed, the inode written back through the journal like every
     /// metadata change.

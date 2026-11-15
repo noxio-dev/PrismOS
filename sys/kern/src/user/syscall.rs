@@ -57,6 +57,9 @@
 //
 // Phase 3.3.4 (sessions and process groups):
 //    58 lstat(path, buf)            stat that does not follow the final link
+//    73 getrandom(buf, len, flags)
+//    74..89 identities: set[ug]id, get[eg]id, set/getres[ug]id, set/getgroups,
+//           chown / fchown / lchown, access (user/ident.rs, phase 3.5.3)
 //    59 setsid()                    60 setpgid(pid, pgid)   61 getpgid(pid)
 //    (a negative kill pid names a group; TIOCSCTTY claims a terminal)
 //
@@ -115,6 +118,7 @@ use crate::user::elf;
 use crate::user::fd;
 use crate::user::futex;
 use crate::user::process;
+use crate::user::ident;
 use crate::user::signal;
 use crate::user::sysc;
 use crate::user::usermode::{EFAULT, ENOSYS};
@@ -207,12 +211,17 @@ fn sys_execve(frame: &mut IsrFrame, path_p: u64, argv_p: u64, envp_p: u64) -> i6
         // /proc's view of the new image (phase 3.3), taken now: the flat
         // command line it was started with.
         let flat = process::argv_flat(&argv);
+        // Phase 3.5.4: the effective ids must be allowed to execute it.
+        let est = match crate::fs::fsys::vfs().exec_check(&abs) {
+            Ok(st) => st,
+            Err(e) => return -crate::user::fd::fs_errno(e),
+        };
         match elf::load_path(&abs, &argv, &envp) {
-            Ok(l) => (l, abs, flat),
+            Ok(l) => (l, abs, flat, est),
             Err(e) => return -e.errno(),
         }
     };
-    let (new, abs, flat) = loaded;
+    let (new, abs, flat, est) = loaded;
     // Point of no return: swap the address space (the new tables go live
     // before the old ones are freed), rename the process, restart in ring 3.
     let old = cur.aspace.replace(new.aspace);
@@ -225,6 +234,20 @@ fn sys_execve(frame: &mut IsrFrame, path_p: u64, argv_p: u64, envp_p: u64) -> i6
     // started with and the binary it became.
     cur.argv = flat;
     cur.exe = abs.clone();
+    // setuid / setgid binaries (phase 3.5.4): the effective id becomes the
+    // file's owner, the saved id follows; everything else stays.
+    if est.mode & 0o4000 != 0 {
+        cur.cred.euid = est.uid;
+        cur.suid = est.uid;
+    } else {
+        cur.suid = cur.cred.euid;
+    }
+    if est.mode & 0o2000 != 0 && est.mode & 0o010 != 0 {
+        cur.cred.egid = est.gid;
+        cur.sgid = est.gid;
+    } else {
+        cur.sgid = cur.cred.egid;
+    }
     cur.fpu.reset();
     cur.signals.exec_reset(); // POSIX: caught -> default, SIG_IGN kept, mask kept
     cur.brk_base = new.image_end; // the new image's heap bounds (3.1)
@@ -354,6 +377,24 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         70 => process::sys_setitimer(a0, a1, a2),
         71 => process::sys_getitimer(a0, a1),
         72 => signal::sys_sigtimedwait(a0, a1, a2, frame.r10),
+        73 => fd::sys_getrandom(a0, a1, a2),
+        // ---- phase 3.5.3: identities, ownership, access -----------------
+        74 => ident::sys_setuid(a0),
+        75 => ident::sys_setgid(a0),
+        76 => ident::sys_geteuid(),
+        77 => ident::sys_getegid(),
+        78 => ident::sys_setreuid(a0, a1),
+        79 => ident::sys_setregid(a0, a1),
+        80 => ident::sys_setresuid(a0, a1, a2),
+        81 => ident::sys_setresgid(a0, a1, a2),
+        82 => ident::sys_getresuid(a0, a1, a2),
+        83 => ident::sys_getresgid(a0, a1, a2),
+        84 => ident::sys_getgroups(a0, a1),
+        85 => ident::sys_setgroups(a0, a1),
+        86 => ident::sys_chown(a0, a1, a2),
+        87 => ident::sys_fchown(a0, a1, a2),
+        88 => ident::sys_lchown(a0, a1, a2),
+        89 => ident::sys_access(a0, a1),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

@@ -77,8 +77,8 @@ use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 
 use crate::fs::devfs::{
-    DEV_CONSOLE, DEV_DRI_CARD0, DEV_EVENT0, DEV_FULL, DEV_NULL, DEV_TTY, DEV_TTY0, DEV_TTY1, DEV_TTYS0, DEV_ZERO,
-    N_EVENT_NODES, N_VT_NODES,
+    DEV_CONSOLE, DEV_DRI_CARD0, DEV_EVENT0, DEV_FULL, DEV_NULL, DEV_RANDOM, DEV_TTY, DEV_TTY0, DEV_TTY1, DEV_TTYS0,
+    DEV_URANDOM, DEV_ZERO, N_EVENT_NODES, N_VT_NODES,
 };
 use crate::fs::vfs::{
     DirEntry, FsError, FileType, O_APPEND, O_CLOEXEC, O_CREATE, O_EXCL, O_NONBLOCK, O_READ,
@@ -149,6 +149,8 @@ pub(crate) fn fs_errno(e: FsError) -> i64 {
         FsError::CrossDevice => EXDEV,
         FsError::TooManyLinks => EMLINK,
         FsError::Invalid => EINVAL,
+        FsError::Access => 13,       // EACCES
+        FsError::NotPermitted => 1,  // EPERM
         FsError::Unsupported => ENOSYS, // no better code for "not here"
         _ => EIO,
     }
@@ -157,7 +159,7 @@ pub(crate) fn fs_errno(e: FsError) -> i64 {
 // ------------------------------------------------------- open file tables
 
 /// What one description is connected to (see the header).
-enum Kind {
+pub(crate) enum Kind {
     Vfs(usize),
     /// /dev/console: the kernel console -- writes mirror to the text
     /// screen *and* the serial line, like the kernel's own messages.
@@ -172,6 +174,9 @@ enum Kind {
     DevNull,
     DevZero,
     DevFull,
+    /// /dev/random (true: waits for the CSPRNG to be seeded) and /dev/urandom
+    /// (false: never waits) -- random.rs.
+    DevRandom(bool),
     /// /dev/dri/card0: one open of the DRM device (drm/mod.rs).
     Drm(Rc<crate::drm::DrmFile>),
     /// /dev/ttyN (N = 1..6): a virtual terminal -- the console line
@@ -320,6 +325,8 @@ impl FdTable {
                     Kind::DevNull => String::from("/dev/null"),
                     Kind::DevZero => String::from("/dev/zero"),
                     Kind::DevFull => String::from("/dev/full"),
+                    Kind::DevRandom(true) => String::from("/dev/random"),
+                    Kind::DevRandom(false) => String::from("/dev/urandom"),
                     Kind::Drm(_) => String::from("/dev/dri/card0"),
                     Kind::Vt(h) => alloc::format!("/dev/tty{}", h.num()),
                     Kind::Evdev(e) => alloc::format!("/dev/input/event{}", e.dev()),
@@ -447,7 +454,7 @@ pub fn drm_file_of(fd: usize) -> Option<Rc<crate::drm::DrmFile>> {
 /// Read the NUL-terminated string at user address `ptr` and make it the
 /// absolute path the *process* sees (its own cwd, phase 3.1).  Shared by
 /// every path-taking syscall of this file.
-fn user_path(ptr: u64) -> Result<String, i64> {
+pub(crate) fn user_path(ptr: u64) -> Result<String, i64> {
     let got: Result<String, i64> = {
         let Some(cur) = process::current() else { return Err(-EFAULT) };
         let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return Err(-EFAULT) };
@@ -522,6 +529,7 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> i64 {
         Kind::Serial => read_tty(tty::Term::Serial, &desc, buf, len),
         Kind::DevNull => 0, // EOF: the buffer is not even looked at
         Kind::DevZero | Kind::DevFull => read_zero(buf, len),
+        Kind::DevRandom(blocking) => read_random(*blocking, desc.flags() & O_NONBLOCK != 0, buf, len),
         Kind::Drm(f) => crate::drm::read(f, buf, len, desc.flags() & O_NONBLOCK != 0),
         Kind::Evdev(f) => crate::input::read(f, buf, len, desc.flags() & O_NONBLOCK != 0),
         Kind::PipeRead(p) => read_pipe(p, &desc, buf, len),
@@ -545,6 +553,94 @@ fn read_vfs(slot: usize, buf: u64, len: usize) -> i64 {
         done += got;
     }
     done as i64
+}
+
+/// Wait until the CSPRNG is seeded (what getrandom(2) and /dev/random do
+/// before the first 128 bits of entropy).  0 once seeded, -EAGAIN for a
+/// non-blocking caller, -EINTR on a signal.
+fn wait_seeded(nonblock: bool) -> i64 {
+    while !crate::random::is_seeded() {
+        if nonblock {
+            return -EAGAIN;
+        }
+        if crate::user::signal::interrupt_pending() {
+            return -EINTR;
+        }
+        crate::user::process::sleep_current(10);
+    }
+    0
+}
+
+/// Fill the caller's buffer from the CSPRNG, in bounded chunks.
+fn fill_random(buf: u64, len: usize) -> i64 {
+    let mut chunk = [0u8; CHUNK];
+    let mut done = 0usize;
+    while done < len {
+        let n = (len - done).min(CHUNK);
+        crate::random::fill(&mut chunk[..n]);
+        if !copy_out(buf, done, &chunk[..n]) {
+            return if done > 0 { done as i64 } else { -EFAULT };
+        }
+        done += n;
+    }
+    for b in chunk.iter_mut() {
+        // SAFETY: wipe the scratch copy of the random bytes.
+        unsafe { core::ptr::write_volatile(b, 0) };
+    }
+    done as i64
+}
+
+fn read_random(blocking: bool, nonblock: bool, buf: u64, len: usize) -> i64 {
+    if blocking {
+        let r = wait_seeded(nonblock);
+        if r < 0 {
+            return r;
+        }
+    }
+    fill_random(buf, len)
+}
+
+/// A write to /dev/random stirs the bytes into the pool (no credit).
+fn write_random(buf: u64, len: usize) -> i64 {
+    let mut chunk = [0u8; CHUNK];
+    let mut done = 0usize;
+    while done < len {
+        let n = (len - done).min(CHUNK);
+        if !copy_in(buf, done, &mut chunk[..n]) {
+            return if done > 0 { done as i64 } else { -EFAULT };
+        }
+        crate::random::add_bytes(&chunk[..n]);
+        done += n;
+    }
+    done as i64
+}
+
+/// `getrandom(buf, len, flags)` (syscall 73): Linux's flags -- GRND_NONBLOCK
+/// (1), GRND_RANDOM (2, same pool here), GRND_INSECURE (4: do not wait for
+/// the seed).  Blocks until the generator is seeded unless told not to;
+/// returns the bytes written (at most 256 per call, like a /dev/random read
+/// on Linux, for GRND_RANDOM; 32 MiB otherwise).
+pub fn sys_getrandom(buf: u64, len: u64, flags: u64) -> i64 {
+    use crate::random::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM};
+    if flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0 {
+        return -EINVAL;
+    }
+    // INSECURE and RANDOM contradict each other.
+    if flags & GRND_INSECURE != 0 && flags & GRND_RANDOM != 0 {
+        return -EINVAL;
+    }
+    let cap: u64 = if flags & GRND_RANDOM != 0 { 256 } else { 32 << 20 };
+    let n = len.min(cap) as usize;
+    if n == 0 {
+        return 0;
+    }
+    if flags & GRND_INSECURE == 0 {
+        let r = wait_seeded(flags & GRND_NONBLOCK != 0);
+        if r < 0 {
+            return r;
+        }
+    }
+    fill_random(buf, n)
 }
 
 fn read_zero(buf: u64, len: usize) -> i64 {
@@ -712,6 +808,7 @@ pub fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
         // The sinks still validate the buffer (an unreadable pointer is
         // -EFAULT, like on any unix) before reporting success.
         Kind::DevNull | Kind::DevZero => write_sink(buf, len),
+        Kind::DevRandom(_) => write_random(buf, len),
         // A DRM fd has no write(): commands go through ioctl (Linux: EINVAL).
         Kind::Drm(_) => -EINVAL,
         Kind::Evdev(f) => crate::input::write(f, buf, len),
@@ -887,6 +984,8 @@ pub fn sys_open(path_p: u64, flags: u64) -> i64 {
         Ok(p) => p,
         Err(e) => return e,
     };
+    let mask = process::current().map_or(0o022, |p| p.umask);
+    crate::fs::fsys::vfs().create_mode = 0o666 & !mask;
     let opened = match crate::fs::fsys::vfs().open_desc(&abs, flagbits) {
         Ok(o) => o,
         Err(e) => return -fs_errno(e),
@@ -931,6 +1030,8 @@ pub fn sys_open(path_p: u64, flags: u64) -> i64 {
             }
             DEV_NULL => Kind::DevNull,
             DEV_ZERO => Kind::DevZero,
+            DEV_RANDOM => Kind::DevRandom(true),
+            DEV_URANDOM => Kind::DevRandom(false),
             DEV_FULL => Kind::DevFull,
             // /dev/dri/card0: first opener becomes DRM master.
             DEV_DRI_CARD0 => match crate::drm::open() {
@@ -1077,7 +1178,7 @@ pub const STAT_SIZE: usize = 144;
 
 /// Serialize one VFS `Stat` (plus a device number for the pipe / device
 /// fstat synthetics) into the user layout at `buf`.
-fn put_stat(buf: u64, ino: u64, mode_perm: u16, ftype: &FileType, size: u64, nlink: u32, rdev: u64, blocks: u64, times: (u32, u32, u32)) -> bool {
+fn put_stat(buf: u64, ino: u64, mode_perm: u16, owner: (u32, u32), ftype: &FileType, size: u64, nlink: u32, rdev: u64, blocks: u64, times: (u32, u32, u32)) -> bool {
     let ifmt: u32 = match ftype {
         FileType::Regular => 0o100000,
         FileType::Dir => 0o040000,
@@ -1091,8 +1192,8 @@ fn put_stat(buf: u64, ino: u64, mode_perm: u16, ftype: &FileType, size: u64, nli
     push(0);                       // st_dev
     push(ino);                     // st_ino
     push(nlink as u64);            // st_nlink
-    push(mode as u64);             // st_mode (u32) + st_uid (u32)
-    push(0);                       // st_gid + __pad0
+    push(mode as u64 | ((owner.0 as u64) << 32)); // st_mode (u32) + st_uid (u32)
+    push(owner.1 as u64);          // st_gid + __pad0
     push(rdev);                    // st_rdev
     push(size);                    // st_size
     push(4096);                    // st_blksize
@@ -1121,7 +1222,7 @@ pub fn sys_stat(path_p: u64, buf: u64) -> i64 {
     match crate::fs::fsys::vfs().stat(&abs) {
         Ok(st) => {
             let times = (st.atime, st.mtime, st.ctime);
-            if put_stat(buf, st.ino, st.mode, &st.ftype, st.size, st.nlink, dev_rdev(&st.ftype), st.blocks, times) {
+            if put_stat(buf, st.ino, st.mode, (st.uid, st.gid), &st.ftype, st.size, st.nlink, dev_rdev(&st.ftype), st.blocks, times) {
                 0
             } else {
                 -EFAULT
@@ -1143,7 +1244,7 @@ pub fn sys_lstat(path_p: u64, buf: u64) -> i64 {
     match crate::fs::fsys::vfs().lstat(&abs) {
         Ok(st) => {
             let times = (st.atime, st.mtime, st.ctime);
-            if put_stat(buf, st.ino, st.mode, &st.ftype, st.size, st.nlink, dev_rdev(&st.ftype), st.blocks, times) {
+            if put_stat(buf, st.ino, st.mode, (st.uid, st.gid), &st.ftype, st.size, st.nlink, dev_rdev(&st.ftype), st.blocks, times) {
                 0
             } else {
                 -EFAULT
@@ -1171,6 +1272,10 @@ fn rdev_of_id(id: u32) -> u64 {
         (4 << 8) | (id - DEV_TTY1 + 1) as u64
     } else if id == DEV_TTY0 {
         4 << 8
+    } else if id == DEV_RANDOM {
+        (1 << 8) | 8 // Linux: 1:8
+    } else if id == DEV_URANDOM {
+        (1 << 8) | 9 // Linux: 1:9
     } else if (DEV_EVENT0..DEV_EVENT0 + N_EVENT_NODES).contains(&id) {
         (13 << 8) | (64 + id - DEV_EVENT0) as u64
     } else {
@@ -1191,7 +1296,7 @@ pub fn sys_fstat(fd: u64, buf: u64) -> i64 {
         Kind::Vfs(slot) => match crate::fs::fsys::vfs().fstat(*slot) {
             Ok(st) => {
                 let times = (st.atime, st.mtime, st.ctime);
-                if put_stat(buf, st.ino, st.mode, &st.ftype, st.size, st.nlink, dev_rdev(&st.ftype), st.blocks, times) {
+                if put_stat(buf, st.ino, st.mode, (st.uid, st.gid), &st.ftype, st.size, st.nlink, dev_rdev(&st.ftype), st.blocks, times) {
                     0
                 } else {
                     -EFAULT
@@ -1205,13 +1310,15 @@ pub fn sys_fstat(fd: u64, buf: u64) -> i64 {
         Kind::DevNull => put_dev_stat(buf, DEV_NULL, 0o666),
         Kind::DevZero => put_dev_stat(buf, DEV_ZERO, 0o666),
         Kind::DevFull => put_dev_stat(buf, DEV_FULL, 0o666),
+        Kind::DevRandom(true) => put_dev_stat(buf, DEV_RANDOM, 0o666),
+        Kind::DevRandom(false) => put_dev_stat(buf, DEV_URANDOM, 0o666),
         Kind::Drm(_) => put_dev_stat(buf, DEV_DRI_CARD0, 0o660),
         Kind::Vt(h) => put_dev_stat(buf, DEV_TTY1 + h.num() as u32 - 1, 0o620),
         Kind::Evdev(e) => put_dev_stat(buf, DEV_EVENT0 + e.dev() as u32, 0o660),
         // A pipe end fstats as a fifo: no inode, no size (the buffered
         // byte count is a snapshot nobody promises).
         Kind::PipeRead(_) | Kind::PipeWrite(_) => {
-            if put_stat(buf, 0, 0o600, &FileType::Other, 0, 1, 0, 0, (0, 0, 0)) {
+            if put_stat(buf, 0, 0o600, (0, 0), &FileType::Other, 0, 1, 0, 0, (0, 0, 0)) {
                 0
             } else {
                 -EFAULT
@@ -1224,7 +1331,7 @@ fn put_dev_stat(buf: u64, id: u32, mode: u16) -> i64 {
     let now = crate::fs::vfs::now();
     let ftype = FileType::Dev(id);
     let rdev = rdev_of_id(id);
-    if put_stat(buf, id as u64, mode, &ftype, 0, 1, rdev, 0, (now, now, now)) {
+    if put_stat(buf, id as u64, mode, (0, 0), &ftype, 0, 1, rdev, 0, (now, now, now)) {
         0
     } else {
         -EFAULT
@@ -1755,7 +1862,7 @@ pub fn sys_readlink(path_p: u64, buf_p: u64, bufsz: u64) -> i64 {
 // and the fd bridges.
 
 /// The descriptor behind `fd`, or the errno answer for a bad number.
-fn desc_of_or_errno(fd: u64) -> Result<Rc<FileDesc>, i64> {
+pub(crate) fn desc_of_or_errno(fd: u64) -> Result<Rc<FileDesc>, i64> {
     let Some(cur) = process::current() else { return Err(-EFAULT) };
     match cur.fds.get(fd as usize) {
         Some(d) => Ok(d),
@@ -1833,6 +1940,17 @@ pub fn sys_fchmod(fd: u64, mode: u64) -> i64 {
         return -EINVAL;
     };
     crate::fs::fsys::vfs().chmod_fd(*slot, (mode & 0o7777) as u16).map_or_else(|e| -fs_errno(e), |_| 0)
+}
+
+/// `fchown(fd, uid, gid)` (syscall 87): chown through an open file.
+pub fn sys_fchown(fd: u64, uid: u64, gid: u64) -> i64 {
+    let desc = match desc_of_or_errno(fd) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    let Kind::Vfs(slot) = &desc.kind else { return -EINVAL };
+    let opt = |v: u64| if v as u32 == u32::MAX { None } else { Some(v as u32) };
+    crate::fs::fsys::vfs().chown_fd(*slot, opt(uid), opt(gid)).map_or_else(|e| -fs_errno(e), |_| 0)
 }
 
 /// `utimensat(dirfd, path, times, flags)` (syscall 68): set atime / mtime
@@ -2052,6 +2170,12 @@ fn desc_ready(desc: &Rc<FileDesc>) -> Ready {
         Kind::DevNull | Kind::DevZero | Kind::DevFull => {
             Ready { read: f & O_READ != 0, write: f & O_WRITE != 0, err: false, hup: false }
         }
+        Kind::DevRandom(blocking) => Ready {
+            read: f & O_READ != 0 && (!*blocking || crate::random::is_seeded()),
+            write: f & O_WRITE != 0,
+            err: false,
+            hup: false,
+        },
         // POLLIN = a flip / vblank event is due; the device is never writable.
         Kind::Drm(d) => Ready { read: crate::drm::readable(d), write: false, err: false, hup: false },
         Kind::Evdev(e) => Ready { read: crate::input::readable(e), write: f & O_WRITE != 0, err: false, hup: false },

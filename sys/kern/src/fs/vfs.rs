@@ -50,6 +50,10 @@ pub enum FsError {
     BadFd,
     CrossDevice,
     TooBig,
+    /// EACCES: the mode bits deny the access (phase 3.5.4).
+    Access,
+    /// EPERM: the operation needs ownership or root (chmod, chown...).
+    NotPermitted,
 }
 
 impl FsError {
@@ -73,6 +77,8 @@ impl FsError {
             FsError::BadFd => "bad file descriptor",
             FsError::CrossDevice => "cross-device link",
             FsError::TooBig => "file too large",
+            FsError::Access => "permission denied",
+            FsError::NotPermitted => "operation not permitted",
         }
     }
 }
@@ -87,6 +93,81 @@ impl From<BlkError> for FsError {
 }
 
 pub type FsResult<T> = Result<T, FsError>;
+
+// ------------------------------------------------- credentials (phase 3.5.4)
+
+/// Who is asking: the identity the permission checks run against.  The
+/// process layer installs a hook that answers for the current process; with
+/// no hook (early boot, kernel threads) every caller is root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cred {
+    /// Real ids (access(2) checks against these) and effective ids (everything else).
+    pub uid: u32,
+    pub euid: u32,
+    pub gid: u32,
+    pub egid: u32,
+    pub groups: [u32; MAX_GROUPS],
+    pub ngroups: u8,
+}
+
+pub const MAX_GROUPS: usize = 16;
+
+impl Cred {
+    pub const ROOT: Cred = Cred { uid: 0, euid: 0, gid: 0, egid: 0, groups: [0; MAX_GROUPS], ngroups: 0 };
+
+    pub fn in_group(&self, g: u32) -> bool {
+        g == self.egid || self.groups[..self.ngroups as usize].contains(&g)
+    }
+}
+
+static CRED_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the "who is the current process" source (user/process.rs).
+pub fn set_cred_hook(f: fn() -> Cred) {
+    CRED_HOOK.store(f as usize, Ordering::Relaxed);
+}
+
+/// The caller's credentials.
+pub fn cred() -> Cred {
+    let p = CRED_HOOK.load(Ordering::Relaxed);
+    if p == 0 {
+        return Cred::ROOT;
+    }
+    // SAFETY: only `set_cred_hook` writes this, always with a valid `fn() -> Cred`.
+    let f: fn() -> Cred = unsafe { core::mem::transmute::<usize, fn() -> Cred>(p) };
+    f()
+}
+
+pub const R_OK: u8 = 4;
+pub const W_OK: u8 = 2;
+pub const X_OK: u8 = 1;
+
+/// May `c` do `want` (a mask of R_OK / W_OK / X_OK) to the file `st`?  The
+/// owner class, else the group class, else "other" -- the first that
+/// matches decides, even when a later class would allow more.  Root passes
+/// everything except execute on a file with no execute bit at all.
+/// `real` selects the real ids (access(2)) instead of the effective ones.
+pub fn permits(st: &Stat, c: &Cred, want: u8, real: bool) -> bool {
+    let (uid, gid_ok) = if real {
+        (c.uid, st.gid == c.gid || c.groups[..c.ngroups as usize].contains(&st.gid))
+    } else {
+        (c.euid, c.in_group(st.gid))
+    };
+    if uid == 0 {
+        if want & X_OK != 0 && st.ftype != FileType::Dir && st.mode & 0o111 == 0 {
+            return false;
+        }
+        return true;
+    }
+    let bits = if st.uid == uid {
+        (st.mode >> 6) & 7
+    } else if gid_ok {
+        (st.mode >> 3) & 7
+    } else {
+        st.mode & 7
+    } as u8;
+    bits & want == want
+}
 
 // ------------------------------------------------------------------- clock
 
@@ -198,6 +279,11 @@ pub trait FileSystem {
         Err(FsError::ReadOnly)
     }
     fn chmod(&mut self, _ino: u64, _mode: u16) -> FsResult<()> {
+        Err(FsError::ReadOnly)
+    }
+    /// chown's payload (phase 3.5.3): set the owner and / or the group
+    /// (`None` keeps the field).
+    fn chown(&mut self, _ino: u64, _uid: Option<u32>, _gid: Option<u32>) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
     /// utimensat's payload (phase 3.4): set atime / mtime.  `None` keeps
@@ -331,11 +417,14 @@ pub struct Vfs {
     mounts: Vec<Mount>,
     files: Vec<Option<OpenFile>>,
     next_id: u32,
+    /// Mode a file created by `open(O_CREATE)` gets (the syscall carries no
+    /// mode: the process layer sets 0o666 & !umask before the call).
+    pub create_mode: u16,
 }
 
 impl Vfs {
     pub const fn new() -> Vfs {
-        Vfs { mounts: Vec::new(), files: Vec::new(), next_id: 1 }
+        Vfs { mounts: Vec::new(), files: Vec::new(), next_id: 1, create_mode: 0o644 }
     }
 
     // ------------------------------------------------------------- mounts
@@ -436,6 +525,8 @@ impl Vfs {
     fn walk(&mut self, path: &str, follow_last: bool) -> FsResult<(usize, u64)> {
         let mut path = String::from(path);
         let mut depth = 0u32;
+        let who = cred();
+        let root = who.euid == 0;
         'restart: loop {
             let mi = self.mount_for(&path).ok_or(FsError::NotFound)?;
             let mp = self.mounts[mi].path.clone();
@@ -449,6 +540,13 @@ impl Vfs {
                 }
                 let last = i + 1 == comps.len();
                 let fs = &mut self.mounts[mi].fs;
+                if !root {
+                    // Search permission on every directory we pass through.
+                    let ds = fs.stat(ino)?;
+                    if ds.ftype == FileType::Dir && !permits(&ds, &who, X_OK, false) {
+                        return Err(FsError::Access);
+                    }
+                }
                 let child = fs.lookup(ino, c)?;
                 let st = fs.stat(child)?;
                 if st.ftype == FileType::Symlink && (!last || follow_last) {
@@ -485,6 +583,50 @@ impl Vfs {
             return Err(FsError::NotDir);
         }
         Ok((mi, dir, leaf))
+    }
+
+    /// Write + search permission on directory `dir` (what creating or
+    /// removing an entry needs).
+    fn check_dir_write(&mut self, mi: usize, dir: u64) -> FsResult<()> {
+        let who = cred();
+        if who.euid == 0 {
+            return Ok(());
+        }
+        let st = self.mounts[mi].fs.stat(dir)?;
+        if permits(&st, &who, W_OK | X_OK, false) {
+            Ok(())
+        } else {
+            Err(FsError::Access)
+        }
+    }
+
+    /// The sticky-directory rule: in a directory with the sticky bit only
+    /// the directory's owner, the entry's owner or root may remove / rename
+    /// the entry.
+    fn check_sticky(&mut self, mi: usize, dir: u64, leaf: &str) -> FsResult<()> {
+        let who = cred();
+        if who.euid == 0 {
+            return Ok(());
+        }
+        let ds = self.mounts[mi].fs.stat(dir)?;
+        if ds.mode & 0o1000 == 0 || ds.uid == who.euid {
+            return Ok(());
+        }
+        let child = self.mounts[mi].fs.lookup(dir, leaf)?;
+        let cs = self.mounts[mi].fs.stat(child)?;
+        if cs.uid == who.euid {
+            Ok(())
+        } else {
+            Err(FsError::NotPermitted) // EPERM, like Linux
+        }
+    }
+
+    /// A freshly created object belongs to its creator (effective uid / gid).
+    fn own_new(&mut self, mi: usize, ino: u64) {
+        let who = cred();
+        if who.euid != 0 || who.egid != 0 {
+            let _ = self.mounts[mi].fs.chown(ino, Some(who.euid), Some(who.egid));
+        }
     }
 
     fn check_len(path: &str) -> FsResult<()> {
@@ -526,6 +668,13 @@ impl Vfs {
         Self::check_len(path)?;
         let p = normalize("/", path);
         let (mi, ino) = self.walk(&p, true)?;
+        let who = cred();
+        if who.euid != 0 {
+            let st = self.mounts[mi].fs.stat(ino)?;
+            if !permits(&st, &who, R_OK, false) {
+                return Err(FsError::Access);
+            }
+        }
         let mut v = self.mounts[mi].fs.readdir(ino)?;
         // A mount point always lists as a directory (what is mounted on it).
         for e in v.iter_mut() {
@@ -610,7 +759,10 @@ impl Vfs {
             return Err(FsError::Exists);
         }
         let (mi, dir, leaf) = self.walk_parent(&p)?;
-        self.mounts[mi].fs.create(dir, &leaf, mode).map(|_| ())
+        self.check_dir_write(mi, dir)?;
+        let ino = self.mounts[mi].fs.create(dir, &leaf, mode)?;
+        self.own_new(mi, ino);
+        Ok(())
     }
 
     pub fn mkdir(&mut self, path: &str, mode: u16) -> FsResult<()> {
@@ -619,7 +771,10 @@ impl Vfs {
             return Err(FsError::Exists);
         }
         let (mi, dir, leaf) = self.walk_parent(&p)?;
-        self.mounts[mi].fs.mkdir(dir, &leaf, mode).map(|_| ())
+        self.check_dir_write(mi, dir)?;
+        let ino = self.mounts[mi].fs.mkdir(dir, &leaf, mode)?;
+        self.own_new(mi, ino);
+        Ok(())
     }
 
     /// `mkdir -p`: create every missing component.
@@ -645,7 +800,10 @@ impl Vfs {
             return Err(FsError::Exists);
         }
         let (mi, dir, leaf) = self.walk_parent(&p)?;
-        self.mounts[mi].fs.symlink(dir, &leaf, target).map(|_| ())
+        self.check_dir_write(mi, dir)?;
+        let ino = self.mounts[mi].fs.symlink(dir, &leaf, target)?;
+        self.own_new(mi, ino);
+        Ok(())
     }
 
     /// Hard link `new` to the existing file `old`.
@@ -663,6 +821,7 @@ impl Vfs {
         if nmi != omi {
             return Err(FsError::CrossDevice);
         }
+        self.check_dir_write(nmi, dir)?;
         self.mounts[omi].fs.link(dir, &leaf, ino)
     }
 
@@ -672,6 +831,8 @@ impl Vfs {
             return Err(FsError::Busy);
         }
         let (mi, dir, leaf) = self.walk_parent(&p)?;
+        self.check_dir_write(mi, dir)?;
+        self.check_sticky(mi, dir, &leaf)?;
         self.mounts[mi].fs.unlink(dir, &leaf)
     }
 
@@ -681,6 +842,8 @@ impl Vfs {
             return Err(FsError::Busy);
         }
         let (mi, dir, leaf) = self.walk_parent(&p)?;
+        self.check_dir_write(mi, dir)?;
+        self.check_sticky(mi, dir, &leaf)?;
         self.mounts[mi].fs.rmdir(dir, &leaf)
     }
 
@@ -702,19 +865,139 @@ impl Vfs {
         if omi != nmi {
             return Err(FsError::CrossDevice);
         }
+        self.check_dir_write(omi, odir)?;
+        self.check_dir_write(nmi, ndir)?;
+        self.check_sticky(omi, odir, &oleaf)?;
         self.mounts[omi].fs.rename(odir, &oleaf, ndir, &nleaf)
     }
 
     pub fn truncate(&mut self, path: &str, size: u64) -> FsResult<()> {
         let p = normalize("/", path);
         let (mi, ino) = self.walk(&p, true)?;
+        let who = cred();
+        if who.euid != 0 {
+            let st = self.mounts[mi].fs.stat(ino)?;
+            if !permits(&st, &who, W_OK, false) {
+                return Err(FsError::Access);
+            }
+        }
         self.mounts[mi].fs.truncate(ino, size)
+    }
+
+    /// Only the owner (or root) may change a file's mode; a non-root caller
+    /// who is not in the file's group loses the setgid bit, like Linux.
+    fn chmod_checked(&mut self, mi: usize, ino: u64, mode: u16) -> FsResult<()> {
+        let who = cred();
+        let mut mode = mode & 0o7777;
+        if who.euid != 0 {
+            let st = self.mounts[mi].fs.stat(ino)?;
+            if st.uid != who.euid {
+                return Err(FsError::NotPermitted);
+            }
+            if !who.in_group(st.gid) {
+                mode &= !0o2000;
+            }
+        }
+        self.mounts[mi].fs.chmod(ino, mode)
     }
 
     pub fn chmod(&mut self, path: &str, mode: u16) -> FsResult<()> {
         let p = normalize("/", path);
         let (mi, ino) = self.walk(&p, true)?;
-        self.mounts[mi].fs.chmod(ino, mode)
+        self.chmod_checked(mi, ino, mode)
+    }
+
+    /// chown's rules: root may do anything; anyone else must own the file,
+    /// may not give it away (the uid stays or is their own), and may change
+    /// the group only to one they belong to.  A non-root change clears
+    /// setuid / setgid on a regular file.  `None` keeps the field (the
+    /// syscall's -1).
+    fn chown_checked(&mut self, mi: usize, ino: u64, uid: Option<u32>, gid: Option<u32>) -> FsResult<()> {
+        let who = cred();
+        let st = self.mounts[mi].fs.stat(ino)?;
+        if who.euid != 0 {
+            if st.uid != who.euid {
+                return Err(FsError::NotPermitted);
+            }
+            if let Some(u) = uid {
+                if u != st.uid {
+                    return Err(FsError::NotPermitted);
+                }
+            }
+            if let Some(g) = gid {
+                if g != st.gid && !who.in_group(g) {
+                    return Err(FsError::NotPermitted);
+                }
+            }
+        }
+        self.mounts[mi].fs.chown(ino, uid, gid)?;
+        if who.euid != 0 && st.ftype == FileType::Regular && st.mode & 0o6000 != 0 {
+            self.mounts[mi].fs.chmod(ino, st.mode & !0o6000)?;
+        }
+        Ok(())
+    }
+
+    /// chown(2) / lchown(2) by path (`follow` false = the link itself).
+    pub fn chown(&mut self, path: &str, follow: bool, uid: Option<u32>, gid: Option<u32>) -> FsResult<()> {
+        Self::check_len(path)?;
+        let p = normalize("/", path);
+        let (mi, ino) = self.walk(&p, follow)?;
+        self.chown_checked(mi, ino, uid, gid)
+    }
+
+    /// access(2): may the *real* ids do `mode` (R_OK / W_OK / X_OK, 0 = exists)?
+    pub fn access(&mut self, path: &str, mode: u8) -> FsResult<()> {
+        Self::check_len(path)?;
+        let p = normalize("/", path);
+        let (mi, ino) = self.walk(&p, true)?;
+        if mode == 0 {
+            return Ok(());
+        }
+        let st = self.mounts[mi].fs.stat(ino)?;
+        if mode & W_OK != 0
+            && self.mounts[mi].fs.read_only()
+            && matches!(st.ftype, FileType::Regular | FileType::Dir | FileType::Symlink)
+        {
+            return Err(FsError::ReadOnly);
+        }
+        if permits(&st, &cred(), mode, true) {
+            Ok(())
+        } else {
+            Err(FsError::Access)
+        }
+    }
+
+    /// execve's gate: a regular file the *effective* ids may execute.  The
+    /// returned Stat carries the setuid / setgid bits and the owner for the
+    /// caller to apply.
+    pub fn exec_check(&mut self, path: &str) -> FsResult<Stat> {
+        Self::check_len(path)?;
+        let p = normalize("/", path);
+        let (mi, ino) = self.walk(&p, true)?;
+        let st = self.mounts[mi].fs.stat(ino)?;
+        match st.ftype {
+            FileType::Dir => return Err(FsError::Access),
+            FileType::Regular => {}
+            _ => return Err(FsError::Access),
+        }
+        if !permits(&st, &cred(), X_OK, false) {
+            return Err(FsError::Access);
+        }
+        Ok(st)
+    }
+
+    /// Changing times needs ownership, or write access (the "set to now" case).
+    fn check_owner_or_write(&mut self, mi: usize, ino: u64) -> FsResult<()> {
+        let who = cred();
+        if who.euid == 0 {
+            return Ok(());
+        }
+        let st = self.mounts[mi].fs.stat(ino)?;
+        if st.uid == who.euid || permits(&st, &who, W_OK, false) {
+            Ok(())
+        } else {
+            Err(FsError::NotPermitted)
+        }
     }
 
     /// utimensat(2) by path (phase 3.4): `follow` is the AT_SYMLINK_NOFOLLOW
@@ -723,6 +1006,7 @@ impl Vfs {
         Self::check_len(path)?;
         let p = normalize("/", path);
         let (mi, ino) = self.walk(&p, follow)?;
+        self.check_owner_or_write(mi, ino)?;
         self.mounts[mi].fs.utimens(ino, atime, mtime)
     }
 
@@ -764,6 +1048,7 @@ impl Vfs {
             return Err(FsError::Invalid);
         }
         let p = normalize("/", path);
+        let mut created = false;
         let (mi, ino) = match self.walk(&p, true) {
             Ok(r) => {
                 if flags & O_CREATE != 0 && flags & O_EXCL != 0 {
@@ -773,12 +1058,32 @@ impl Vfs {
             }
             Err(FsError::NotFound) if flags & O_CREATE != 0 => {
                 let (mi, dir, leaf) = self.walk_parent(&p)?;
-                let ino = self.mounts[mi].fs.create(dir, &leaf, 0o644)?;
+                self.check_dir_write(mi, dir)?;
+                let ino = self.mounts[mi].fs.create(dir, &leaf, self.create_mode)?;
+                self.own_new(mi, ino);
+                created = true;
                 (mi, ino)
             }
             Err(e) => return Err(e),
         };
         let st = self.mounts[mi].fs.stat(ino)?;
+        // The mode bits against the effective ids (a file we just created
+        // is ours by construction, whatever its mode says).
+        if !created {
+            let who = cred();
+            if who.euid != 0 {
+                let mut want = 0;
+                if flags & O_READ != 0 {
+                    want |= R_OK;
+                }
+                if flags & O_WRITE != 0 {
+                    want |= W_OK;
+                }
+                if !permits(&st, &who, want, false) {
+                    return Err(FsError::Access);
+                }
+            }
+        }
         // A device node: no table slot, no I/O here -- the descriptor layer
         // turns the id into the device it serves.
         if let FileType::Dev(id) = st.ftype {
@@ -937,7 +1242,15 @@ impl Vfs {
         let f = self.file(fd)?;
         let (mid, ino) = (f.mount, f.ino);
         let mi = self.mount_index(mid)?;
-        self.mounts[mi].fs.chmod(ino, mode)
+        self.chmod_checked(mi, ino, mode)
+    }
+
+    /// fchown(2): the open file's own inode, the same rules as `chown`.
+    pub fn chown_fd(&mut self, fd: usize, uid: Option<u32>, gid: Option<u32>) -> FsResult<()> {
+        let f = self.file(fd)?;
+        let (mid, ino) = (f.mount, f.ino);
+        let mi = self.mount_index(mid)?;
+        self.chown_checked(mi, ino, uid, gid)
     }
 
     /// utimensat / futimens by descriptor (phase 3.4): the open file's
@@ -946,6 +1259,7 @@ impl Vfs {
         let f = self.file(fd)?;
         let (mid, ino) = (f.mount, f.ino);
         let mi = self.mount_index(mid)?;
+        self.check_owner_or_write(mi, ino)?;
         self.mounts[mi].fs.utimens(ino, atime, mtime)
     }
 

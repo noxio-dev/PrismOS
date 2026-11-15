@@ -63,6 +63,8 @@ struct Node {
     /// Permission bits only, like the rest of the kernel's stat.
     mode: u16,
     nlink: u32,
+    uid: u32,
+    gid: u32,
     atime: u32,
     mtime: u32,
     ctime: u32,
@@ -118,6 +120,8 @@ impl TmpFs {
             ftype: FileType::Dir,
             mode: 0o1777, // the classic /tmp: sticky, world-writable
             nlink: 2,
+            uid: 0,
+            gid: 0,
             atime: now,
             mtime: now,
             ctime: now,
@@ -175,7 +179,7 @@ impl TmpFs {
         let now = vfs::now();
         self.nodes.insert(
             ino,
-            Node { parent, ftype, mode: mode & 0o7777, nlink: 1, atime: now, mtime: now, ctime: now, payload },
+            Node { parent, ftype, mode: mode & 0o7777, nlink: 1, uid: 0, gid: 0, atime: now, mtime: now, ctime: now, payload },
         );
         Ok(ino)
     }
@@ -224,8 +228,8 @@ impl TmpFs {
             mode: n.mode,
             size,
             nlink: n.nlink,
-            uid: 0,
-            gid: 0,
+            uid: n.uid,
+            gid: n.gid,
             atime: n.atime,
             mtime: n.mtime,
             ctime: n.ctime,
@@ -566,6 +570,18 @@ impl FileSystem for TmpFs {
     fn chmod(&mut self, ino: u64, mode: u16) -> FsResult<()> {
         let n = self.node_mut(ino)?;
         n.mode = mode & 0o7777;
+        n.ctime = vfs::now();
+        Ok(())
+    }
+
+    fn chown(&mut self, ino: u64, uid: Option<u32>, gid: Option<u32>) -> FsResult<()> {
+        let n = self.node_mut(ino)?;
+        if let Some(u) = uid {
+            n.uid = u;
+        }
+        if let Some(g) = gid {
+            n.gid = g;
+        }
         n.ctime = vfs::now();
         Ok(())
     }

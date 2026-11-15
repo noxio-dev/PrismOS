@@ -35,6 +35,8 @@
 pub mod elf;
 pub mod fd;
 pub mod fpu;
+pub mod ident;
+pub mod ident_rules;
 pub mod futex;
 pub mod process;
 pub mod signal;

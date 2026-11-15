@@ -607,19 +607,10 @@ fn apply_relocs(aspace: &mut AddressSpace, dynseg: Seg, bias: u64) -> Result<(),
     Ok(())
 }
 
-/// A few pseudo-random bytes for AT_RANDOM (not cryptographic: there is no
-/// entropy source yet).
+/// The 16 bytes of AT_RANDOM (stack protector canary, malloc hardening):
+/// straight from the kernel CSPRNG (phase 3.5.2).
 fn random16() -> [u8; 16] {
-    // SAFETY: rdtsc is available on every x86-64 CPU.
-    let mut x = unsafe { core::arch::x86_64::_rdtsc() } ^ 0x9E37_79B9_7F4A_7C15;
-    let mut out = [0u8; 16];
-    for b in out.iter_mut() {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        *b = (x >> 24) as u8;
-    }
-    out
+    crate::random::bytes16()
 }
 
 /// Lay out strings, auxv, envp, argv and argc on the new stack and return the

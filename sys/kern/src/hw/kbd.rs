@@ -941,6 +941,7 @@ fn status_snapshot() -> Status {
 /// thanks to the AUX bit) and queue the decoded characters.
 pub fn on_irq() {
     IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+    crate::random::irq_event(1);
     // Bounded: broken hardware cannot wedge us inside one interrupt.
     for _ in 0..64 {
         let st = status();
