@@ -161,7 +161,10 @@ pub fn sys_mmap(a: [u64; 6]) -> i64 {
     if len == 0 {
         return -EINVAL;
     }
-    if len > MAX_MAP {
+    // A DRM buffer (a dumb buffer can be 64 MiB) is not bound by the file /
+    // anonymous cap: it is bounded by the object itself, checked below.
+    let drm_file = if flags & MAP_ANONYMOUS == 0 { crate::user::fd::drm_file_of(fd as usize) } else { None };
+    if len > MAX_MAP && drm_file.is_none() {
         return -ENOMEM;
     }
     if flags & !MAP_KNOWN != 0 {
@@ -183,6 +186,9 @@ pub fn sys_mmap(a: [u64; 6]) -> i64 {
     }
     let w = prot & PROT_WRITE != 0;
     let x = prot & PROT_EXEC != 0;
+    if let Some(f) = drm_file {
+        return mmap_drm(&f, addr, len, w, flags, off);
+    }
     // The loader's reservation idiom: anonymous PROT_NONE, pages mapped
     // present but supervisor-only (vmm.rs -- any user access SIGSEGVs,
     // `mprotect` can upgrade them, `mmap` MAP_FIXED over them replaces them).
@@ -298,6 +304,75 @@ pub fn sys_mmap(a: [u64; 6]) -> i64 {
                 return -EFAULT;
             }
             pos += got as u64;
+        }
+    }
+    start as i64
+}
+
+/// `mmap` of a DRM fd: map the pages of a GEM object (found through the fake
+/// offset `DRM_IOCTL_MODE_MAP_DUMB` returned) into the caller, MAP_SHARED.
+///
+/// Every page gets one more `cow` reference (the object keeps its own), and
+/// is mapped with the SHARED PTE bit so `fork` neither COWs nor copies it:
+/// parent and child keep drawing into the same buffer.  `munmap` and exit
+/// release the references through the ordinary path; a buffer closed while
+/// still mapped lives until the last unmap.
+fn mmap_drm(file: &alloc::rc::Rc<crate::drm::DrmFile>, addr: u64, len: u64, w: bool, flags: u64, off: u64) -> i64 {
+    // Linux's GEM mmap needs a shared mapping, never executable (the W^X
+    // check above already refused W+X; refuse X alone for device memory).
+    if flags & MAP_SHARED == 0 || off & (PAGE - 1) != 0 {
+        return -EINVAL;
+    }
+    let len = page_up(len);
+    let Some((gem, inner)) = crate::drm::mmap_lookup(file, off) else { return -EINVAL };
+    if inner as u64 + len > (gem.page_count() as u64) * PAGE {
+        return -EINVAL; // beyond the end of the object
+    }
+    let Some(cur) = process::current() else { return -EFAULT };
+    let Some(aspace) = cur.aspace.as_mut() else { return -EFAULT };
+    let start = if flags & MAP_FIXED != 0 {
+        if addr & (PAGE - 1) != 0 {
+            return -EINVAL;
+        }
+        // SAFETY: syscall context, our CR3 is live.
+        unsafe { aspace.unmap(addr, len) };
+        addr
+    } else {
+        let mut v = vmm::USER_MMAP_BASE;
+        loop {
+            if v + len > MMAP_LIMIT {
+                return -ENOMEM;
+            }
+            if aspace.range_free(v, len) {
+                break;
+            }
+            v += PAGE;
+        }
+        v
+    };
+    if start & (PAGE - 1) != 0 || start < vmm::USER_BASE || start + len > MMAP_LIMIT {
+        return -ENOMEM;
+    }
+    let sig_lo = vmm::USER_SIGCODE & !(PAGE - 1);
+    if start < sig_lo + PAGE && start + len > sig_lo {
+        return -ENOMEM;
+    }
+    let first = inner / PAGE as usize;
+    let n = (len / PAGE) as usize;
+    for i in 0..n {
+        let Some(phys) = gem.page_phys(first + i) else {
+            // SAFETY: syscall context, our CR3 is live.
+            unsafe { aspace.unmap(start, len) };
+            return -EINVAL;
+        };
+        if !crate::mem::cow::track(phys) {
+            unsafe { aspace.unmap(start, len) };
+            return -ENOMEM;
+        }
+        if !aspace.map_page_shared(start + i as u64 * PAGE, phys, w) {
+            let _ = crate::mem::cow::release(phys); // this page never got mapped
+            unsafe { aspace.unmap(start, len) };
+            return -ENOMEM;
         }
     }
     start as i64

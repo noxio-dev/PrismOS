@@ -88,6 +88,11 @@ const NX: u64 = 1 << 63;
 /// raises #PF; the handler (below) resolves it by copying (or re-arming RW
 /// when the page has become exclusively owned again).
 const COW: u64 = 1 << 9;
+/// Software-available PTE bit 10: a shared device / GEM page (a DRM buffer
+/// mapped MAP_SHARED).  `fork` shares such a page as is -- both sides keep
+/// RW, no COW -- because parent and child must keep seeing the same pixels
+/// (Xorg forks xkbcomp *after* mapping its framebuffer).
+const SHARED: u64 = 1 << 10;
 
 /// PML4 slots (0..256) the kernel owns in every address space.  Filled once
 /// at the end of `init` so user spaces share them and never reuse them.
@@ -797,6 +802,17 @@ impl AddressSpace {
     /// `x`: executable.  Fails if `virt` is outside user space, unaligned, in
     /// a kernel-owned slot, already mapped, or out of memory.
     pub fn map_page(&mut self, virt: u64, phys: u64, w: bool, x: bool) -> bool {
+        self.map_page_flags(virt, phys, w, x, 0)
+    }
+
+    /// Map a frame that something else owns (a GEM object) as a shared,
+    /// non-COW page: the caller has already `cow::track`ed the frame, and
+    /// `unmap` / address-space teardown drop that reference again.
+    pub fn map_page_shared(&mut self, virt: u64, phys: u64, w: bool) -> bool {
+        self.map_page_flags(virt, phys, w, false, SHARED)
+    }
+
+    fn map_page_flags(&mut self, virt: u64, phys: u64, w: bool, x: bool, extra: u64) -> bool {
         if virt & (PAGE - 1) != 0 || phys & (PAGE - 1) != 0 || !user_range_ok(virt, PAGE as usize) {
             return false;
         }
@@ -815,7 +831,7 @@ impl AddressSpace {
             if tr_live(pt, i1) & P != 0 {
                 return false;
             }
-            let mut f = P | US;
+            let mut f = P | US | extra;
             if w {
                 f |= RW;
             }
@@ -1338,7 +1354,11 @@ unsafe fn fork_tree(src: u64, dst: u64, level: u32) -> bool {
             if !crate::mem::cow::track(phys) {
                 return false; // out of kernel heap: abort, self-heals
             }
-            if e & RW != 0 {
+            if e & SHARED != 0 {
+                // A shared device page: stays shared and writable on both
+                // sides; the refcount above keeps the frame alive.
+                tw_live(dst, i, e);
+            } else if e & RW != 0 {
                 // Writable data page: read-only + COW on both sides, the
                 // first writer pays for the copy.
                 tw_live(src, i, (e & !RW) | COW);

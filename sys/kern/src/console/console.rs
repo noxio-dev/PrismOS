@@ -476,6 +476,24 @@ pub fn home() {
     }
 }
 
+/// The framebuffer console double-buffers (DRM needs that: it borrows the
+/// screen without losing what the console drew).
+pub fn is_buffered() -> bool {
+    // SAFETY: read-only access to the console configuration.
+    let con = unsafe { &*addr_of_mut!(CONSOLE) };
+    con.fb.as_ref().map_or(false, |f| f.is_buffered())
+}
+
+/// Redraw the text console in full -- the screen comes back from DRM.
+pub fn repaint() {
+    let _guard = crate::arch::io::IrqGuard::new();
+    // SAFETY: single CPU, guarded against IRQ-context prints.
+    let c = unsafe { &mut *addr_of_mut!(CONSOLE) };
+    if let Some(f) = c.fb.as_mut() {
+        f.repaint();
+    }
+}
+
 /// Switch the framebuffer console to a RAM back buffer.  Needs the PMM and
 /// the live page tables, so call it right after `vmm::init`.  Returns true
 /// when the back buffer is active (false: no framebuffer, or no memory --

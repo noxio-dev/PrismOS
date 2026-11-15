@@ -96,6 +96,17 @@ impl FbConsole {
     }
 
     /// Make everything printed so far visible, then the cursor on top.
+    /// Repaint everything from the back buffer (the screen was borrowed by a
+    /// DRM client and is ours again).
+    pub fn repaint(&mut self) {
+        self.surf.mark_all();
+        self.flush();
+    }
+
+    pub fn is_buffered(&self) -> bool {
+        self.surf.is_buffered()
+    }
+
     pub fn flush(&mut self) {
         self.surf.present(); // also takes the previous cursor off the screen
         if self.cursor_on {

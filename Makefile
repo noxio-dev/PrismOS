@@ -543,3 +543,12 @@ clean:
 keytest:
 	rustc --edition 2021 --test tests/keymap_host.rs -o $(B)/keymap_host
 	$(B)/keymap_host --test-threads=1
+
+# Host-side tests of the DRM/KMS ABI and driver (no QEMU needed).
+.PHONY: drmtest
+drmtest:
+	mkdir -p $(B)
+	rustc --edition 2021 --test tests/drm_host.rs -o $(B)/drm_host
+	$(B)/drm_host --test-threads=1
+	rustc --edition 2021 --test tests/drm_kms_host.rs -o $(B)/drm_kms_host
+	$(B)/drm_kms_host --test-threads=1

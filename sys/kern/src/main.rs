@@ -29,6 +29,7 @@ extern crate alloc;
 mod arch;
 mod boot;
 mod console;
+mod drm;
 mod fs;
 mod hw;
 mod lib;
@@ -209,6 +210,17 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         );
     } else {
         kprintln!("heap     : init failed (no memory for the region)");
+    }
+
+    // --- DRM / KMS on the firmware framebuffer ------------------------------
+    // Needs the heap (object tables) and the console's back buffer (the
+    // console keeps drawing there while a client owns the screen).
+    if bi.flags & boot::FLAG_FB != 0 && console::is_buffered() {
+        if drm::init(bi.fb) {
+            vprintln!("drm      : prismfb, {}x{} -> /dev/dri/card0", bi.fb.width, bi.fb.height);
+        } else {
+            vprintln!("drm      : framebuffer not drivable (need 32 bpp), no /dev/dri/card0");
+        }
     }
 
     // --- Ring 3 / processes (phase 2) ---------------------------------------

@@ -14,6 +14,7 @@
 //   /dev/null     reads are an immediate EOF, writes are swallowed
 //   /dev/zero     reads produce zeroes, writes are swallowed
 //   /dev/full     writes answer ENOSPC
+//   /dev/dri/card0  the DRM / KMS device (only when a framebuffer exists)
 //
 // It only provides the *namespace* half of a device: lookup / readdir /
 // stat answer with `FileType::Dev(id)` nodes (the inode number *is* the
@@ -38,6 +39,11 @@ pub const DEV_TTY: u32 = 4;
 pub const DEV_TTY0: u32 = 5;
 pub const DEV_FULL: u32 = 6;
 pub const DEV_TTYS0: u32 = 7;
+/// /dev/dri/card0: the DRM device (drm/mod.rs).  Lives in the /dev/dri
+/// subdirectory, whose own inode is DRI_DIR_INO.
+pub const DEV_DRI_CARD0: u32 = 8;
+const DRI_DIR_INO: u64 = 0x100;
+const DRI_NODES: [(&str, u32, u16); 1] = [("card0", DEV_DRI_CARD0, 0o660)];
 
 /// Name and permission bits of each device node, in readdir order.
 const NODES: [(&str, u32, u16); 7] = [
@@ -61,14 +67,14 @@ impl DevFs {
     }
 
     fn node(id: u32) -> Option<(&'static str, u16)> {
-        NODES.iter().find(|(_, n, _)| *n == id).map(|&(n, _, m)| (n, m))
+        NODES.iter().chain(DRI_NODES.iter()).find(|(_, n, _)| *n == id).map(|&(n, _, m)| (n, m))
     }
 
     fn stat_of(&mut self, ino: u64) -> Stat {
         let now = vfs::now();
-        if ino == ROOT_INO {
+        if ino == ROOT_INO || ino == DRI_DIR_INO {
             return Stat {
-                ino: ROOT_INO,
+                ino,
                 ftype: FileType::Dir,
                 mode: 0o755,
                 size: 0,
@@ -128,7 +134,7 @@ impl FileSystem for DevFs {
     }
 
     fn stat(&mut self, ino: u64) -> FsResult<Stat> {
-        if ino == ROOT_INO || Self::node(ino as u32).is_some() {
+        if ino == ROOT_INO || ino == DRI_DIR_INO || (ino < 0x100 && Self::node(ino as u32).is_some()) {
             Ok(self.stat_of(ino))
         } else {
             Err(FsError::NotFound)
@@ -136,8 +142,19 @@ impl FileSystem for DevFs {
     }
 
     fn lookup(&mut self, dir: u64, name: &str) -> FsResult<u64> {
+        if dir == DRI_DIR_INO {
+            for (n, id, _) in DRI_NODES {
+                if name == n {
+                    return Ok(id as u64);
+                }
+            }
+            return Err(FsError::NotFound);
+        }
         if dir != ROOT_INO {
             return Err(FsError::NotDir);
+        }
+        if name == "dri" && crate::drm::present() {
+            return Ok(DRI_DIR_INO);
         }
         for (n, id, _) in NODES {
             if name == n {
@@ -148,6 +165,15 @@ impl FileSystem for DevFs {
     }
 
     fn readdir(&mut self, dir: u64) -> FsResult<Vec<DirEntry>> {
+        if dir == DRI_DIR_INO {
+            let mut out = Vec::new();
+            out.push(DirEntry { ino: DRI_DIR_INO, ftype: FileType::Dir, name: String::from(".") });
+            out.push(DirEntry { ino: ROOT_INO, ftype: FileType::Dir, name: String::from("..") });
+            for (n, id, _) in DRI_NODES {
+                out.push(DirEntry { ino: id as u64, ftype: FileType::Dev(id), name: String::from(n) });
+            }
+            return Ok(out);
+        }
         if dir != ROOT_INO {
             return Err(FsError::NotDir);
         }
@@ -158,6 +184,9 @@ impl FileSystem for DevFs {
         out.push(DirEntry { ino: ROOT_INO, ftype: FileType::Dir, name: String::from("..") });
         for (n, id, _) in NODES {
             out.push(DirEntry { ino: id as u64, ftype: FileType::Dev(id), name: String::from(n) });
+        }
+        if crate::drm::present() {
+            out.push(DirEntry { ino: DRI_DIR_INO, ftype: FileType::Dir, name: String::from("dri") });
         }
         Ok(out)
     }

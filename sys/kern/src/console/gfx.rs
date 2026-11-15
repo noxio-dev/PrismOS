@@ -124,6 +124,11 @@ impl Surface {
         true
     }
 
+    /// Mark the whole screen dirty (a full repaint on the next `present`).
+    pub fn mark_all(&mut self) {
+        self.mark(0, 0, self.w, self.h);
+    }
+
     pub fn is_buffered(&self) -> bool {
         self.buffered
     }
@@ -195,7 +200,7 @@ impl Surface {
     /// back buffer exists -- without one there is no clean copy to restore.
     /// Call it after `present()`; `present()` takes the old one off first.
     pub fn cursor_draw(&mut self, x: usize, y: usize, w: usize, h: usize) {
-        if !self.buffered {
+        if !self.buffered || crate::drm::scanout_owned() {
             return;
         }
         let (x1, y1) = ((x + w).min(self.w), (y + h).min(self.h));
@@ -217,6 +222,11 @@ impl Surface {
 
     /// Copy everything drawn since the last call to the screen.
     pub fn present(&mut self) {
+        // A DRM client's buffer is on screen: the console must not touch it
+        // (the dirty rectangle stays marked for the repaint on release).
+        if crate::drm::scanout_owned() {
+            return;
+        }
         // The old cursor goes first: whatever was drawn since may or may not
         // cover its cell, and a stale one must not be left behind.
         self.cursor_restore();

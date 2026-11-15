@@ -76,7 +76,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 
-use crate::fs::devfs::{DEV_CONSOLE, DEV_FULL, DEV_NULL, DEV_TTYS0, DEV_TTY, DEV_TTY0, DEV_ZERO};
+use crate::fs::devfs::{DEV_CONSOLE, DEV_DRI_CARD0, DEV_FULL, DEV_NULL, DEV_TTYS0, DEV_TTY, DEV_TTY0, DEV_ZERO};
 use crate::fs::vfs::{
     DirEntry, FsError, FileType, O_APPEND, O_CLOEXEC, O_CREATE, O_EXCL, O_NONBLOCK, O_READ,
     O_TRUNC, O_WRITE, Opened, Whence,
@@ -169,6 +169,8 @@ enum Kind {
     DevNull,
     DevZero,
     DevFull,
+    /// /dev/dri/card0: one open of the DRM device (drm/mod.rs).
+    Drm(Rc<crate::drm::DrmFile>),
     PipeRead(Rc<RefCell<Pipe>>),
     PipeWrite(Rc<RefCell<Pipe>>),
 }
@@ -310,6 +312,7 @@ impl FdTable {
                     Kind::DevNull => String::from("/dev/null"),
                     Kind::DevZero => String::from("/dev/zero"),
                     Kind::DevFull => String::from("/dev/full"),
+                    Kind::Drm(_) => String::from("/dev/dri/card0"),
                     Kind::PipeRead(_) | Kind::PipeWrite(_) => String::from("pipe"),
                 };
                 Some((i, name))
@@ -398,7 +401,7 @@ impl FdTable {
 
 /// Copy `data` to user memory at `buf + done` (the read() direction):
 /// copy-on-write pages are resolved first, then the plain write.
-fn copy_out(buf: u64, done: usize, data: &[u8]) -> bool {
+pub(crate) fn copy_out(buf: u64, done: usize, data: &[u8]) -> bool {
     let Some(cur) = process::current() else { return false };
     let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return false };
     let at = buf + done as u64;
@@ -407,10 +410,19 @@ fn copy_out(buf: u64, done: usize, data: &[u8]) -> bool {
 
 /// Copy `n` bytes from user memory at `buf + done` into `into` (the write()
 /// direction).  Returns false when the page is not readable.
-fn copy_in(buf: u64, done: usize, into: &mut [u8]) -> bool {
+pub(crate) fn copy_in(buf: u64, done: usize, into: &mut [u8]) -> bool {
     let Some(cur) = process::current() else { return false };
     let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return false };
     aspace.read(buf + done as u64, into)
+}
+
+/// The DRM open behind descriptor `fd` of the current process, if it is one.
+pub fn drm_file_of(fd: usize) -> Option<Rc<crate::drm::DrmFile>> {
+    let d = process::current()?.fds.get(fd)?;
+    match &d.kind {
+        Kind::Drm(f) => Some(f.clone()),
+        _ => None,
+    }
 }
 
 /// Read the NUL-terminated string at user address `ptr` and make it the
@@ -491,6 +503,7 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> i64 {
         Kind::Serial => read_tty(tty::Term::Serial, &desc, buf, len),
         Kind::DevNull => 0, // EOF: the buffer is not even looked at
         Kind::DevZero | Kind::DevFull => read_zero(buf, len),
+        Kind::Drm(f) => crate::drm::read(f, buf, len, desc.flags() & O_NONBLOCK != 0),
         Kind::PipeRead(p) => read_pipe(p, &desc, buf, len),
         Kind::PipeWrite(_) => -EBADF,
     }
@@ -679,6 +692,8 @@ pub fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
         // The sinks still validate the buffer (an unreadable pointer is
         // -EFAULT, like on any unix) before reporting success.
         Kind::DevNull | Kind::DevZero => write_sink(buf, len),
+        // A DRM fd has no write(): commands go through ioctl (Linux: EINVAL).
+        Kind::Drm(_) => -EINVAL,
         // /dev/full: the write no disk could make.
         Kind::DevFull => {
             let mut chunk = [0u8; CHUNK];
@@ -884,6 +899,11 @@ pub fn sys_open(path_p: u64, flags: u64) -> i64 {
             DEV_NULL => Kind::DevNull,
             DEV_ZERO => Kind::DevZero,
             DEV_FULL => Kind::DevFull,
+            // /dev/dri/card0: first opener becomes DRM master.
+            DEV_DRI_CARD0 => match crate::drm::open() {
+                Ok(f) => Kind::Drm(Rc::new(f)),
+                Err(e) => return e,
+            },
             _ => return -ENODEV, // a node without a device behind it
         },
     };
@@ -1104,6 +1124,7 @@ pub fn sys_lstat(path_p: u64, buf: u64) -> i64 {
 /// and friends -- the id is the minor).
 fn dev_rdev(ftype: &FileType) -> u64 {
     match ftype {
+        FileType::Dev(id) if *id == DEV_DRI_CARD0 => crate::drm::DRM_MAJOR << 8,
         FileType::Dev(id) => (1 << 8) | *id as u64,
         _ => 0,
     }
@@ -1136,6 +1157,7 @@ pub fn sys_fstat(fd: u64, buf: u64) -> i64 {
         Kind::DevNull => put_dev_stat(buf, DEV_NULL, 0o666),
         Kind::DevZero => put_dev_stat(buf, DEV_ZERO, 0o666),
         Kind::DevFull => put_dev_stat(buf, DEV_FULL, 0o666),
+        Kind::Drm(_) => put_dev_stat(buf, DEV_DRI_CARD0, 0o660),
         // A pipe end fstats as a fifo: no inode, no size (the buffered
         // byte count is a snapshot nobody promises).
         Kind::PipeRead(_) | Kind::PipeWrite(_) => {
@@ -1151,7 +1173,8 @@ pub fn sys_fstat(fd: u64, buf: u64) -> i64 {
 fn put_dev_stat(buf: u64, id: u32, mode: u16) -> i64 {
     let now = crate::fs::vfs::now();
     let ftype = FileType::Dev(id);
-    if put_stat(buf, id as u64, mode, &ftype, 0, 1, (1 << 8) | id as u64, 0, (now, now, now)) {
+    let rdev = if id == DEV_DRI_CARD0 { crate::drm::DRM_MAJOR << 8 } else { (1 << 8) | id as u64 };
+    if put_stat(buf, id as u64, mode, &ftype, 0, 1, rdev, 0, (now, now, now)) {
         0
     } else {
         -EFAULT
@@ -1352,6 +1375,10 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> i64 {
     const TIOCGPGRP: u64 = 0x540F;
     const TIOCSPGRP: u64 = 0x5410;
     const TIOCGWINSZ: u64 = 0x5413;
+    // A DRM descriptor takes the whole ioctl space of magic 'd'.
+    if let Some(f) = drm_file_of(fd as usize) {
+        return crate::drm::ioctl(&f, req as u32, arg);
+    }
     let (which, term_id) = {
         let Some(cur) = process::current() else { return -EFAULT };
         let Some(d) = cur.fds.get(fd as usize) else { return -EBADF };
@@ -1963,6 +1990,8 @@ fn desc_ready(desc: &Rc<FileDesc>) -> Ready {
         Kind::DevNull | Kind::DevZero | Kind::DevFull => {
             Ready { read: f & O_READ != 0, write: f & O_WRITE != 0, err: false, hup: false }
         }
+        // POLLIN = a flip / vblank event is due; the device is never writable.
+        Kind::Drm(d) => Ready { read: crate::drm::readable(d), write: false, err: false, hup: false },
         Kind::PipeRead(p) => {
             let p = p.borrow();
             let eof = p.writers == 0;
