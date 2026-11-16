@@ -29,7 +29,7 @@ build PrismOS itself.
 | 1 | Kernel foundations (heap, ACPI/APIC, PCI/AHCI, VFS + ext4, SMP bring-up) | done |
 | 2 | Ring 3 and processes (scheduler, ELF loader, fork, signals, pipes) | done |
 | 3.1 – 3.4 | POSIX userspace (syscalls, mlibc, init/TTY/procfs, BusyBox + ash) | done |
-| 3.5 | Precise time, randomness, users and permissions | todo |
+| 3.5 | Precise time, randomness, users and permissions | done |
 | 4.1 | Cross binutils in the image (`ar`, `ranlib`, `nm`, `objdump`, `strip`) | done |
 | 4.2 – 4.5 | Threads, C++, building userspace with the PrismOS toolchain, dev image | todo |
 | 5 | Self-hosting (native binutils, gcc, build tools, full bootstrap) | todo |
