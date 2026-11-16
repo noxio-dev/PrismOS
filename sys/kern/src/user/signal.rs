@@ -428,6 +428,7 @@ pub fn sys_sigtimedwait(set_p: u64, info_p: u64, ts_p: u64, sz: u64) -> i64 {
     let set = (set64 & ((1u64 << NSIG) - 1) & !(1u64 << SIGKILL)) as u32;
 
     if cur.signals.blocked & set != set {
+        crate::kprintln!("[trace] sigtimedwait pid={} EINVAL set={:#x} blocked={:#x}", cur.pid, set, cur.signals.blocked);
         return -EINVAL;
     }
 

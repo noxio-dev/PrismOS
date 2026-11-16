@@ -102,18 +102,27 @@ struct ksigaction {
         uint64_t mask;
 };
 
+/* Signal-mask convention: mlibc (like Linux) keeps signal N in bit N-1 of a
+ * sigset_t; the kernel keeps it in bit N.  Every mask crossing the syscall
+ * boundary is shifted -- without it init's blocked SIGCHLD (bit 16) was the
+ * kernel's SIGSTKFLT and sigtimedwait never saw a child die. */
+inline uint64_t mask_to_kernel(uint64_t m) { return m << 1; }
+inline uint64_t mask_from_kernel(uint64_t m) { return m >> 1; }
+
 /* The kernel's sigprocmask exchanges the low 8 bytes of the sigset_t. */
 int prism_sigmask(int how, const sigset_t *__restrict set,
                 sigset_t *__restrict retrieve) {
         uint64_t kset = 0;
         if(set)
                 memcpy(&kset, set, sizeof(kset));
+        kset = mask_to_kernel(kset);
         uint64_t kold = 0;
         auto ret = sys(PRISM_SYS_SIGPROCMASK, how, set ? &kset : nullptr,
                         retrieve ? &kold : nullptr);
         if(int e = sc_error(ret); e)
                 return e;
         if(retrieve) {
+                kold = mask_from_kernel(kold);
                 memset(retrieve, 0, sizeof(*retrieve));
                 memcpy(retrieve, &kold, sizeof(kold));
         }
@@ -1007,7 +1016,10 @@ int Sysdeps<Kill>::operator()(pid_t pid, int sig) {
 int Sysdeps<Sigtimedwait>::operator()(const sigset_t *__restrict set,
                 siginfo_t *__restrict info,
                 const struct timespec *__restrict timeout, int *out_signal) {
-    long r = __do_syscall4(72, (long)set, (long)info, (long)timeout, 8);
+    uint64_t kset = 0;
+    memcpy(&kset, set, sizeof(kset));
+    kset = mask_to_kernel(kset);
+    long r = __do_syscall4(72, (long)&kset, (long)info, (long)timeout, 8);
     if (r < 0) return -r;           // errno positif
     *out_signal = (int)r;
     return 0;
@@ -1043,6 +1055,7 @@ int Sysdeps<Sigaction>::operator()(int signum, const struct sigaction *act,
                 kact.flags |= SA_RESTORER;
                 kact.restorer = reinterpret_cast<uintptr_t>(&__mlibc_signal_restore);
                 memcpy(&kact.mask, &act->sa_mask, sizeof(kact.mask));
+                kact.mask = mask_to_kernel(kact.mask);
         }
 
         auto ret = sys(PRISM_SYS_SIGACTION, signum, act ? &kact : nullptr,
@@ -1055,7 +1068,10 @@ int Sysdeps<Sigaction>::operator()(int signum, const struct sigaction *act,
                 oldact->sa_flags = static_cast<int>(kold.flags);
                 oldact->sa_restorer = reinterpret_cast<void (*)(void)>(kold.restorer);
                 memset(&oldact->sa_mask, 0, sizeof(oldact->sa_mask));
-                memcpy(&oldact->sa_mask, &kold.mask, sizeof(kold.mask));
+                {
+                        uint64_t m = mask_from_kernel(kold.mask);
+                        memcpy(&oldact->sa_mask, &m, sizeof(m));
+                }
         }
         return 0;
 }

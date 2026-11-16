@@ -861,6 +861,9 @@ fn drop_reaped(p: Box<Process>) {
 /// ru_utime / ru_stime -- its own CPU plus everything its own children
 /// left it -- and the caller's RUSAGE_CHILDREN grows by the same pair,
 /// the way getrusage reports it.
+/// Temporary: trace the exit/wait handshake (busybox init respawn hunt).
+const TRACE_INIT: bool = false;
+
 pub fn wait_current(pid_arg: u64, status_ptr: u64, flags: u64, rusage_ptr: u64) -> i64 {
     let Some(cur0) = current() else { return -EFAULT };
     let me = cur0.pid;
@@ -895,6 +898,9 @@ pub fn wait_current(pid_arg: u64, status_ptr: u64, flags: u64, rusage_ptr: u64) 
             }
             if wnohang {
                 return 0;
+            }
+            if TRACE_INIT {
+                crate::kprintln!("[trace] wait: pid={} parks for {}", me, want);
             }
             // Park until a matching child dies; zombify flips us back to
             // Ready and the scheduler (main loop or a peer) switches to us.
@@ -955,6 +961,9 @@ pub fn wait_current(pid_arg: u64, status_ptr: u64, flags: u64, rusage_ptr: u64) 
                 p.switches,
                 p.preempts,
             );
+            if TRACE_INIT {
+                crate::kprintln!("[trace] wait: pid={} reaped {}", me, zpid);
+            }
             drop_reaped(p);
             // SAFETY: syscall context, IF=0, we are CURRENT.
             unsafe {
@@ -1507,10 +1516,16 @@ unsafe fn after_death(pid: u64) {
         if ppid != 0 {
             for q in table.iter_mut() {
                 if q.pid == ppid && q.state != State::Zombie {
+                    if TRACE_INIT {
+                        crate::kprintln!("[trace] exit pid={} -> parent {} state={} wait_pid={} blocked={:#x}", pid, q.pid, q.state as u8, q.wait_pid, q.signals.blocked);
+                    }
                     if q.state == State::Waiting && (q.wait_pid == 0 || q.wait_pid == pid) {
                         q.state = State::Ready;
                     }
-                    if q.signals.handler_of(SIGCHLD) != 0 {
+                    // A handler, or a *blocked* SIGCHLD: busybox init blocks it
+                    // and collects it with sigtimedwait -- without this it
+                    // never learns that its login exited and never respawns.
+                    if q.signals.handler_of(SIGCHLD) != 0 || q.signals.blocked & (1 << SIGCHLD) != 0 {
                         q.signals.pending |= 1 << SIGCHLD;
                     }
                     break;
