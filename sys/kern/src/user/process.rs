@@ -1458,6 +1458,10 @@ fn zombify_common(p: &mut Process, outcome: Outcome) {
     // Its futex waiter (if any) goes with it: a dead process waits on
     // nothing, and a wake must not count a corpse (phase 3.2).
     crate::user::futex::on_death(p.pid);
+    // Likewise a socket wait (user/fd/unix.rs): off the parked list *before*
+    // the descriptors go, because closing the last socket wakes the parked
+    // processes -- and the dying one must not be among them.
+    crate::user::fd::unix::parked_leave(p.pid);
     drop(p.aspace.take());
     p.fds.release();
 }

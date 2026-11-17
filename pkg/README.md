@@ -3,7 +3,8 @@
 A userland program on PrismOS is a **package**: a directory under `pkg/`
 carrying a `prism.toml` manifest.  The mini libc is gone — **mlibc is the
 only libc** — and `tools/prism.py` (the `./prism` shim at the repo root) is
-the builder.  Eight packages live here: `hello`, `fork`, `fd`, `posix`
+the builder.  Nine packages live here: `hello`, `fork`, `fd`, `unixsock` (AF_UNIX stream
+sockets from ring 3), `posix`
 (stat, mmap, directories, uname, termios and the phase 3.3.4 session
 scenario: setsid, setpgid, `kill(-pgrp)`, lstat on a symlink), `cube`
 (the kernel's spinning cube), `tmpfs` (the phase 3.3 RAM file system,

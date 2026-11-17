@@ -60,6 +60,9 @@
 //    73 getrandom(buf, len, flags)
 //    74..89 identities: set[ug]id, get[eg]id, set/getres[ug]id, set/getgroups,
 //           chown / fchown / lchown, access (user/ident.rs, phase 3.5.3)
+//    90..102 AF_UNIX stream sockets: socket, socketpair, bind, listen, accept4,
+//           connect, sendmsg, recvmsg, shutdown, getsockname, getpeername,
+//           getsockopt, setsockopt (user/fd/unix.rs)
 //    59 setsid()                    60 setpgid(pid, pgid)   61 getpgid(pid)
 //    (a negative kill pid names a group; TIOCSCTTY claims a terminal)
 //
@@ -395,6 +398,20 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         87 => ident::sys_fchown(a0, a1, a2),
         88 => ident::sys_lchown(a0, a1, a2),
         89 => ident::sys_access(a0, a1),
+        // ---- AF_UNIX stream sockets (user/fd/unix.rs) -------------------
+        90 => fd::unix::sys_socket(a0, a1, a2),
+        91 => fd::unix::sys_socketpair(a0, a1, a2, frame.r10),
+        92 => fd::unix::sys_bind(a0, a1, a2),
+        93 => fd::unix::sys_listen(a0, a1),
+        94 => fd::unix::sys_accept(a0, a1, a2, frame.r10),
+        95 => fd::unix::sys_connect(a0, a1, a2),
+        96 => fd::unix::sys_sendmsg(a0, a1, a2),
+        97 => fd::unix::sys_recvmsg(a0, a1, a2),
+        98 => fd::unix::sys_shutdown(a0, a1),
+        99 => fd::unix::sys_getsockname(a0, a1, a2),
+        100 => fd::unix::sys_getpeername(a0, a1, a2),
+        101 => fd::unix::sys_getsockopt(a0, a1, a2, frame.r10, frame.r8),
+        102 => fd::unix::sys_setsockopt(a0, a1, a2, frame.r10, frame.r8),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

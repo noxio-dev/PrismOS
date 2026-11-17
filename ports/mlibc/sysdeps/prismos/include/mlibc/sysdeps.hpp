@@ -7,7 +7,7 @@
  *
  * The PrismOS sysdeps tag set (phase 3.2, step 2): every tag the kernel has
  * a syscall for.  A tag absent from this list is *missing on purpose* --
- * mlibc's generic layer then answers ENOSYS (pthread_create, sockets,
+ * mlibc's generic layer then answers ENOSYS (pthread_create,
  * *at() beyond AT_FDCWD, ...) -- which is the port's contract:
  * what the kernel lacks stays ENOSYS.
  */
@@ -142,7 +142,25 @@ struct PrismOSSysdepTags :
         /* the init step's shutdown half: reboot / poweroff ride the
          * kernel's 57, the cmd passed raw (the linux-reboot option's
          * tag, phase 3.4's option lands with it). */
-        Reboot
+        Reboot,
+
+        /* AF_UNIX stream sockets (kernel syscalls 90..102): what an X
+         * server and its clients, or any local IPC, stand on.  send / recv /
+         * sendto / recvfrom are mlibc's own wrappers over MsgSend / MsgRecv.
+         * Datagram sockets and other families answer the kernel's errno. */
+        Socket,
+        Socketpair,
+        Bind,
+        Listen,
+        Accept,
+        Connect,
+        MsgSend,
+        MsgRecv,
+        Shutdown,
+        Sockname,
+        Peername,
+        GetSockopt,
+        SetSockopt
 {};
 
 struct SysdepTraits {

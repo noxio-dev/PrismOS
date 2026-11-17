@@ -92,12 +92,13 @@ Phase 5 — self-hosting
 - [ ] Phase 5.6 — full bootstrap: PrismOS builds PrismOS, with a test comparing the produced binaries
 
 Beyond (nice to have)
-- [ ] hidden kernel prerequisites that the phases above keep running into: file-backed `MAP_SHARED` with a page cache, Unix domain sockets, `epoll` -- move them before 4.2 / 5.2 when they block
+- [ ] hidden kernel prerequisites that the phases above keep running into: file-backed `MAP_SHARED` with a page cache, `epoll` -- move them before 4.2 / 5.2 when they block
+- [x] Unix domain sockets (`AF_UNIX` `SOCK_STREAM`, syscalls 90-102): socketpair, named + abstract sockets, accept / connect, `SCM_RIGHTS`, non-blocking I/O, `poll` / `select`, `SO_PEERCRED`; `sys/kern/src/user/fd/unix.rs` over the host-tested state machine `user/unix_core.rs` (`make unixtest`, `/bin/unixsock`).  Not yet: `SOCK_DGRAM` / `SOCK_SEQPACKET`, `SCM_CREDENTIALS`, a socket inode type in the VFS (a bound path stats as a regular file), permission checks on connect
 - [ ] networking: virtio-net or e1000, ARP/IP/UDP/TCP, a tiny `ping` and `wget`
 - [x] USB (xHCI) keyboard and mass storage, NVMe (polling drivers; root ports only, no hubs -- see docs/USB-NVME.md)
 - [ ] other file systems: FAT32 R/W in the kernel
 - [ ] graphics: framebuffer userspace API, a minimal window system
-- [ ] desktop (Xorg, then KDE): mlibc is the entry ticket, not the whole price -- also Unix domain sockets, `epoll`, shared memory (`MAP_SHARED` of files, `shm`), a display / input device interface (KMS-style), and a lot of the Linux surface (`/proc`, `/sys`, `udev`-like discovery)
+- [ ] desktop (Xorg, then KDE): mlibc is the entry ticket, not the whole price -- also `epoll` (Unix domain sockets landed), shared memory (`MAP_SHARED` of files, `shm`), a display / input device interface (KMS-style), and a lot of the Linux surface (`/proc`, `/sys`, `udev`-like discovery)
 - [ ] AArch64 port of the kernel and loader
 
 *`One day, perhaps, PrismOS will be self-hosted lol`*

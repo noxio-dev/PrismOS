@@ -43,5 +43,6 @@ pub mod signal;
 pub mod sysc;
 pub mod syscall;
 pub mod tty;
+pub mod unix_core;
 pub mod usermode;
 pub mod vt;

@@ -90,6 +90,9 @@ use crate::user::signal;
 use crate::user::tty;
 use crate::user::usermode::{EBADF, EFAULT, EINVAL};
 
+/// AF_UNIX stream sockets (the syscall half; user/unix_core.rs is the state machine).
+pub(crate) mod unix;
+
 // ------------------------------------------------------------- limits
 
 /// Descriptors per process (fd 0..63); one more open is -EMFILE.
@@ -186,6 +189,8 @@ pub(crate) enum Kind {
     Evdev(Rc<crate::input::EvFile>),
     PipeRead(Rc<RefCell<Pipe>>),
     PipeWrite(Rc<RefCell<Pipe>>),
+    /// An AF_UNIX stream socket (user/fd/unix.rs).
+    Unix(Rc<RefCell<unix::UnixSock>>),
 }
 
 /// Which terminal a descriptor talks to, if it is a terminal at all.
@@ -331,6 +336,7 @@ impl FdTable {
                     Kind::Vt(h) => alloc::format!("/dev/tty{}", h.num()),
                     Kind::Evdev(e) => alloc::format!("/dev/input/event{}", e.dev()),
                     Kind::PipeRead(_) | Kind::PipeWrite(_) => String::from("pipe"),
+                    Kind::Unix(_) => unix::proc_name(),
                 };
                 Some((i, name))
             })
@@ -501,7 +507,12 @@ fn uptime_ms() -> u64 {
 /// Park ~20 ms (see the header): refs into the process table must be gone
 /// before the call -- the switch may move the table (another process fork).
 fn park_once() {
+    // Registered while parked so a socket event can wake us at once
+    // (unix::notify) instead of at the next quantum.
+    let pid = process::getpid();
+    unix::parked_enter(pid);
     process::sleep_current(PARK_MS);
+    unix::parked_leave(pid);
 }
 
 // -------------------------------------------------------------- read
@@ -534,6 +545,7 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> i64 {
         Kind::Evdev(f) => crate::input::read(f, buf, len, desc.flags() & O_NONBLOCK != 0),
         Kind::PipeRead(p) => read_pipe(p, &desc, buf, len),
         Kind::PipeWrite(_) => -EBADF,
+        Kind::Unix(s) => unix::read(s, &desc, buf, len),
     }
 }
 
@@ -822,6 +834,7 @@ pub fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
         }
         Kind::PipeWrite(p) => write_pipe(p, &desc, buf, len),
         Kind::PipeRead(_) => -EBADF,
+        Kind::Unix(s) => unix::write(s, &desc, buf, len),
     }
 }
 
@@ -1186,6 +1199,12 @@ fn put_stat(buf: u64, ino: u64, mode_perm: u16, owner: (u32, u32), ftype: &FileT
         FileType::Dev(_) => 0o020000, // character device
         _ => 0o010000,                // fifo / other
     };
+    put_stat_ifmt(buf, ino, ifmt, mode_perm, owner, size, nlink, rdev, blocks, times)
+}
+
+/// `put_stat` with the file-type bits given outright (a socket has no
+/// `FileType` of its own in the VFS).
+fn put_stat_ifmt(buf: u64, ino: u64, ifmt: u32, mode_perm: u16, owner: (u32, u32), size: u64, nlink: u32, rdev: u64, blocks: u64, times: (u32, u32, u32)) -> bool {
     let mode = ifmt | (mode_perm as u32 & 0o7777);
     let mut w: Vec<u8> = Vec::with_capacity(STAT_SIZE);
     let mut push = |v: u64| w.extend_from_slice(&v.to_le_bytes());
@@ -1317,6 +1336,13 @@ pub fn sys_fstat(fd: u64, buf: u64) -> i64 {
         Kind::Evdev(e) => put_dev_stat(buf, DEV_EVENT0 + e.dev() as u32, 0o660),
         // A pipe end fstats as a fifo: no inode, no size (the buffered
         // byte count is a snapshot nobody promises).
+        Kind::Unix(_) => {
+            if put_stat_ifmt(buf, 0, unix::S_IFSOCK, 0o777, (0, 0), 0, 1, 0, 0, (0, 0, 0)) {
+                0
+            } else {
+                -EFAULT
+            }
+        }
         Kind::PipeRead(_) | Kind::PipeWrite(_) => {
             if put_stat(buf, 0, 0o600, (0, 0), &FileType::Other, 0, 1, 0, 0, (0, 0, 0)) {
                 0
@@ -1532,6 +1558,12 @@ pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> i64 {
     const TIOCGPGRP: u64 = 0x540F;
     const TIOCSPGRP: u64 = 0x5410;
     const TIOCGWINSZ: u64 = 0x5413;
+    // A socket answers FIONREAD / FIONBIO (user/fd/unix.rs).
+    if let Some(d) = process::current().and_then(|c| c.fds.get(fd as usize)) {
+        if let Kind::Unix(s) = &d.kind {
+            return unix::ioctl(s, &d, req, arg).unwrap_or(-ENOTTY);
+        }
+    }
     // A DRM descriptor takes the whole ioctl space of magic 'd'.
     if let Some(f) = drm_file_of(fd as usize) {
         return crate::drm::ioctl(&f, req as u32, arg);
@@ -1910,7 +1942,7 @@ pub fn sys_fsync(fd: u64) -> i64 {
         Kind::Vfs(slot) => {
             crate::fs::fsys::vfs().fsync_fd(*slot).map_or_else(|e| -fs_errno(e), |_| 0)
         }
-        Kind::PipeRead(_) | Kind::PipeWrite(_) => -EINVAL,
+        Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::Unix(_) => -EINVAL,
         _ => 0,
     }
 }
@@ -2188,6 +2220,10 @@ fn desc_ready(desc: &Rc<FileDesc>) -> Ready {
             let p = p.borrow();
             let broken = p.readers == 0;
             Ready { read: false, write: PIPE_CAPACITY - p.buf.len() > 0 || broken, err: broken, hup: false }
+        }
+        Kind::Unix(s) => {
+            let (read, write, err, hup) = unix::ready(s);
+            Ready { read, write, err, hup }
         }
     }
 }

@@ -1,0 +1,21 @@
+# /usr/bin/unixsock -- AF_UNIX stream sockets: socketpair, named and abstract
+# sockets, accept / connect across a fork, SCM_RIGHTS, non-blocking I/O,
+# shutdown, poll, the options a display library asks for.
+[package]
+name = "unixsock"
+version = "0.1.0"
+description = "AF_UNIX stream socket scenarios (the X11 transport)"
+
+[build]
+sources = ["src/unixsock.c"]
+
+[install]
+path = "/usr/bin/unixsock"
+
+[verify]
+# 1 write, 13 read, 15 close, 8 fork, 9 waitpid, 7 exit, 41 poll, then the
+# socket calls: 90 socket, 91 socketpair, 92 bind, 93 listen, 94 accept4,
+# 95 connect, 96 sendmsg, 97 recvmsg, 98 shutdown, 99 getsockname,
+# 100 getpeername, 101 getsockopt, 102 setsockopt.
+syscalls = [1, 13, 15, 8, 9, 7, 41, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102]
+symbols = ["write", "read", "fork", "waitpid", "poll", "socket", "socketpair", "bind", "listen", "accept4", "connect", "sendmsg", "recvmsg", "shutdown", "getsockname", "getpeername", "getsockopt", "setsockopt"]

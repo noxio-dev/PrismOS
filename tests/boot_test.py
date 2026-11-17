@@ -312,6 +312,24 @@ def main():
           "pid 1 posix -- exited with status 0",
           "process table empty",
           "/boot"], 240),
+        # AF_UNIX stream sockets (the X11 transport; syscalls 90..102,
+        # sys/kern/src/user/fd/unix.rs).  /bin/unixsock drives them end to
+        # end: socketpair, named (file system) and abstract sockets, accept /
+        # connect across a fork with 200 echo round trips, SCM_RIGHTS (a pipe
+        # crossing the socket), non-blocking I/O, shutdown, poll (including a
+        # poll blocked in the kernel that a forked writer wakes), the socket
+        # options a display library asks for, and the honest errors.  The
+        # state machine itself is host-tested by `make unixtest`.
+        ("BIOS shell: AF_UNIX stream sockets", ksh_cmd,
+         [("prism# ", "exec unixsock\r"),
+          ("unixsock: all 10 passed", "ps\r")],
+         ["unixsock (pid 1): AF_UNIX stream sockets",
+          "pair      ok", "named     ok", "abstract  ok", "forkecho  ok",
+          "rights    ok", "nonblock  ok", "shutdown  ok", "poll      ok",
+          "opts      ok", "errors    ok",
+          "unixsock: all 10 passed",
+          "pid 1 unixsock -- exited with status 0",
+          "process table empty"], 240),
     ]
     if code and vars_ and os.path.exists(code):
         scenarios += [

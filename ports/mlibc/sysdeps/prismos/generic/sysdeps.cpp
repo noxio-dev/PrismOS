@@ -24,6 +24,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/statfs.h>
 #include <sys/statvfs.h>
@@ -34,7 +35,7 @@
  *
  * The PrismOS sysdeps (phase 3.2, step 2): every mlibc tag the kernel has
  * a syscall for, spoken through the raw convention of generic/syscall.cpp.
- * Everything else -- threads / clone, sockets, *at() beyond AT_FDCWD -- is
+ * Everything else -- threads / clone, datagram sockets, *at() beyond AT_FDCWD -- is
  * deliberately absent from the tag list (include/mlibc/sysdeps.hpp), so
  * mlibc's generic layer answers ENOSYS: what the kernel lacks stays
  * ENOSYS, the port's contract.  (Phase 3.4 -- the busybox step -- moved
@@ -1085,6 +1086,106 @@ int Sysdeps<ThreadSigmask>::operator()(int how, const sigset_t *__restrict set,
                 sigset_t *__restrict retrieve) {
         /* One process, one thread: the two calls are the same word. */
         return prism_sigmask(how, set, retrieve);
+}
+
+/* ---- AF_UNIX stream sockets (kernel syscalls 90..102, user/fd/unix.rs) ----
+ *
+ * The kernel takes the Linux x86-64 layouts this port's abi-bits already
+ * define (sockaddr_un, msghdr with 32-bit iovlen / controllen, the 16-byte
+ * cmsghdr), so the words pass through untouched.  Only getsockname /
+ * getpeername / accept differ in shape: the kernel's length is one in/out
+ * word, mlibc's sysdeps split it into a maximum and an actual size. */
+
+int Sysdeps<Socket>::operator()(int family, int type, int protocol, int *fd) {
+        auto ret = sys(PRISM_SYS_SOCKET, family, type, protocol);
+        if(int e = sc_error(ret); e)
+                return e;
+        *fd = static_cast<int>(ret);
+        return 0;
+}
+
+int Sysdeps<Socketpair>::operator()(int domain, int type_and_flags, int proto, int *fds) {
+        auto ret = sys(PRISM_SYS_SOCKETPAIR, domain, type_and_flags, proto, fds);
+        return sc_error(ret);
+}
+
+int Sysdeps<Bind>::operator()(int fd, const struct sockaddr *addr_ptr, socklen_t addr_length) {
+        auto ret = sys(PRISM_SYS_BIND, fd, addr_ptr, addr_length);
+        return sc_error(ret);
+}
+
+int Sysdeps<Listen>::operator()(int fd, int backlog) {
+        auto ret = sys(PRISM_SYS_LISTEN, fd, backlog);
+        return sc_error(ret);
+}
+
+int Sysdeps<Accept>::operator()(int fd, int *newfd, struct sockaddr *addr_ptr,
+                socklen_t *addr_length, int flags) {
+        /* mlibc's flags are the Linux SOCK_* ones, which abi-bits/socket.h
+         * defines and the kernel reads as such. */
+        auto ret = sys(PRISM_SYS_ACCEPT4, fd, addr_ptr, addr_length, flags);
+        if(int e = sc_error(ret); e)
+                return e;
+        *newfd = static_cast<int>(ret);
+        return 0;
+}
+
+int Sysdeps<Connect>::operator()(int fd, const struct sockaddr *addr_ptr, socklen_t addr_length) {
+        auto ret = sys(PRISM_SYS_CONNECT, fd, addr_ptr, addr_length);
+        return sc_error(ret);
+}
+
+int Sysdeps<MsgSend>::operator()(int fd, const struct msghdr *hdr, int flags, ssize_t *length) {
+        auto ret = sys(PRISM_SYS_SENDMSG, fd, hdr, flags);
+        if(int e = sc_error(ret); e)
+                return e;
+        *length = static_cast<ssize_t>(ret);
+        return 0;
+}
+
+int Sysdeps<MsgRecv>::operator()(int fd, struct msghdr *hdr, int flags, ssize_t *length) {
+        auto ret = sys(PRISM_SYS_RECVMSG, fd, hdr, flags);
+        if(int e = sc_error(ret); e)
+                return e;
+        *length = static_cast<ssize_t>(ret);
+        return 0;
+}
+
+int Sysdeps<Shutdown>::operator()(int sockfd, int how) {
+        auto ret = sys(PRISM_SYS_SHUTDOWN, sockfd, how);
+        return sc_error(ret);
+}
+
+int Sysdeps<Sockname>::operator()(int fd, struct sockaddr *addr_ptr,
+                socklen_t max_addr_length, socklen_t *actual_length) {
+        socklen_t len = max_addr_length;
+        auto ret = sys(PRISM_SYS_GETSOCKNAME, fd, addr_ptr, &len);
+        if(int e = sc_error(ret); e)
+                return e;
+        *actual_length = len;
+        return 0;
+}
+
+int Sysdeps<Peername>::operator()(int fd, struct sockaddr *addr_ptr,
+                socklen_t max_addr_length, socklen_t *actual_length) {
+        socklen_t len = max_addr_length;
+        auto ret = sys(PRISM_SYS_GETPEERNAME, fd, addr_ptr, &len);
+        if(int e = sc_error(ret); e)
+                return e;
+        *actual_length = len;
+        return 0;
+}
+
+int Sysdeps<GetSockopt>::operator()(int fd, int layer, int number,
+                void *__restrict buffer, socklen_t *__restrict size) {
+        auto ret = sys(PRISM_SYS_GETSOCKOPT, fd, layer, number, buffer, size);
+        return sc_error(ret);
+}
+
+int Sysdeps<SetSockopt>::operator()(int fd, int layer, int number,
+                const void *buffer, socklen_t size) {
+        auto ret = sys(PRISM_SYS_SETSOCKOPT, fd, layer, number, buffer, size);
+        return sc_error(ret);
 }
 
 } // namespace mlibc

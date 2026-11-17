@@ -544,6 +544,14 @@ keytest:
 	rustc --edition 2021 --test tests/keymap_host.rs -o $(B)/keymap_host
 	$(B)/keymap_host --test-threads=1
 
+# Host-side tests of the AF_UNIX state machine (no QEMU needed): the byte
+# channels, EOF / EPIPE, SCM_RIGHTS batches, the accept queue.
+.PHONY: unixtest
+unixtest:
+	mkdir -p $(B)
+	rustc --edition 2021 --test tests/unix_host.rs -o $(B)/unix_host
+	$(B)/unix_host --test-threads=1
+
 # Host-side tests of the DRM/KMS ABI and driver (no QEMU needed).
 .PHONY: drmtest
 drmtest:

@@ -48,12 +48,22 @@ phase.
 **What the kernel lacks stays ENOSYS** — the rule of the phase.  Tags the
 kernel cannot serve are simply absent from the tag list, and mlibc's
 generic layer answers `ENOSYS` on its own: `pthread_create` (no clone),
-sockets, `*at()` past `AT_FDCWD`, rusage accounting (wait4 gets honest
+`*at()` past `AT_FDCWD`, rusage accounting (wait4 gets honest
 zeroes), `fchmod` and the whole permission family (phase 3.5).  A few
 corners are emulated where the emulation is exact: `pipe2`'s flags ride
 `fcntl` (`O_CLOEXEC`→`F_SETFD`, `O_NONBLOCK`→`F_SETFL`), `opendir` checks
 `S_ISDIR` itself (the kernel has no `O_DIRECTORY` bit), and `pselect`
 refuses a signal mask rather than pretend (`select` works).
+
+**Sockets** (syscalls 90–102, `sys/kern/src/user/fd/unix.rs`): `AF_UNIX`
+`SOCK_STREAM` only -- `socket`, `socketpair`, `bind`, `listen`, `accept` /
+`accept4`, `connect`, `shutdown`, `getsockname` / `getpeername`, `getsockopt`
+/ `setsockopt`, and `send` / `recv` / `sendto` / `recvfrom` / `sendmsg` /
+`recvmsg` through mlibc's `MsgSend` / `MsgRecv` (`SCM_RIGHTS` included).
+Names live on the file system (`bind` creates the node) or in the abstract
+namespace.  Datagram sockets answer `ESOCKTNOSUPPORT`, other families
+`EAFNOSUPPORT`.  `FIONREAD` / `FIONBIO` work on them, and `poll` / `select`
+see them like any descriptor.
 
 Two ABI notes worth remembering.  The **O_* flags are the kernel's own**
 (`O_READ` 1, `O_WRITE` 2, `O_CREATE` 4, `O_TRUNC` 8, `O_APPEND` 16,

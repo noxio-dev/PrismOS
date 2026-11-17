@@ -110,6 +110,21 @@ enum {
         PRISM_SYS_FCHOWN = 87,
         PRISM_SYS_LCHOWN = 88,
         PRISM_SYS_ACCESS = 89,       /* access(path, mode): the real ids */
+
+        /* AF_UNIX stream sockets (user/fd/unix.rs) */
+        PRISM_SYS_SOCKET = 90,       /* socket(domain, type, protocol) */
+        PRISM_SYS_SOCKETPAIR = 91,   /* socketpair(domain, type, protocol, &sv[2]) */
+        PRISM_SYS_BIND = 92,         /* bind(fd, addr, len) */
+        PRISM_SYS_LISTEN = 93,       /* listen(fd, backlog) */
+        PRISM_SYS_ACCEPT4 = 94,      /* accept4(fd, addr, &len, flags) */
+        PRISM_SYS_CONNECT = 95,      /* connect(fd, addr, len) */
+        PRISM_SYS_SENDMSG = 96,      /* sendmsg(fd, msghdr, flags) */
+        PRISM_SYS_RECVMSG = 97,      /* recvmsg(fd, msghdr, flags) */
+        PRISM_SYS_SHUTDOWN = 98,     /* shutdown(fd, how) */
+        PRISM_SYS_GETSOCKNAME = 99,  /* getsockname(fd, addr, &len) */
+        PRISM_SYS_GETPEERNAME = 100, /* getpeername(fd, addr, &len) */
+        PRISM_SYS_GETSOCKOPT = 101,  /* getsockopt(fd, level, name, val, &len) */
+        PRISM_SYS_SETSOCKOPT = 102,  /* setsockopt(fd, level, name, val, len) */
 };
 
 /* arch_prctl() codes -- the Linux x86-64 values the kernel expects. */
