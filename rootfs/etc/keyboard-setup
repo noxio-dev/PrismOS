@@ -4,7 +4,6 @@
 #
 # PrismOS Keyboard Setup.
 # BusyBox ash + loadkmap + UTF-8 enabled.
-# Blocks on read until answered; falls back to /etc/keymap on EOF.
 
 RESET='\033[0m'
 BOLD='\033[1m'
@@ -13,14 +12,14 @@ CYAN='\033[1;36m'
 GREEN='\033[1;32m'
 YELLOW='\033[1;33m'
 MAGENTA='\033[1;35m'
-WHITE='\033[1;37m'
 
 W=50
+INNER=$((W - 2))
 
-# Build horizontal lines (UTF-8 character '─' takes 3 bytes in ash)
+# Build horizontal border.
 hr=""
 i=0
-while [ $i -lt $((W - 2)) ]; do
+while [ "$i" -lt "$INNER" ]; do
     hr="${hr}─"
     i=$((i + 1))
 done
@@ -28,45 +27,54 @@ done
 top_line()    { printf "${CYAN}╭%s╮${RESET}\n" "$hr"; }
 bottom_line() { printf "${CYAN}╰%s╯${RESET}\n" "$hr"; }
 sep_line()    { printf "${CYAN}├%s┤${RESET}\n" "$hr"; }
-blank()       { printf "${CYAN}│${RESET}%*s${CYAN}│${RESET}\n" "$((W - 2))" ''; }
+blank()       { printf "${CYAN}│${RESET}%*s${CYAN}│${RESET}\n" "$INNER" ''; }
 
-# Left-aligned cell with clean UTF-8 / ANSI padding
-cell() {
-    # $1 = colored number tag, $2 = option description text
-    pad=$((W - 9 - ${#2}))
-    printf "${CYAN}│${RESET}  %s  %s%*s ${CYAN}│${RESET}\n" "$1" "$2" "$pad" ''
-}
-
-# Center titles accounting for raw string length ($1)
+# Print a line with a known visible width.
+# $1 = visible text width
+# $2 = formatted text (may contain ANSI escapes)
+# Center text using an explicitly supplied visible width.
 center() {
-    len=${#1}
-    lpad=$(( (W - 2 - len) / 2 ))
-    rpad=$(( W - 2 - lpad - len ))
-    printf "${CYAN}│${RESET}%*s%s%*s${CYAN}│${RESET}\n" "$lpad" '' "$2" "$rpad" ''
+    len=$1
+    content=$2
+
+    left=$(( (INNER - len) / 2 ))
+    right=$(( INNER - len - left ))
+
+    printf "${CYAN}│${RESET}%*s%s%*s${CYAN}│${RESET}\n" \
+        "$left" "" "$content" "$right" ""
 }
 
+# Menu cell: exactly 48 visible columns inside the borders.
+cell() {
+    tag=$1
+    description=$2
+
+    # 2 leading spaces + 1 digit + 2 spaces
+    # + description + remaining padding.
+    pad=$(( INNER - 5 - ${#description} ))
+
+    printf "${CYAN}│${RESET}  %s  %s%*s${CYAN}│${RESET}\n" \
+        "$tag" "$description" "$pad" ""
+}
+
+clear
 printf "\n"
 
 top_line
 blank
-center "PrismOS Keyboard Setup" "$(printf "${BOLD}${MAGENTA}PrismOS Keyboard Setup${RESET}")"
-center "select the console keymap" "$(printf "${DIM}Select your console keymap${RESET}")"
+
+center 22 "$(printf "${BOLD}${MAGENTA}PrismOS Keyboard Setup${RESET}")"
+center 26 "$(printf "${DIM}Select your console keymap${RESET}")"
+
 blank
 sep_line
 blank
 
-# Menu options defined with separate string formatting to prevent shell arithmetic errors
-opt1="$(printf "${GREEN}1${RESET}")"
-opt2="$(printf "${GREEN}2${RESET}")"
-opt3="$(printf "${GREEN}3${RESET}")"
-opt4="$(printf "${GREEN}4${RESET}")"
-opt5="$(printf "${GREEN}5${RESET}")"
-
-cell "$opt1" "French             (AZERTY)"
-cell "$opt2" "US English         (QWERTY)"
-cell "$opt3" "UK English         (QWERTY)"
-cell "$opt4" "German             (QWERTZ)"
-cell "$opt5" "Spanish            (QWERTY)"
+cell "$(printf "${GREEN}1${RESET}")" "French (AZERTY)"
+cell "$(printf "${GREEN}2${RESET}")" "US English (QWERTY)"
+cell "$(printf "${GREEN}3${RESET}")" "UK English (QWERTY)"
+cell "$(printf "${GREEN}4${RESET}")" "German (QWERTZ)"
+cell "$(printf "${GREEN}5${RESET}")" "Spanish (QWERTY)"
 
 blank
 bottom_line
@@ -74,16 +82,18 @@ printf "\n"
 
 layout=""
 saved=""
+
 while [ -z "$layout" ]; do
     printf " ${CYAN}❯${RESET} ${BOLD}Select layout [1-5]:${RESET} "
+
     if ! read choice; then
-        # EOF: headless boot or closed stdin
         printf "\n ${DIM}(no input -- keeping /etc/keymap layout)${RESET}\n"
         saved=$(cat /etc/keymap 2>/dev/null)
         test -n "$saved" || saved="us"
         layout="$saved"
         break
     fi
+
     case "$choice" in
         1) layout="fr" ;;
         2) layout="us" ;;
