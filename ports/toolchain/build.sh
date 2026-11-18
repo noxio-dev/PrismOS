@@ -100,6 +100,32 @@ done
 PATCHES=$REPO/ports/toolchain/patches
 say() { printf '[build/%s] %s\n' "$1" "$2"; }
 
+# fetch_tar file url [url ...] -- the first URL that yields a readable
+# tarball wins.  --fail fails on HTTP errors instead of saving an error
+# page under the tarball's name (which once poisoned the sources cache),
+# -L follows the mirror's redirects, and `tar tf` (compression detected
+# by tar itself) rejects anything that is not an archive, the resume
+# included; a failed attempt drops the .part so it cannot poison the
+# next run, the next attempt starts over without the resume, and a
+# mirror that keeps erroring hands over to the next URL.
+fetch_tar() { # file url [url ...]
+        f=$1
+        shift
+        for url in "$@"; do
+                for resume in "-C -" "" ""; do
+                        if curl -sS -fL --retry 3 $resume -o "$f.part" "$url" \
+                                && tar tf "$f.part" >/dev/null 2>&1; then
+                                mv "$f.part" "$f"
+                                return 0
+                        fi
+                        rm -f "$f.part"
+                        sleep 2
+                done
+        done
+        echo "ports/toolchain: $f: the download failed or is not a tarball" >&2
+        exit 1
+}
+
 # ---- stage: fetch ------------------------------------------------------------
 # The tarballs, the prerequisites (gmp / mpfr / mpc, linked into gcc's tree
 # so its build builds them), and the two triplet patches.
@@ -112,9 +138,15 @@ do_fetch() {
                  mpfr/mpfr-$MPFR_VER.tar.xz \
                  mpc/mpc-$MPC_VER.tar.gz; do
                 f=$(basename "$a")
+                d=${f%.tar.*}
                 if [ ! -f "$f" ]; then
                         say fetch "$f"
-                        curl -sS --retry 3 -C - -o "$f.part" "$MIRROR/$a" && mv "$f.part" "$f"
+                        fetch_tar "$f" "$MIRROR/$a" "https://ftp.gnu.org/gnu/$a"
+                elif [ ! -d "$d" ] && ! tar tf "$f" >/dev/null 2>&1; then
+                        say fetch "$f: not a readable tarball (a failed download saved an error page), refetching"
+                        rm -f "$f"
+                        say fetch "$f"
+                        fetch_tar "$f" "$MIRROR/$a" "https://ftp.gnu.org/gnu/$a"
                 fi
         done
         for a in binutils-$BINUTILS_VER.tar.xz gcc-$GCC_VER.tar.xz \

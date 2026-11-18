@@ -105,6 +105,32 @@ done
 PATCHES=$REPO/ports/nano/patches
 say() { printf '[nano/%s] %s\n' "$1" "$2"; }
 
+# fetch_tar file url [url ...] -- the first URL that yields a readable
+# tarball wins.  --fail fails on HTTP errors instead of saving an error
+# page under the tarball's name (which once poisoned the sources cache),
+# -L follows the mirror's redirects, and `tar tf` (compression detected
+# by tar itself) rejects anything that is not an archive, the resume
+# included; a failed attempt drops the .part so it cannot poison the
+# next run, the next attempt starts over without the resume, and a
+# mirror that keeps erroring hands over to the next URL.
+fetch_tar() { # file url [url ...]
+        f=$1
+        shift
+        for url in "$@"; do
+                for resume in "-C -" "" ""; do
+                        if curl -sS -fL --retry 3 $resume -o "$f.part" "$url" \
+                                && tar tf "$f.part" >/dev/null 2>&1; then
+                                mv "$f.part" "$f"
+                                return 0
+                        fi
+                        rm -f "$f.part"
+                        sleep 2
+                done
+        done
+        echo "ports/nano: $f: the download failed or is not a tarball" >&2
+        exit 1
+}
+
 # The toolchain has to be there first: the driver compiles through
 # x86_64-prismos-gcc and the sandwich links libc.a out of the sysroot.
 [ -x "$PREFIX/bin/x86_64-prismos-gcc" ] || {
@@ -129,14 +155,23 @@ command -v tic >/dev/null || {
 do_fetch() {
         mkdir -p "$SRC"
         cd "$SRC"
-        for pair in "ncurses/$NCURSES_VER ncurses-$NCURSES_VER.tar.gz" \
-                    "nano/$NANO_VER nano-$NANO_VER.tar.xz"; do
+        # The pairs spell the GNU layout directly: ncurses and nano ship
+        # their tarballs at the top of their /gnu directory (no version
+        # subdirectory -- "$GNU/ncurses/6.6" is a 404 page, which a curl
+        # without --fail once saved as the tarball itself).
+        for pair in "ncurses/ncurses-$NCURSES_VER.tar.gz ncurses-$NCURSES_VER.tar.gz" \
+                    "nano/nano-$NANO_VER.tar.xz nano-$NANO_VER.tar.xz"; do
                 path=${pair%% *}; f=${pair##* }
+                d=${f%.tar.gz}; d=${d%.tar.xz}
                 if [ ! -f "$f" ]; then
                         say fetch "$f"
-                        curl -sS --retry 3 -C - -o "$f.part" "$GNU/$path" && mv "$f.part" "$f"
+                        fetch_tar "$f" "$GNU/$path" "https://ftp.gnu.org/gnu/$path"
+                elif [ ! -d "$d" ] && ! tar tf "$f" >/dev/null 2>&1; then
+                        say fetch "$f: not a readable tarball (a failed download saved an error page), refetching"
+                        rm -f "$f"
+                        say fetch "$f"
+                        fetch_tar "$f" "$GNU/$path" "https://ftp.gnu.org/gnu/$path"
                 fi
-                d=${f%.tar.gz}; d=${d%.tar.xz}
                 if [ ! -d "$d" ]; then
                         say fetch "extracting $f"
                         case $f in *.tar.gz) tar xzf "$f" ;; *) tar xf "$f" ;; esac
