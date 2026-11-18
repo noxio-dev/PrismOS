@@ -6,7 +6,7 @@
 [package]
 name = "infofetch"
 version = "0.1.0"
-description = "a PrismOS app"
+description = "a fastfetch like"
 
 [build]
 sources = ["src/main.c"]
