@@ -26,34 +26,34 @@ LIGHT_MAGENTA='\033[95m'
 LIGHT_CYAN='\033[96m'
 LIGHT_WHITE='\033[97m'
 
-printf "${RESET}"
+printf '%b' "$RESET"
 
-echo -e "${BOLD}${CYAN}PrismOS${RESET}: system start-up"
+printf '%b\n' "${BOLD}${CYAN}PrismOS${RESET}: system start-up"
 
 # Run package startup scripts
 for script in /etc/rc.d/*; do
     if [ -x "$script" ]; then
-        echo -e "  ${LIGHT_CYAN}→${RESET} Running ${WHITE}$script${RESET}"
+        printf '%b\n' "  ${LIGHT_CYAN}→${RESET} Running ${WHITE}$script${RESET}"
         "$script"
     fi
 done
 
-echo -e "${BOLD}${GREEN}PrismOS${RESET}: startup complete"
+printf '%b\n' "${BOLD}${GREEN}PrismOS${RESET}: startup complete"
 
 if [ -x /etc/keyboard-setup ]; then
-	/etc/keyboard-setup
+    /etc/keyboard-setup
 else
-    printf "[${RED}Error${RESET}] Cannot run /etc/keyboard-setup \n"
+    printf '%b\n' "[${RED}Error${RESET}] Cannot run /etc/keyboard-setup"
 fi
 
 clear
 
 printf '\n'
-printf "${BOLD}${MAGENTA}Welcome to PrismOS!${RESET}\n\n"
+printf '%b\n\n' "${BOLD}${MAGENTA}Welcome to PrismOS!${RESET}"
 
-printf "${LIGHT_CYAN}The whole operating system is fully written from scratch in "
-printf "${BOLD}${BLUE}C/Rust${RESET}\n"
+printf '%b' "${LIGHT_CYAN}The whole operating system is fully written from scratch in "
+printf '%b\n' "${BOLD}${BLUE}C/Rust${RESET}"
 
-printf "${LIGHT_YELLOW}And it can run some things like Busybox or small programs.${RESET}\n\n"
+printf '%b\n\n' "${LIGHT_YELLOW}And it can run some things like Busybox or small programs.${RESET}"
 
-printf "${BOLD}${LIGHT_GREEN}Enjoy!${RESET}\n\n"
+printf '%b\n\n' "${BOLD}${LIGHT_GREEN}Enjoy!${RESET}"
