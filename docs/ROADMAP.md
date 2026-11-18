@@ -72,7 +72,7 @@ Phase 3 — POSIX userspace
 
 Phase 4 — toolchain (phase 3.2 already ships cross binutils 2.44 and gcc 14.2.0, so this phase is about completing and using them)
 - [x] Phase 4.1 — complete binutils in the image: cross-built `ar`, `ranlib`, `strip`, `objdump`, `nm`, installed and used by the builds
-  - [x] the five utilities as PrismOS programs: binutils 2.44 configured `--host=x86_64-prismos,target=x86_64-prismos` (the same tarball and triplet patch the toolchain already fetches), compiled against the mlibc sysroot and linked as the static PIEs the loader expects — `ports/binutils`, whose `prism-cc` driver turns the do_prog discipline into a compiler shape so binutils' own configure and make drive both toolchain paths (bootstrap wrappers or real cross tools) unchanged; libc.a leads the link group, libiberty's always-built `getopt.o`/`fnmatch.o` never colliding with the static library's
+  - [x] the five utilities as PrismOS programs: binutils 2.44 configured `--host=x86_64-prismos --target=x86_64-prismos` (the same tarball and triplet patch the toolchain already fetches), compiled against the mlibc sysroot and linked as the static PIEs the loader expects — `ports/binutils`, whose `prism-cc` driver turns the do_prog discipline into a compiler shape so binutils' own configure and make drive both toolchain paths (bootstrap wrappers or real cross tools) unchanged; libc.a leads the link group, libiberty's always-built `getopt.o`/`fnmatch.o` never colliding with the static library's
   - [x] the libc gap the port revealed: the **glibc option** joins the mlibc port (`'glibc': true` — `getopt_long`, the GNU long options the utilities parse their flags with; the option set finally matching the deliberately Linux-shaped ABI the gcc patch chose), while what the kernel lacks stays `ENOSYS` and degrades honestly (libiberty's `getrlimit` probe)
   - [x] installed into the image: `/usr/bin/{ar,ranlib,nm,objdump,strip}`, stripped with the cross strip under the 4 MiB whole-file cap (1.9–3.2 MiB each, ~11 MiB together — the root partition 64→96 MiB); `as` and `ld` stay phase 5.1's business
   - [x] used by the builds: the port's own AR / RANLIB archive libbfd, libopcodes, libsframe and zlib, the cross strip stages the five; `verify.sh` disassembles every program it checks through the prefixed `objdump` / `nm` / `readelf` (bootstrap.sh's wrapper set completed with `objdump` + `readelf`); the Makefile grew `make binutils` and `make root` installs the five
@@ -101,4 +101,4 @@ Beyond (nice to have)
 - [ ] desktop (Xorg, then KDE): mlibc is the entry ticket, not the whole price, also `epoll` (Unix domain sockets landed), shared memory (`MAP_SHARED` of files, `shm`), a display / input device interface (KMS-style), and a lot of the Linux surface (`/proc`, `/sys`, `udev`-like discovery)
 - [ ] AArch64 port of the kernel and loader
 
-*`One day, perhaps, PrismOS will be self-hosted lol`*
+*One day, perhaps, PrismOS will be self-hosted lol*
