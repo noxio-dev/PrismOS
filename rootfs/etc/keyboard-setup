@@ -21,7 +21,7 @@ printf "${GREEN}  3.${RESET} UK English (QWERTY)\n"
 printf "${GREEN}  4.${RESET} German (QWERTZ)\n"
 printf "${GREEN}  5.${RESET} Spanish (QWERTY)\n\n"
 
-printf "${YELLOW}Select [1-6]: ${RESET}"
+printf "${YELLOW}Select [1-5]: ${RESET}"
 # An 8 s ceiling, not a boot blocker: the boot tests and the serial
 # sessions are headless (nobody can answer here, the input queue stays
 # empty), so the silence falls back to /etc/keymap -- the layout
