@@ -151,7 +151,10 @@ static int errors(char **envp)
         bad += expect("execve(/nonexistent)", ec(execve("/nonexistent", av, envp)), -ENOENT);
         bad += expect("execve(/boot/loader.conf)", ec(execve("/boot/loader.conf", av, envp)), -EACCES);
         bad += expect("execve(/bin/notelf.dat)", ec(execve("/bin/notelf.dat", av, envp)), -ENOEXEC);
-        bad += expect("execve(/bin) directory", ec(execve("/bin", av, envp)), -EISDIR);
+        /* A directory is not executable: EACCES, the gate's answer since
+         * phase 3.5.4 (POSIX allows EACCES or EISDIR here; the old
+         * expectation was EISDIR from phase 2.4, before the gate). */
+        bad += expect("execve(/bin) directory", ec(execve("/bin", av, envp)), -EACCES);
         bad += expect("execve(bad pointer)", ec(execve((const char *)0x1234, av, envp)), -EFAULT);
         bad += expect("execve(path too long)", ec(execve(longpath, av, envp)), -ENAMETOOLONG);
         {

@@ -234,6 +234,17 @@ $B/busybox.stamp: $B/toolchain/usr/.stamp $B/mlibc-port.md5 $(BUSYBOX_PORT_FILES
 
 NANO_PORT_FILES := $(shell find ports/nano -type f | sort)
 
+# doom's data: the shareware IWAD is not redistributable, so the build
+# does not fetch it -- the user drops one in the tree and the root
+# target copies it into the image at the directory doom's d_iwad.c
+# search starts from (the cwd the port chdir()s to).  A doom1.wad or
+# doom.wad at the repo root is picked up automatically; anything else,
+# spell it on the make line (make DOOM_WAD=/path/to/doom2.wad root).
+# Without one the image still builds and /usr/bin/doom still runs -- it
+# exits with the game's own "no IWAD found" report.
+DOOM_WAD ?= $(firstword $(wildcard doom1.wad DOOM1.WAD doom.wad))
+DOOM_PORT_FILES := $(shell find pkg/doom/src/main.c pkg/doom/prism.toml | sort)
+
 nano: $B/nano.stamp
 $B/nano.stamp: $B/toolchain/usr/.stamp $B/mlibc-port.md5 $(NANO_PORT_FILES)
 	@mkdir -p $(@D)
@@ -350,8 +361,18 @@ root: $B/root.stamp
 # reads whole files (MAX_ELF_FILE is 4 MiB) and the debug sections buy
 # it nothing.
 ROOTFS_FILES := $(shell find rootfs -type f | sort)
+# The root state records the WAD spell-out: a 1995-vintage IWAD (the
+# zip carries its own date) reads older than this stamp, so a first
+# `make DOOM_WAD=...` would otherwise look up to date without ever
+# copying.  The file holds the last value; a change re-runs the root.
+$B/root.wad: FORCE
+	@echo '$(DOOM_WAD)' > $@.new; cmp -s $@.new $@ || mv $@.new $@; rm -f $@.new
+.PHONY: FORCE
+FORCE:
+
 $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
-	$(HELLO_DYN) $B/pkgs.stamp $B/binutils.stamp $B/busybox.stamp $B/nano.stamp $(ROOTFS_FILES)
+	$(HELLO_DYN) $B/pkgs.stamp $B/binutils.stamp $B/busybox.stamp $B/nano.stamp \
+	$(DOOM_WAD) $B/root.wad $(ROOTFS_FILES)
 	rm -rf $B/root
 	mkdir -p $B/root/boot/lua $B/root/boot/defaults $B/root/boot/kernel \
                  $B/root/dev $B/root/etc $B/root/proc $B/root/sys $B/root/tmp \
@@ -398,6 +419,19 @@ $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
 	cp $B/nano-out/libncursesw.so.6 $B/root/usr/lib/libncursesw.so.6
 	mkdir -p $B/root/usr/share/terminfo/p
 	cp $B/nano-out/terminfo/p/prism $B/root/usr/share/terminfo/p/prism
+	# doom: the game lands in /usr/bin through pkg/doom's manifest; its
+	# data does not ride in the package -- the shareware IWAD is the
+	# user's to supply (see DOOM_WAD above).  The port chdir()s to the
+	# directory the copy lands in, which is where d_iwad.c's search
+	# starts, and where the game's own saves land beside it.
+	mkdir -p $B/root/usr/share/games/doom
+	if [ -n "$(DOOM_WAD)" ]; then \
+		cp "$(DOOM_WAD)" $B/root/usr/share/games/doom/doom1.wad; \
+		echo "  doom   $(DOOM_WAD) -> /usr/share/games/doom/doom1.wad"; \
+	else \
+		echo "  doom   no IWAD in the tree: /usr/bin/doom runs without data"; \
+		echo "         (drop doom1.wad here, or make DOOM_WAD=... root)"; \
+	fi
 	chmod 755 $B/root/usr/bin/* $B/root/usr/lib/libncursesw.so.6
 	$(TOOLCHAIN)/bin/x86_64-prismos-strip --strip-all \
 		-o $B/root/usr/lib/ld.so $(SYSROOT)/usr/lib/ld.so

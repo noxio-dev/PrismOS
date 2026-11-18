@@ -61,7 +61,7 @@ KVER = kernel_version()
 LOGIN_PROMPT = "prismos login:"
 SHELL_PROMPT = "prism$ "
 KSHELL_PROMPT = "prism# "
-MOTD = "Welcome to PrismOS (busybox + ash, phase 3.4)."
+MOTD = "Welcome to PrismOS."
 
 
 def expectation_met(text, want):
@@ -210,8 +210,10 @@ def main():
     # SNN* script banner of /etc/rc), opens the keyboard-setup prompt that a
     # headless boot times out of, prints the banner twice (rc + session) and
     # puts the login on the serial tty.
+    # init itself is quiet since CONFIG_FEATURE_INIT_QUIET=y (the header
+    # line "init started: BusyBox v1.37.0" is compiled out); the rcS run
+    # is the first thing the serial line hears from the userland.
     userland_start = kernel_brief + [
-        "init started: BusyBox v1.37.0",
         "starting pid 2, tty '': '/etc/init.d/rcS'",
         "PrismOS: system startup",
         "S00mounts", "S05hostname", "S10keymap",
@@ -392,7 +394,7 @@ def main():
           "float check: ok",
           "hello chain: pid 2 calls execve()", 'argv[2] = "(after execve)"', 'argv[4] = "y"',
           "execve(/nonexistent)         -> -2", "execve(/boot/loader.conf)    -> -13",
-          ("count", "not an ELF file", 2),            # errors' third check + the step below
+          "not an ELF file",              # the notelf script's own echo (the last step)
           "notelf -- exited with status 0",
           "fpu 1: 40 rounds ok", "fpu 2: 40 rounds ok",
           "hello fault: about to dereference NULL", "killed by exception 14",
@@ -738,6 +740,38 @@ def main():
           ("count", LOGIN_PROMPT, 2),          # boot + respawn
           ("count", MOTD, 2),                  # its motd, twice
           "second-session"], 240))
+
+    # /usr/bin/doom: the doomgeneric port.  Without data in the image the
+    # game runs its startup chain (Z_Init, the config dir), reports
+    # "Game mode indeterminate" through its own I_Error and exits
+    # cleanly (the port's atexit put the console tty back) -- the
+    # prompt's second occurrence is the proof.  With the shareware IWAD
+    # in the image (make DOOM_WAD=...), the run finds it in the cwd the
+    # port chdir()s to, brings the framebuffer up (i_video's
+    # I_InitGraphics report) and quits through the menu -- Escape, up
+    # (the main menu wraps from New Game onto Quit Game), Enter, 'y':
+    # the menu draws on the framebuffer, so the steps are timed, not
+    # echoed.
+    doom_wad = os.path.join(os.path.dirname(os.path.abspath(image)),
+                            "root", "usr", "share", "games", "doom", "doom1.wad")
+    if os.path.exists(doom_wad):
+        scenarios.append(
+            ("BIOS userland: doom (shareware IWAD, framebuffer, quit menu)", bios_cmd,
+             [(SHELL_PROMPT, "doom\r", 1.2, 1),
+              ("I_InitGraphics: framebuffer", "\x1b", 2.0),
+              ("I_InitGraphics: framebuffer", "\x1b[A", 1.5, 1),
+              ("I_InitGraphics: framebuffer", "\r", 2.0, 1),
+              ("I_InitGraphics: framebuffer", "y", 3.0, 1),
+              (SHELL_PROMPT, "echo back-from-doom\r", 0.5, 2)],
+             ["I_InitGraphics: framebuffer",
+              "back-from-doom"], 240))
+    else:
+        scenarios.append(
+            ("BIOS userland: doom without data (the game's own I_Error)", bios_cmd,
+             [(SHELL_PROMPT, "doom\r", 1.2, 1),
+              (SHELL_PROMPT, "echo back-from-doom\r", 0.5, 2)],
+             ["Game mode indeterminate",
+              "back-from-doom"], 180))
 
     # A substring filter for focused runs (comma-separated): keep the
     # whole-suite default for CI, let a developer ask for one scenario.

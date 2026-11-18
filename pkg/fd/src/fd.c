@@ -107,9 +107,20 @@ static int sc_stdio(void)
         bad += !expect(ec(write(9, l1, 4)), -EBADF);
         bad += !expect(ec(read(9, b, sizeof b)), -EBADF);
         bad += !expect(ec(close(9)), -EBADF);
-        bad += !expect(ec(read(1, b, sizeof b)), -EBADF); /* write-only */
+        /* read on a write-only descriptor -- one of our own: the
+         * session's fd 1 is O_RDWR (busybox init dups a single
+         * read-write tty open onto 0/1/2), so a read there is a real
+         * read, and a tty with no byte pending parks it.  A write-only
+         * file is the EBADF this check is about. */
+        long wf = open("/fd.txt", O_WRONLY | O_CREAT, 0644);
+        if (wf < 0)
+                bad++;
+        else {
+                bad += !expect(ec(read(wf, b, sizeof b)), -EBADF);
+                close(wf);
+        }
         bad += !expect(ec(lseek(1, 0, SEEK_SET)), -ESPIPE);
-        fmt(d, sizeof d, "%d checks, EBADF x3, ESPIPE on the console", 6 - bad);
+        fmt(d, sizeof d, "%d checks, EBADF x4, ESPIPE on the console", 7 - bad);
         check("stdio", bad == 0, d);
         return bad;
 }
