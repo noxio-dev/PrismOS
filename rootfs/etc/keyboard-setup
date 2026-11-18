@@ -1,60 +1,92 @@
 #!/bin/sh
-
-# PrismOS Keyboard Setup
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 noxio-dev
+#
+# PrismOS Keyboard Setup.
+# BusyBox ash + loadkmap only.  Draws a bordered picker in the same style
+# as the loader menu.  Blocks on read until the user answers (no timeout);
+# on EOF (headless boot, closed stdin) it falls back to /etc/keymap.
 
 RESET='\033[0m'
 BOLD='\033[1m'
-CYAN='\033[36m'
-GREEN='\033[32m'
-YELLOW='\033[33m'
-MAGENTA='\033[35m'
-WHITE='\033[37m'
+DIM='\033[2m'
+CYAN='\033[1;36m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+MAGENTA='\033[1;35m'
+WHITE='\033[1;37m'
+
+W=48
+# Build the horizontal rule with plain shell arithmetic -- no tr/sed, so it
+# works on any BusyBox build.
+hr=""
+i=0
+while [ $i -lt $((W - 2)) ]; do hr="$hr-"; i=$((i + 1)); done
+line()  { printf "${DIM}+%s+${RESET}\n" "$hr"; }
+blank() { printf "${DIM}|%*s|${RESET}\n" "$((W - 2))" ''; }
+# left-aligned text cell padded to the box width
+cell()  { printf "${DIM}|${RESET} %s%-*s${DIM}|${RESET}\n" "$1" "$((W - 3 - ${#2}))" "$2"; }
+
+# center <visible-text> <colored-string>: pad from the visible length so the
+# escape sequences do not skew the centering.
+center() {
+    len=${#1}
+    pad=$(( (W - len) / 2 ))
+    printf "${DIM}|${RESET}%*s%s%*s${DIM}|${RESET}\n" "$pad" '' "$2" "$((W - 2 - pad - len))" ''
+}
 
 clear
+printf "\n"
+line
+blank
+center "PrismOS Keyboard Setup" "$(printf "${BOLD}${MAGENTA}PrismOS Keyboard Setup${RESET}")"
+center "select the console keymap" "$(printf "${DIM}select the console keymap${RESET}")"
+blank
+line
+blank
 
-printf "\n${BOLD}${MAGENTA}PrismOS Keyboard Setup${RESET}\n\n"
-printf "${CYAN}Choose your keyboard layout:${RESET}\n\n"
+cell "$(printf "${GREEN} 1.${RESET}")" "French             (AZERTY)"
+cell "$(printf "${GREEN} 2.${RESET}")" "US English         (QWERTY)"
+cell "$(printf "${GREEN} 3.${RESET}")" "UK English         (QWERTY)"
+cell "$(printf "${GREEN} 4.${RESET}")" "German             (QWERTZ)"
+cell "$(printf "${GREEN} 5.${RESET}")" "Spanish            (QWERTY)"
 
-printf "${GREEN}  1.${RESET} French (AZERTY)\n"
-printf "${GREEN}  2.${RESET} US English (QWERTY)\n"
-printf "${GREEN}  3.${RESET} UK English (QWERTY)\n"
-printf "${GREEN}  4.${RESET} German (QWERTZ)\n"
-printf "${GREEN}  5.${RESET} Spanish (QWERTY)\n\n"
+blank
+line
+printf "\n"
 
-printf "${YELLOW}Select [1-5]: ${RESET}"
-# An 8 s ceiling, not a boot blocker: the boot tests and the serial
-# sessions are headless (nobody can answer here, the input queue stays
-# empty), so the silence falls back to /etc/keymap -- the layout
-# S10keymap already loaded -- and the boot goes on.
-if read -t 8 choice; then
+layout=""
+saved=""
+while [ -z "$layout" ]; do
+    printf "${YELLOW}Select [1-5]: ${RESET}"
+    if ! read choice; then
+        # EOF: headless boot or closed stdin.  Keep the layout that
+        # S10keymap already loaded and continue booting.
+        printf "${DIM}(no input -- keeping the /etc/keymap layout)${RESET}\n"
+        saved=$(cat /etc/keymap 2>/dev/null)
+        test -n "$saved" || saved="us"
+        layout="$saved"
+        break
+    fi
     case "$choice" in
         1) layout="fr" ;;
         2) layout="us" ;;
         3) layout="uk" ;;
         4) layout="de" ;;
         5) layout="es" ;;
-        *)
-            printf "${YELLOW}Invalid selection.${RESET}\n"
-            exit 1
-            ;;
+        *)  printf "${YELLOW}Invalid selection -- enter a number from 1 to 5.${RESET}\n" ;;
     esac
-else
-    printf "\n${YELLOW}No answer (headless boot) -- keeping the /etc/keymap layout.${RESET}\n"
-    layout=$(cat /etc/keymap 2>/dev/null)
-    test -n "$layout" || layout="us"
-fi
+done
 
 if [ ! -f "/usr/share/keymaps/$layout.bkmap" ]; then
-    printf "${YELLOW}Keyboard map not found!${RESET}\n"
+    printf "\n${YELLOW}Keyboard map not found: /usr/share/keymaps/%s.bkmap${RESET}\n" "$layout"
     exit 1
 fi
 
-loadkmap < "/usr/share/keymaps/$layout.bkmap"
-
-if [ $? -eq 0 ]; then
+if loadkmap < "/usr/share/keymaps/$layout.bkmap"; then
     echo "KEYMAP=$layout" > /etc/keyboard.conf
-    printf "\n${GREEN}Keyboard layout successfully loaded!${RESET}\n"
+    printf "\n${GREEN}Keyboard layout '%s' loaded successfully.${RESET}\n" "$layout"
 else
-    printf "\n${YELLOW}Failed to load keyboard layout.${RESET}\n"
+    printf "\n${YELLOW}Failed to load keyboard layout '%s'.${RESET}\n" "$layout"
     exit 1
-fi
+fi 
