@@ -45,6 +45,7 @@
 
 static int prism_kbd_init(void);
 static void prism_exit(void);
+static int kbd_medium;                  /* 1: console keycodes, press/release */
 
 /* ---------------------------------------------------------------- screen */
 
@@ -125,14 +126,19 @@ void DG_Init(void)
          * m_config's ORIGCODE is off (no config file is read or
          * written), so rebind here, before the game ever reads these:
          * fire, use, strafe and speed on the keys a tty does send. */
-        key_fire = 0x03;            /* ^C (ISIG is off) -- the original fire key */
-        key_use = ' ';
-        key_strafe = 'a';           /* vanilla's alt: hold + left/right arrows */
-        key_speed = 'r';
-        key_strafeleft = 'd';
-        key_straferight = 'f';
-        key_nextweapon = '/';
-        key_prevweapon = '.';
+        if (!kbd_medium) {
+                key_fire = 0x03;    /* ^C (ISIG is off) -- the original fire key */
+                key_use = ' ';
+                key_strafe = 'a';   /* vanilla's alt: hold + left/right arrows */
+                key_speed = 'r';
+                key_strafeleft = 'd';
+                key_straferight = 'f';
+                key_nextweapon = '/';
+                key_prevweapon = '.';
+        }
+        /* On the console (K_MEDIUMRAW) the keys arrive as real scancode
+         * events and the in-code defaults apply: ctrl fire, space use,
+         * shift run, alt strafe, , and . strafe. */
 }
 
 void DG_DrawFrame(void)
@@ -180,6 +186,19 @@ static int kbd_fd = -1;
 static struct termios kbd_saved;
 static int kbd_fl;              /* the fd's own flags (O_NONBLOCK is ours) */
 
+/* The console's keyboard modes (<linux/kd.h>, answered by hw/keymap.rs
+ * through user/fd.rs).  K_MEDIUMRAW hands over one byte per key event:
+ * the Linux keycode, bit 7 set on release -- the real "key is down /
+ * key went up" a tty's text bytes cannot give.  Only the console
+ * answers; the serial line says -ENOTTY and keeps the hold model below. */
+#define PRISM_KDGKBMODE 0x4B44
+#define PRISM_KDSKBMODE 0x4B45
+#define PRISM_K_UNICODE 3
+#define PRISM_K_MEDIUMRAW 2
+
+static unsigned int kbd_mode_saved = PRISM_K_UNICODE;
+static uint8_t kc_down[128];            /* keycodes currently held */
+
 static struct {
         int pressed;
         int key;
@@ -200,6 +219,13 @@ static uint32_t esc_at;         /* the tick a held lone ESC arrived (0: none) */
 static void kbd_restore(void)
 {
         if (kbd_fd >= 0) {
+                /* First: a console left in MEDIUMRAW would leave the
+                 * shell with keycodes instead of characters. */
+                if (kbd_medium) {
+                        prism_ioctl(kbd_fd, PRISM_KDSKBMODE,
+                                    (void *)(long)kbd_mode_saved);
+                        kbd_medium = 0;
+                }
                 tcsetattr(kbd_fd, TCSANOW, &kbd_saved);
                 fcntl(kbd_fd, F_SETFL, kbd_fl);
                 kbd_fd = -1;
@@ -260,6 +286,21 @@ static int prism_kbd_init(void)
         raw.c_cflag |= CS8;
         tcsetattr(kbd_fd, TCSANOW, &raw);
         fcntl(kbd_fd, F_SETFL, kbd_fl | O_NONBLOCK);
+
+        /* On the console, ask for real key events: a held key is then a
+         * key that stays down until its release arrives (no timer, so
+         * no gap between the first press and the host's autorepeat).
+         * Anything that fails leaves the text-byte model in charge. */
+        {
+                unsigned int mode = PRISM_K_UNICODE;
+
+                if (prism_ioctl(kbd_fd, PRISM_KDGKBMODE, &mode) == 0 &&
+                    prism_ioctl(kbd_fd, PRISM_KDSKBMODE,
+                                (void *)(long)PRISM_K_MEDIUMRAW) == 0) {
+                        kbd_mode_saved = mode;
+                        kbd_medium = 1;
+                }
+        }
         return 0;
 }
 
@@ -289,6 +330,78 @@ static void key_press(int k)
         key_push(1, k);
 }
 
+/* Linux keycode -> doomkeys code, the convention of doomgeneric's own
+ * platforms (ctrl fires, space uses, shift runs, alt strafes, , and .
+ * strafe).  0 = a key the game has no use for. */
+static const unsigned char kc_doom[128] = {
+        [1] = KEY_ESCAPE,
+        [2] = '1', [3] = '2', [4] = '3', [5] = '4', [6] = '5',
+        [7] = '6', [8] = '7', [9] = '8', [10] = '9', [11] = '0',
+        [12] = KEY_MINUS, [13] = KEY_EQUALS, [14] = KEY_BACKSPACE,
+        [15] = KEY_TAB,
+        [16] = 'q', [17] = 'w', [18] = 'e', [19] = 'r', [20] = 't',
+        [21] = 'y', [22] = 'u', [23] = 'i', [24] = 'o', [25] = 'p',
+        [26] = '[', [27] = ']', [28] = KEY_ENTER,
+        [29] = KEY_FIRE,                        /* left ctrl */
+        [30] = 'a', [31] = 's', [32] = 'd', [33] = 'f', [34] = 'g',
+        [35] = 'h', [36] = 'j', [37] = 'k', [38] = 'l',
+        [39] = ';', [40] = '\'', [41] = '`',
+        [42] = KEY_RSHIFT,                      /* left shift */
+        [43] = '\\',
+        [44] = 'z', [45] = 'x', [46] = 'c', [47] = 'v', [48] = 'b',
+        [49] = 'n', [50] = 'm',
+        [51] = KEY_STRAFE_L,                    /* , */
+        [52] = KEY_STRAFE_R,                    /* . */
+        [53] = '/',
+        [54] = KEY_RSHIFT,
+        [55] = '*',
+        [56] = KEY_LALT,                        /* left alt */
+        [57] = KEY_USE,                         /* space */
+        [59] = KEY_F1, [60] = KEY_F2, [61] = KEY_F3, [62] = KEY_F4,
+        [63] = KEY_F5, [64] = KEY_F6, [65] = KEY_F7, [66] = KEY_F8,
+        [67] = KEY_F9, [68] = KEY_F10, [87] = KEY_F11, [88] = KEY_F12,
+        [96] = KEY_ENTER,                       /* keypad enter */
+        [97] = KEY_FIRE,                        /* right ctrl */
+        [100] = KEY_LALT,                       /* right alt */
+        [102] = KEY_HOME, [103] = KEY_UPARROW, [104] = KEY_PGUP,
+        [105] = KEY_LEFTARROW, [106] = KEY_RIGHTARROW, [107] = KEY_END,
+        [108] = KEY_DOWNARROW, [109] = KEY_PGDN, [110] = KEY_INS,
+        [111] = KEY_DEL, [119] = KEY_PAUSE,
+};
+
+/* K_MEDIUMRAW: every byte is one key event (keycode, bit 7 = release).
+ * The game gets exactly what the keyboard did: a key stays down as long
+ * as it is held, whatever the host's autorepeat delay is.  A repeated
+ * make code (the autorepeat) is not a new press; two keys that mean the
+ * same doom key (left and right shift) release it with the last one. */
+static void key_drain_medium(void)
+{
+        uint8_t tmp[KB_BUF];
+        long n;
+
+        while ((n = read(kbd_fd, tmp, sizeof(tmp))) > 0) {
+                for (long i = 0; i < n; i++) {
+                        int kc = tmp[i] & 0x7f;
+                        int down = !(tmp[i] & 0x80);
+                        int k = kc_doom[kc];
+
+                        if (!k || down == kc_down[kc])
+                                continue;
+                        kc_down[kc] = (uint8_t)down;
+                        if (!down) {
+                                int other = 0;
+
+                                for (int j = 0; j < 128; j++)
+                                        if (kc_down[j] && kc_doom[j] == k)
+                                                other = 1;
+                                if (other)
+                                        continue;
+                        }
+                        key_push(down, k);
+                }
+        }
+}
+
 /* A tty byte is a key, except the few a terminal cannot say: the
  * action keys the in-code binds live in the C0 range, and ^H stands in
  * for 0x7f (both are backspace). */
@@ -314,6 +427,11 @@ static void key_drain(void)
         };
         long n;
         int pos;
+
+        if (kbd_medium) {
+                key_drain_medium();
+                return;
+        }
 
         while ((n = read(kbd_fd, tmp, sizeof(tmp))) > 0) {
                 for (long i = 0; i < n; i++) {
@@ -371,7 +489,7 @@ int DG_GetKey(int *pressed, unsigned char *key)
         key_drain();
 
         /* Nothing new and the hold expired: the key goes up. */
-        if (held_key && key_qh == key_qt &&
+        if (!kbd_medium && held_key && key_qh == key_qt &&
             DG_GetTicksMs() - held_at >= HOLD_MS) {
                 key_push(0, held_key);
                 held_key = 0;

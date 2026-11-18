@@ -26,7 +26,7 @@ char *doom1_endmsg[] =
   "please don't leave, there's more\ndemons to toast!",
   "let's beat it -- this is turning\ninto a bloodbath!",
   "i wouldn't leave if i were you.\ndos is much worse.",
-  "you're trying to say you like dos\nbetter than me, right?",
+  "you're trying to say you like PrismOS\nbetter than me, right?",
   "don't leave yet -- there's a\ndemon around that corner!",
   "ya know, next time you come in here\ni'm gonna toast ya.",
   "go ahead and leave. see if i care.",
