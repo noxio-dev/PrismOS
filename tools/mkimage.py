@@ -156,8 +156,29 @@ def build_ext4(root_dir, size_mib, workdir):
     with open(img, "wb") as f:
         f.truncate(size_mib * 1024 * 1024)
     subprocess.run(["mke2fs", "-q", "-F", "-t", "ext4", "-L", "PRISMROOT",
-                    "-d", root_dir, img], check=True)
+                    "-E", "root_owner=0:0", "-d", root_dir, img], check=True)
+    chown_root(root_dir, img, workdir)
     return img
+
+
+def chown_root(root_dir, img, workdir):
+    """mke2fs -d copies the *build host's* uid/gid onto every file it
+    populates (root_owner=0:0 only covers the root directory), so the image
+    would be owned by uid 1000.  Rewrite uid/gid to 0 on every populated
+    inode with debugfs, without needing root or fakeroot on the host."""
+    cmds = []
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        rel = os.path.relpath(dirpath, root_dir)
+        for name in dirnames + filenames:
+            path = "/" + (name if rel == "." else os.path.join(rel, name))
+            path = path.replace("\\", "\\\\").replace('"', '\\"')
+            cmds.append('sif "%s" uid 0' % path)
+            cmds.append('sif "%s" gid 0' % path)
+    script = os.path.join(workdir, "chown.debugfs")
+    with open(script, "w") as f:
+        f.write("\n".join(cmds) + "\n")
+    subprocess.run(["debugfs", "-w", "-f", script, img], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def main():

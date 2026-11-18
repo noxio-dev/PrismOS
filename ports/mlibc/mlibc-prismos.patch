@@ -641,3 +641,21 @@ index a1af64d0..818cd164 100644
  	return &global_utf8_charcode.get();
  }
  
+diff --git a/options/posix/generic/sys-wait.cpp b/options/posix/generic/sys-wait.cpp
+index 092790a..30dabad 100644
+--- a/options/posix/generic/sys-wait.cpp
++++ b/options/posix/generic/sys-wait.cpp
+@@ -32,10 +32,9 @@ pid_t wait(int *status) {
+ }
+ 
+ pid_t wait3(int *status, int options, struct rusage *rusage) {
+-	(void) rusage;
+-	mlibc::infoLogger() << "\e[31mmlibc: wait3() is not implemented correctly\e[39m"
+-		<< frg::endlog;
+-	return waitpid(-1, status, options);
++	// wait3(s, o, r) is wait4(-1, s, o, r) by definition; the Waitpid sysdep
++	// already carries the rusage pointer (PrismOS syscall 66).
++	return wait4(-1, status, options, rusage);
+ }
+ 
+ pid_t wait4(pid_t pid, int *status, int options, struct rusage *ru) {

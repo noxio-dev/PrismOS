@@ -814,12 +814,21 @@ int Sysdeps<Rmdir>::operator()(const char *path) {
 
 int Sysdeps<Fchownat>::operator()(int dirfd, const char *path,
                 uid_t uid, gid_t gid, int flags) {
-        /* The kernel has no owner changes (chown* absent from its surface):
-         * ENOSYS, like the other absent classes -- and NOT the missing-
-         * sysdep __ensure, which mlibc guarantees from the generic fallback
-         * and which busied the tar extraction with one. */
-        (void)dirfd; (void)path; (void)uid; (void)gid; (void)flags;
-        return ENOSYS;
+        /* chown(2) (86) follows a final symlink, lchown(2) (88) does not.
+         * No *at syscalls in the kernel: only AT_FDCWD resolves, and of
+         * the flags only AT_SYMLINK_NOFOLLOW changes the call.  uid / gid
+         * of (uid_t)-1 / (gid_t)-1 keep the field: the kernel's own
+         * "unchanged" spelling, passed through as the 64-bit value. */
+        if(dirfd != AT_FDCWD)
+                return ENOSYS;
+        if(flags & ~AT_SYMLINK_NOFOLLOW)
+                return EINVAL;
+        auto ret = sys(flags & AT_SYMLINK_NOFOLLOW ? PRISM_SYS_LCHOWN
+                                                   : PRISM_SYS_CHOWN,
+                        path, uid, gid);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
 }
 
 int Sysdeps<Unlinkat>::operator()(int dirfd, const char *path, int flags) {

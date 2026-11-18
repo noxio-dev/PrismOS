@@ -679,7 +679,7 @@ fn console_deliver(buf: u64, chunk: &[u8], got: usize) -> i64 {
 
 fn read_tty(which: tty::Term, desc: &Rc<FileDesc>, buf: u64, len: usize) -> i64 {
     let nonblock = desc.flags() & O_NONBLOCK != 0;
-    let start = uptime_ms();
+    let mut start = uptime_ms();
     let want = len.min(CHUNK);
     let mut chunk = [0u8; CHUNK];
     let wname = match which {
@@ -736,10 +736,11 @@ fn read_tty(which: tty::Term, desc: &Rc<FileDesc>, buf: u64, len: usize) -> i64 
             return -EAGAIN;
         }
         if uptime_ms() - start >= WAIT_MAX_MS {
-            // A way out, not a wedge: the caller re-reads (a shell prompt
-            // idles for hours this way, ten seconds at a time).
-            tty::set_reader(which, 0);
-            return -EAGAIN;
+            // A blocking tty read waits until data, a signal or ^D: an
+            // -EAGAIN here is read as end of file by mlibc and kills every
+            // idle login after ten seconds.  The house cap only bounds one
+            // park at a time, so re-arm it (the same rule as poll/select).
+            start = uptime_ms();
         }
         // crate::kprintln!("[rd] iters={} parking", iters); // TEMP
         park_once();

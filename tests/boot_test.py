@@ -375,19 +375,17 @@ def main():
           "process table empty"], 240),
         # Phase 2.4: ELF programs from the ext4 root (/bin/hello is a static PIE
         # built by `make`): loader, argv/envp/auxv, execve, per-process FPU
-        # state, fault containment, exit status.  hello errors stops at its
-        # third check these days: /bin/notelf is the rootfs' own shebang demo
-        # now (a #!/bin/sh script), so its execve succeeds and replaces hello
-        # with the script -- ash's own fork of `echo` takes the next pid, so
-        # the waits below key on the occurrences of the exit report and the
-        # notelf report instead of pinning process numbers (see the report).
+        # state, fault containment, exit status.  hello errors' third check
+        # execs /bin/notelf.dat (a data file, no shebang: ENOEXEC) so it runs
+        # to the end; /bin/notelf stays the rootfs' shebang demo (a #!/bin/sh
+        # script that the final step runs).
         ("BIOS shell: ELF programs + execve (phase 2.4)", ksh_cmd,
          [(KSHELL_PROMPT, "exec hello info alpha\r"),
           ("hello -- exited with status 0", "exec hello chain x y\r", 0.3, 1),
           ("hello -- exited with status 0", "exec hello errors\r", 0.3, 2),
-          ("notelf -- exited with status 0", "exec hello fpu 1\r", 0.3, 1),
-          ("hello -- exited with status 0", "exec hello fpu 2\r", 0.3, 3),
-          ("hello -- exited with status 0", "exec hello fault\r", 0.3, 4),
+          ("hello -- exited with status 0", "exec hello fpu 1\r", 0.3, 3),
+          ("hello -- exited with status 0", "exec hello fpu 2\r", 0.3, 4),
+          ("hello -- exited with status 0", "exec hello fault\r", 0.3, 5),
           ("killed by exception 14", "exec hello exit 42\r"),
           ("exited with status 42", "exec notelf\r")],
          ['argv[2] = "alpha"', "env: PRISMOS=" + KVER, "main() runs at 0x", "AT_PAGESZ = 4096",
@@ -395,7 +393,7 @@ def main():
           "hello chain: pid 2 calls execve()", 'argv[2] = "(after execve)"', 'argv[4] = "y"',
           "execve(/nonexistent)         -> -2", "execve(/boot/loader.conf)    -> -13",
           ("count", "not an ELF file", 2),            # errors' third check + the step below
-          ("count", "notelf -- exited with status 0", 2),
+          "notelf -- exited with status 0",
           "fpu 1: 40 rounds ok", "fpu 2: 40 rounds ok",
           "hello fault: about to dereference NULL", "killed by exception 14",
           "exited with status 42"], 240),
