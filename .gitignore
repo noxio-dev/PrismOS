@@ -14,4 +14,4 @@ tests/fstest/target/
 !sys/kern/data/unifont.bin
 __pycache__/
 
-rootfs/etc/doom/doom1.wad
+rootfs/usr/share/games/doom/doom1.wad
