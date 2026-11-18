@@ -45,7 +45,6 @@ center() {
     printf "${CYAN}│${RESET}%*s%s%*s${CYAN}│${RESET}\n" "$lpad" '' "$2" "$rpad" ''
 }
 
-clear
 printf "\n"
 
 top_line

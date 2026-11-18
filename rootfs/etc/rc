@@ -46,8 +46,6 @@ else
     printf '%b\n' "[${RED}Error${RESET}] Cannot run /etc/keyboard-setup"
 fi
 
-clear
-
 printf '\n'
 printf '%b\n\n' "${BOLD}${MAGENTA}Welcome to PrismOS!${RESET}"
 
