@@ -946,6 +946,14 @@ pub fn sys_sethostname(name_p: u64, len: u64) -> i64 {
     }
 }
 
+/// `sync()` (syscall 103): push every mounted file system's dirty state to
+/// its device -- the same flush `reboot` ends with.  Always succeeds (the
+/// failures are logged by `sync_all`, like POSIX: sync() has no error).
+pub fn sys_sync() -> i64 {
+    crate::fs::fsys::sync_all();
+    0
+}
+
 /// `reboot(cmd)` (syscall 57): flush every file system, then restart or
 /// power the machine off.  The commands are the Linux ones; anything else
 /// is -EINVAL.  The exit routes are the classic ISA ones: the 0x604 and

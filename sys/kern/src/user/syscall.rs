@@ -63,6 +63,7 @@
 //    90..102 AF_UNIX stream sockets: socket, socketpair, bind, listen, accept4,
 //           connect, sendmsg, recvmsg, shutdown, getsockname, getpeername,
 //           getsockopt, setsockopt (user/fd/unix.rs)
+//    103 sync()                     flush every mounted file system
 //    59 setsid()                    60 setpgid(pid, pgid)   61 getpgid(pid)
 //    (a negative kill pid names a group; TIOCSCTTY claims a terminal)
 //
@@ -412,6 +413,7 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         100 => fd::unix::sys_getpeername(a0, a1, a2),
         101 => fd::unix::sys_getsockopt(a0, a1, a2, frame.r10, frame.r8),
         102 => fd::unix::sys_setsockopt(a0, a1, a2, frame.r10, frame.r8),
+        103 => sysc::sys_sync(),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

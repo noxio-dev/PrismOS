@@ -705,6 +705,11 @@ int Sysdeps<Fsync>::operator()(int fd) {
         return 0;
 }
 
+void Sysdeps<Sync>::operator()() {
+        // sync() cannot fail (POSIX): the kernel's 103 flushes every mount.
+        sys(PRISM_SYS_SYNC);
+}
+
 int Sysdeps<Fdatasync>::operator()(int fd) {
         // The kernel has exactly one flush -- the mount's write-back cache
         // pushed to the device -- so the data-only distinction is not a

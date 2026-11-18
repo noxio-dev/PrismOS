@@ -126,6 +126,7 @@ struct PrismOSSysdepTags :
         Fchdir,
         Fsync,
         Fdatasync,
+        Sync,
         Chmod,
         Fchmod,
         Fchownat,

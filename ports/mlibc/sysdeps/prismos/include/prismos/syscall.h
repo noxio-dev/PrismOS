@@ -125,6 +125,7 @@ enum {
         PRISM_SYS_GETPEERNAME = 100, /* getpeername(fd, addr, &len) */
         PRISM_SYS_GETSOCKOPT = 101,  /* getsockopt(fd, level, name, val, &len) */
         PRISM_SYS_SETSOCKOPT = 102,  /* setsockopt(fd, level, name, val, len) */
+        PRISM_SYS_SYNC = 103,        /* sync() */
 };
 
 /* arch_prctl() codes -- the Linux x86-64 values the kernel expects. */
