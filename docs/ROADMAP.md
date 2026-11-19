@@ -78,7 +78,9 @@ Phase 4 — toolchain (phase 3.2 already ships cross binutils 2.44 and gcc 14.2.
   - [x] used by the builds: the port's own AR / RANLIB archive libbfd, libopcodes, libsframe and zlib, the cross strip stages the five; `verify.sh` disassembles every program it checks through the prefixed `objdump` / `nm` / `readelf` (bootstrap.sh's wrapper set completed with `objdump` + `readelf`); the Makefile grew `make binutils` and `make root` installs the five
   - [x] the kernel's hidden prerequisite: `ELF_STACK_SIZE` 16→256 pages — `objdump -d` of a full 1.9 MiB binary faulted eight bytes below the 64 KiB stack, measured under `prism_emu` running on the kernel's own stack size
   - [x] the proof without a machine: `prism_emu` grew the full argv and the utilities' file surface (the stat pair + lstat, unlink / rename, umask, munmap / mprotect, fcntl, a real lseek, the PrismOS `O_*` bits translated, `O_CREATE` files at the kernel's 0o644) — `tests/binutils_test.py` (`make bintest`, 17 checks) drives the five against the host's own binutils 2.44: archives and stripped objects **byte for byte**, `nm` and `objdump -d` text for text (367,021 lines on the stress run), the errno paths honest
-- [ ] Phase 4.2 — threads: `clone` (`CLONE_VM`, `CLONE_THREAD`, `set_tid_address`), per-thread TLS, `pthread_create` in the mlibc port (`futex` is already there)
+- [~] Phase 4.2 — threads: `clone` (`CLONE_VM`, `CLONE_THREAD`, `set_tid_address`), per-thread TLS, `pthread_create` in the mlibc port (`futex` is already there)
+  - [x] kernel: syscalls 104..108, thread groups (tgid, shared address space and fd table, group exit/kill/exec), pure logic in `user/thread_core.rs` with 14 host tests (`make threadtest`)
+  - [x] mlibc: Clone / PrepareStack / ThreadExit / Tgkill sysdeps, trampoline; compiles against mlibc v7.0.0
 - [ ] Phase 4.3 — C++: cross-built libstdc++ (with threads), a `hello.cpp` test (iostream, exceptions, `std::thread`), shared libgcc
 - [ ] Phase 4.4 — build the userspace with the PrismOS toolchain: `make`, coreutils, diffutils, findutils, pkg-config
 - [ ] Phase 4.5 — a "dev" image: the sysroot embedded in the boot image, preparing phase 5

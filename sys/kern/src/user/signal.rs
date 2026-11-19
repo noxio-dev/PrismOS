@@ -239,9 +239,21 @@ pub fn sys_signal(sig: u64, handler: u64) -> i64 {
         return -EINVAL;
     }
     match with_current(|s| core::mem::replace(&mut s.actions[sig as usize].handler, handler)) {
-        Some(old) => old as i64,
+        Some(old) => {
+            propagate_action(sig);
+            old as i64
+        }
         None => -EFAULT,
     }
+}
+
+/// Dispositions belong to the process, not to the thread (phase 4.2): after
+/// one thread installs one, its siblings get the same -- the effect of the
+/// shared handler table CLONE_SIGHAND names.  The pending set and the
+/// blocked mask stay each thread's own.
+fn propagate_action(sig: u64) {
+    let Some(act) = with_current(|s| s.actions[sig as usize]) else { return };
+    process::for_siblings(|q| q.signals.actions[sig as usize] = act);
 }
 
 /// `sigaction(sig, act, oldact)` (syscall 38, phase 3.2): the full install.
@@ -305,6 +317,7 @@ pub fn sys_sigaction(sig: u64, act_p: u64, oldact_p: u64) -> i64 {
     }
     if let Some(a) = newact {
         let _ = with_current(|s| s.actions[sig as usize] = a);
+        propagate_action(sig);
     }
     0
 }
@@ -376,14 +389,16 @@ pub fn sys_kill(pid: u64, sig: u64) -> i64 {
         let target = (pid as i64).unsigned_abs();
         if target == 0 {
             // kill(-1): every live process but the caller and pid 1.
-            let me = process::getpid();
+            let me = process::tgid();
             let n = broadcast_but_self(me, sig);
             return if n > 0 { 0 } else { -ESRCH };
         }
         let n = signal_pgrp(target, sig);
         return if n > 0 { 0 } else { -ESRCH };
     }
-    let me = process::getpid();
+    // "me" is the caller's process (phase 4.2): kill(getpid()) from any
+    // thread is a self-kill.
+    let me = process::tgid();
     if pid == me {
         // A self-kill with a default disposition acts right away; with a
         // handler it goes the pending route and the delivery happens at the
@@ -549,7 +564,7 @@ fn pgrp_members(pgrp: u64) -> alloc::vec::Vec<u64> {
 /// `kill(getpid())` rules (which never returns when the default action is
 /// termination).  Returns how many processes heard it.
 pub fn signal_pgrp(pgrp: u64, sig: u64) -> usize {
-    let me = process::getpid();
+    let me = process::tgid();
     let mut n = 0;
     for pid in pgrp_members(pgrp) {
         if pid == me {
@@ -560,6 +575,44 @@ pub fn signal_pgrp(pgrp: u64, sig: u64) -> usize {
         }
     }
     n
+}
+
+/// `tgkill(tgid, tid, sig)` (syscall 108, phase 4.2): raise `sig` in ONE
+/// thread -- `tid` must be a live thread of group `tgid`, the guard against
+/// a recycled id.  A handler takes the pending route in that thread; a
+/// terminating default ends the whole process (it is a process-wide action),
+/// at once when the target is the caller's own group.
+pub fn sys_tgkill(tgid: u64, tid: u64, sig: u64) -> i64 {
+    const ESRCH: i64 = 3;
+    if sig >= NSIG as u64 {
+        return -EINVAL;
+    }
+    let Some(cur) = process::current() else { return -EFAULT };
+    let (my_tid, my_tgid) = (cur.pid, cur.tgid);
+    match process::with_pid_mut(tid, |p| p.tgid == tgid && p.state != process::State::Zombie) {
+        Some(true) => {}
+        _ => return -ESRCH,
+    }
+    if sig == 0 {
+        return 0; // just checking it exists
+    }
+    if tid == my_tid {
+        return self_signal(sig);
+    }
+    if process::post_signal_thread(tid, sig) {
+        return 0;
+    }
+    if terminates_by_default(sig) {
+        if tgid == my_tgid {
+            // A sibling of the caller: the caller is a member of the group
+            // that dies, so it ends the process itself.
+            process::exit_current(process::Outcome::Signaled(sig));
+        }
+        if !process::signal_target(tgid, sig) {
+            return -ESRCH;
+        }
+    }
+    0
 }
 
 /// `kill(-1)`: every live process but the caller and init (pid 1), the

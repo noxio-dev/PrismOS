@@ -103,7 +103,9 @@ fn page_up(x: u64) -> u64 {
 /// byte-granular -- the pages are rounded up, like everywhere.
 pub fn sys_brk(addr: u64) -> i64 {
     let Some(cur) = process::current() else { return -EFAULT };
-    let (base, old) = (cur.brk_base, cur.brk);
+    // The break belongs to the process (phase 4.2): the threads of a group
+    // move one shared value, kept in the leader's entry.
+    let (base, old) = process::brk_bounds();
     let limit = vmm::USER_MMAP_BASE;
     let new = if addr >= base && addr <= limit { addr } else { old };
     if new == old {
@@ -142,8 +144,7 @@ pub fn sys_brk(addr: u64) -> i64 {
         }
     }
     if ok {
-        let Some(cur) = process::current() else { return -EFAULT };
-        cur.brk = new;
+        process::set_brk(new);
         new as i64
     } else {
         old as i64 // the Unix answer to a brk that cannot happen
@@ -1011,13 +1012,21 @@ fn power_off() -> ! {
 pub fn sys_setsid() -> i64 {
     const EPERM: i64 = 1;
     let Some(cur) = process::current() else { return -EFAULT };
-    if cur.pgid == cur.pid {
+    // The session is the *process's* (phase 4.2): the group id names it,
+    // and the sibling threads follow.
+    let tg = cur.tgid;
+    if cur.pgid == tg {
         return -EPERM;
     }
-    cur.sid = cur.pid;
-    cur.pgid = cur.pid;
+    cur.sid = tg;
+    cur.pgid = tg;
     cur.ctty = 0; // a new session has no controlling terminal yet
-    cur.pid as i64
+    process::for_siblings(|q| {
+        q.sid = tg;
+        q.pgid = tg;
+        q.ctty = 0;
+    });
+    tg as i64
 }
 
 /// `setpgid(pid, pgid)` (syscall 60): move `pid` (0 = the caller) into
@@ -1033,7 +1042,7 @@ pub fn sys_setpgid(pid: u64, pgid: u64) -> i64 {
     const EINVAL: i64 = 22;
     const EPERM: i64 = 1;
     let Some(cur) = process::current() else { return -EFAULT };
-    let me = cur.pid;
+    let me = cur.tgid; // the process, whichever thread asks (phase 4.2)
     let target = if pid == 0 { me } else { pid };
     if pgid > i32::MAX as u64 {
         return -EINVAL;
@@ -1062,6 +1071,13 @@ pub fn sys_setpgid(pid: u64, pgid: u64) -> i64 {
         return -EPERM;
     }
     let _ = process::with_pid_mut(target, |p| p.pgid = group);
+    if target == me {
+        // The caller's own process: every thread of it changes group.
+        if let Some(cur) = process::current() {
+            cur.pgid = group;
+        }
+        process::for_siblings(|q| q.pgid = group);
+    }
     0
 }
 
@@ -1070,7 +1086,7 @@ pub fn sys_setpgid(pid: u64, pgid: u64) -> i64 {
 /// there is no such live process.
 pub fn sys_getpgid(pid: u64) -> i64 {
     const ESRCH: i64 = 3;
-    let me = process::getpid();
+    let me = process::tgid();
     let target = if pid == 0 { me } else { pid };
     process::with_pid_mut(target, |p| p.pgid).map_or(-ESRCH, |g| g as i64)
 }

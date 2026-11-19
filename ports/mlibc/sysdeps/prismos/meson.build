@@ -65,7 +65,9 @@ libc_sources += files(
         'generic/entry.cpp',
         'generic/sysdeps.cpp',
         'generic/syscall.cpp',
+        'generic/thread.cpp',
         'x86_64/signal.S',
+        'x86_64/thread_entry.S',
 )
 
 if not no_headers

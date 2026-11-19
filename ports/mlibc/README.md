@@ -45,10 +45,11 @@ the Linux pollfd, the SA_* / CLOCK_* / errno values are the classic ones.
 way the kernel switched with the process since the first step of this
 phase.
 
+**Threads (phase 4.2)** — `pthread_create`/`join`/mutexes run over the kernel's `clone` (syscalls 104..108).  They need the dynamically linked libc (ld.so allocates the thread TCB), so a thread program is linked like hello-dyn; cancellation is unsupported.
+
 **What the kernel lacks stays ENOSYS** — the rule of the phase.  Tags the
 kernel cannot serve are simply absent from the tag list, and mlibc's
-generic layer answers `ENOSYS` on its own: `pthread_create` (no clone),
-`*at()` past `AT_FDCWD`, rusage accounting (wait4 gets honest
+generic layer answers `ENOSYS` on its own: `*at()` past `AT_FDCWD`, rusage accounting (wait4 gets honest
 zeroes), `fchmod` and the whole permission family (phase 3.5).  A few
 corners are emulated where the emulation is exact: `pipe2`'s flags ride
 `fcntl` (`O_CLOEXEC`→`F_SETFD`, `O_NONBLOCK`→`F_SETFL`), `opendir` checks

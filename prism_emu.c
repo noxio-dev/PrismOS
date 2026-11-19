@@ -432,6 +432,7 @@ static void serve_entry(struct user_regs_struct *r) {
         case P_CLOSE:      r->orig_rax = 3;   break;   /* close(fd) */
         case P_ARCH_PRCTL: r->orig_rax = 158; break;   /* arch_prctl: same regs */
         case P_GETPID:     r->orig_rax = 39;  break;   /* getpid() */
+        case 105:          r->orig_rax = 186; break;   /* gettid() -- mlibc's GetTid/FutexTid since phase 4.2; single-threaded here, host tid is fine */
         case P_GETPPID:    r->orig_rax = 110; break;   /* getppid() */
         case P_GETUID:     r->orig_rax = 102; break;   /* getuid() */
         case P_GETGID:     r->orig_rax = 104; break;   /* getgid() */

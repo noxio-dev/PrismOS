@@ -64,6 +64,11 @@
 //           connect, sendmsg, recvmsg, shutdown, getsockname, getpeername,
 //           getsockopt, setsockopt (user/fd/unix.rs)
 //    103 sync()                     flush every mounted file system
+//    104..108 threads (phase 4.2): clone(flags, stack, ptid, ctid, tls) --
+//           the Linux x86-64 argument order, thread form only --,
+//           gettid(), thread_exit(), set_tid_address(addr), tgkill(tgid,
+//           tid, sig).  getpid() answers the thread GROUP's id; exit(2)
+//           ends the whole group, thread_exit(2) the caller only.
 //    59 setsid()                    60 setpgid(pid, pgid)   61 getpgid(pid)
 //    (a negative kill pid names a group; TIOCSCTTY claims a terminal)
 //
@@ -190,6 +195,10 @@ fn read_user_strv(aspace: &AddressSpace, ptr: u64) -> Result<Vec<Vec<u8>>, i64> 
 /// execve(path, argv, envp): see the header comment.
 fn sys_execve(frame: &mut IsrFrame, path_p: u64, argv_p: u64, envp_p: u64) -> i64 {
     let Some(cur) = process::current() else { return -EFAULT };
+    // A worker thread cannot take over the process's identity (phase 4.2).
+    if let Err(e) = process::exec_prepare() {
+        return e;
+    }
     let loaded = {
         let Some(aspace) = cur.aspace.as_ref() else { return -EFAULT };
         let path = match read_user_cstr(aspace, path_p, 255) {
@@ -226,8 +235,10 @@ fn sys_execve(frame: &mut IsrFrame, path_p: u64, argv_p: u64, envp_p: u64) -> i6
         }
     };
     let (new, abs, flat, est) = loaded;
-    // Point of no return: swap the address space (the new tables go live
-    // before the old ones are freed), rename the process, restart in ring 3.
+    // Point of no return: the other threads of the group end (phase 4.2),
+    // then swap the address space (the new tables go live before the old
+    // ones are freed), rename the process, restart in ring 3.
+    process::exec_kill_workers();
     let old = cur.aspace.replace(new.aspace);
     // SAFETY: the new tables share the kernel half, so the running kernel
     // code stays mapped; the old ones are dropped only after the switch.
@@ -288,7 +299,9 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
     // only six-argument call so far).
     let ret: i64 = match frame.rax {
         0 => process::exit_current(process::Outcome::Exited(a0)),
-        2 => process::getpid() as i64,
+        // The process id: a thread's is its group's (phase 4.2); the
+        // thread id is gettid (105).
+        2 => process::tgid() as i64,
         3 => crate::hw::pit::uptime_ms() as i64,
         4 => {
             process::yield_current();
@@ -414,6 +427,12 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         101 => fd::unix::sys_getsockopt(a0, a1, a2, frame.r10, frame.r8),
         102 => fd::unix::sys_setsockopt(a0, a1, a2, frame.r10, frame.r8),
         103 => sysc::sys_sync(),
+        // ---- phase 4.2: threads (user/thread_core.rs, process.rs) -------
+        104 => process::clone_current(frame, a0, a1, a2, frame.r10, frame.r8),
+        105 => process::getpid() as i64,
+        106 => process::exit_thread_current(),
+        107 => process::set_tid_address(a0),
+        108 => signal::sys_tgkill(a0, a1, a2),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

@@ -340,7 +340,7 @@ unsafe fn raise(which: Term, sig: u64) {
     if target == 0 {
         return;
     }
-    if target == process::getpid() {
+    if target == process::tgid() {
         // Ourselves -- the interrupted process (the tick pumped) or the
         // caller of the read that pumped: pending for a handler (delivered
         // at the syscall return), the default action applied at once

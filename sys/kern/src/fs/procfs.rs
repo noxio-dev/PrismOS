@@ -461,7 +461,7 @@ impl FileSystem for ProcFs {
     /// 3.3.6: the path a file was opened from, the device's node, "pipe").
     fn readlink(&mut self, ino: u64) -> FsResult<String> {
         match ino {
-            SELF => Ok(process::getpid().to_string()),
+            SELF => Ok(process::tgid().to_string()),
             _ => {
                 let pid = Self::pid_of(ino).ok_or(FsError::Invalid)?;
                 let n = (ino - pid_base(pid)) % 0x100;

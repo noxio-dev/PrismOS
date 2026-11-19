@@ -72,6 +72,7 @@ install_uapi() {
         cp -r "$REPO/ports/mlibc/linux-headers/linux" "$SYSROOT/usr/include/"
         cp -r "$REPO/ports/mlibc/linux-headers/asm" "$SYSROOT/usr/include/"
         cp -r "$REPO/ports/mlibc/linux-headers/asm-generic" "$SYSROOT/usr/include/"
+        cp -r "$REPO/ports/mlibc/linux-headers/drm" "$SYSROOT/usr/include/"
 }
 
 while [ $# -gt 0 ]; do

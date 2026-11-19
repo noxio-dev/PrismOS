@@ -198,11 +198,10 @@ static inline long prism_mount(const char *source, const char *target,
 }
 
 /*
- * ioctl(29) (phase 3.3): the raw form of the one request pair a shell
- * needs -- TIOCSPGRP, the foreground claim that a ^C of ISIG targets
- * (mlibc's public ioctl() is glibc-option code the port keeps off;
- * tcgetattr / tcsetattr / isatty are library calls).  The answer is the
- * kernel's: 0 or the negative errno.
+ * ioctl(29): the raw form, for programs that do not link a libc call.
+ * Normal programs use mlibc's standard ioctl(fd, request, ...) from
+ * <sys/ioctl.h> (it sets errno; this returns the kernel's answer as is:
+ * 0 or the negative errno).
  */
 static inline long prism_ioctl(int fd, unsigned long request, void *arg)
 {

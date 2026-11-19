@@ -24,9 +24,21 @@ same reason.  (net/if_ppp.h, the one other linux-including header the glibc
 option installs, stays uninstallable-to-use on purpose: nothing enabled
 includes it.)
 
+Display-server additions (ioctl() as the standard libc call): the request
+numbers and structures behind the ioctls the kernel answers on its device
+nodes -- linux/{kd,vt}.h (the console / VT requests), linux/input.h +
+linux/input-event-codes.h (evdev: struct input_event, EVIOC*, KEY_* / BTN_* /
+REL_* / ABS_*), and drm/{drm,drm_mode,drm_fourcc}.h (DRM / KMS: what libdrm
+and Xorg's modesetting driver include; sys/kern/src/drm/uapi.rs pins the
+same layouts with compile-time assertions).  They are the output of a real
+`make headers_install` (Debian linux-libc-dev 6.8.0, taken verbatim); the
+linux/ ones are GPL-2.0 WITH Linux-syscall-note like the rest, the drm/
+ones carry their own MIT licence text.  linux/fb.h is left out on purpose:
+it pulls linux/i2c.h and the kernel has no fbdev.
+
 Nothing else lives here on purpose: the kernel has no capability story
 (the tags stay ENOSYS through the port's contract), and BusyBox's own
-applet set -- the phase that needs the option -- parses its flags through
-mlibc's <sys/mount.h> and <sys/statfs.h>, not the kernel UAPI.  The day a
-port needs more of the UAPI, the honest move is a `make headers_install`
-of a real kernel tree, not a bigger hand-carried set.
+applet set parses its flags through mlibc's <sys/mount.h> and
+<sys/statfs.h>.  The day a port needs more of the UAPI, the honest move is
+still a `make headers_install` of a real kernel tree -- which is how the
+files above were obtained -- not hand-edited headers.

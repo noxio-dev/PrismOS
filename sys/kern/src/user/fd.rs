@@ -279,25 +279,85 @@ struct Slot {
     cloexec: bool,
 }
 
-/// The per-process fd table: fd numbers are indices, 0/1/2 = stdio.
-pub struct FdTable {
+/// The table proper: fd numbers are indices, 0/1/2 = stdio.  A process
+/// reaches it through the `FdTable` handle below.
+pub struct FdInner {
     slots: Vec<Option<Slot>>,
 }
 
+/// The per-process fd table (phase 4.2: a handle).  A plain process owns its
+/// table alone; the threads of a group (CLONE_FILES) hold several handles on
+/// ONE table, so an open() in one thread is visible in the others.  The
+/// handle dereferences to the table, which keeps every `cur.fds.xxx()` call
+/// site as it was.  The kernel is not preemptible and runs on one CPU, and
+/// no table method parks while it holds the borrow (descriptions are cloned
+/// out first), so the unchecked interior access is sound -- the same rule
+/// the shared `Rc<FileDesc>` themselves rely on.
+pub struct FdTable {
+    inner: Rc<core::cell::UnsafeCell<FdInner>>,
+}
+
+impl core::ops::Deref for FdTable {
+    type Target = FdInner;
+    fn deref(&self) -> &FdInner {
+        // SAFETY: see the type's comment.
+        unsafe { &*self.inner.get() }
+    }
+}
+
+impl core::ops::DerefMut for FdTable {
+    fn deref_mut(&mut self) -> &mut FdInner {
+        // SAFETY: see the type's comment.
+        unsafe { &mut *self.inner.get() }
+    }
+}
+
 impl FdTable {
+    fn wrap(t: FdInner) -> FdTable {
+        FdTable { inner: Rc::new(core::cell::UnsafeCell::new(t)) }
+    }
+
     /// A fresh table with stdin/stdout/stderr on the console -- three
     /// separate descriptions, like any unix boot (a dup of one of them
     /// would share the flags; here stdout and stderr stay independent).
     pub fn with_stdio() -> FdTable {
-        let mk = |f| Some(Slot { desc: Rc::new(FileDesc::new(Kind::Console, f)), cloexec: false });
-        FdTable { slots: alloc::vec![mk(O_READ), mk(O_WRITE), mk(O_WRITE)] }
+        FdTable::wrap(FdInner::with_stdio())
     }
 
     /// What `fork` hands the child: the same descriptions (Rc bumps), so
     /// the child and the parent share file offsets and pipe ends -- and the
-    /// same FD_CLOEXEC marks on the numbers (POSIX keeps them).
+    /// same FD_CLOEXEC marks on the numbers (POSIX keeps them).  A separate
+    /// table: closing a number in one leaves the other alone.
     pub fn fork_copy(&self) -> FdTable {
-        FdTable {
+        FdTable::wrap(FdInner::fork_copy(self))
+    }
+
+    /// Another handle on the SAME table (CLONE_FILES, a new thread).
+    pub fn share(&self) -> FdTable {
+        FdTable { inner: self.inner.clone() }
+    }
+
+    /// Death closes the descriptors -- but only the last handle of a shared
+    /// table may: a thread's end must not close what its siblings still
+    /// use.  A non-last handle just lets go of the table.
+    pub fn release(&mut self) {
+        if Rc::strong_count(&self.inner) > 1 {
+            self.inner = Rc::new(core::cell::UnsafeCell::new(FdInner { slots: Vec::new() }));
+        } else {
+            // SAFETY: see the type's comment (sole handle, one CPU).
+            unsafe { (*self.inner.get()).release_all() };
+        }
+    }
+}
+
+impl FdInner {
+    fn with_stdio() -> FdInner {
+        let mk = |f| Some(Slot { desc: Rc::new(FileDesc::new(Kind::Console, f)), cloexec: false });
+        FdInner { slots: alloc::vec![mk(O_READ), mk(O_WRITE), mk(O_WRITE)] }
+    }
+
+    fn fork_copy(&self) -> FdInner {
+        FdInner {
             slots: self
                 .slots
                 .iter()
@@ -415,7 +475,7 @@ impl FdTable {
     /// Drop every description the table holds (death closes all
     /// descriptors: the last clone of each is what closes the file / pipe
     /// end).  Leaves the table empty; a zombie holds nothing open.
-    pub fn release(&mut self) {
+    fn release_all(&mut self) {
         self.slots.clear();
     }
 }
@@ -695,7 +755,9 @@ fn read_tty(which: tty::Term, desc: &Rc<FileDesc>, buf: u64, len: usize) -> i64 
     //     len
     // );
     // The tty's ^C fallback target while we are the parked reader.
-    tty::set_reader(which, process::getpid());
+    // The reader is named by its *process* (phase 4.2): the ^C fallback
+    // sends it a kill(), whose target is a process id.
+    tty::set_reader(which, process::tgid());
     let mut iters = 0u64;
     loop {
         // Trace the queue state on the first few iterations, then stale-loop

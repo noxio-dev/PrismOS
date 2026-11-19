@@ -735,8 +735,16 @@ fn user_range_ok(virt: u64, len: usize) -> bool {
 
 /// One process's page tables.  The kernel half is shared with the kernel
 /// PML4, the user half is private and freed on drop.
+///
+/// Threads (phase 4.2, CLONE_VM) share one tree through several handles:
+/// `share` hands out another `AddressSpace` on the same PML4, `refs` counts
+/// the handles, and only the last one dropped frees the user half.  Every
+/// mapping operation works on the tables themselves, so any handle serves
+/// (the kernel is not preemptible and runs on one CPU: the counter needs no
+/// atomics, the same rule the shared file descriptions follow).
 pub struct AddressSpace {
     pml4: u64,
+    refs: alloc::rc::Rc<()>,
 }
 
 impl AddressSpace {
@@ -759,8 +767,15 @@ impl AddressSpace {
                 }
             }
         }
-        Some(AddressSpace { pml4 })
+        Some(AddressSpace { pml4, refs: alloc::rc::Rc::new(()) })
     }
+
+    /// Another handle on the same page tables (CLONE_VM).  The tree is freed
+    /// when the last handle goes away.
+    pub fn share(&self) -> AddressSpace {
+        AddressSpace { pml4: self.pml4, refs: self.refs.clone() }
+    }
+
 
     /// Value to load into CR3.
     #[allow(dead_code)] // the scheduler switches through `activate`
@@ -1383,6 +1398,10 @@ unsafe fn fork_tree(src: u64, dst: u64, level: u32) -> bool {
 
 impl Drop for AddressSpace {
     fn drop(&mut self) {
+        // A thread group's tables outlive every handle but the last.
+        if alloc::rc::Rc::strong_count(&self.refs) > 1 {
+            return;
+        }
         // Never free the tables we are running on.
         if current_cr3() == self.pml4 {
             activate_kernel();

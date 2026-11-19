@@ -141,6 +141,13 @@ pub fn on_death(pid: u64) {
     remove_waiter(pid);
 }
 
+/// Wake every waiter on the word at `uaddr` of address space `space` (phase
+/// 4.2): what a dying thread does for its CLONE_CHILD_CLEARTID word, so a
+/// joiner parked on it runs.  The wake of a thread's end, not a syscall.
+pub fn wake_all_at(space: u64, uaddr: u64) {
+    let _ = futex_wake(space, uaddr, i32::MAX as u64, MATCH_ANY);
+}
+
 // ----------------------------------------------------------- user memory
 
 /// The 32-bit futex word at `uaddr` (read through the running process's own

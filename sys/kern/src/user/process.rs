@@ -110,6 +110,7 @@ const EINVAL: i64 = 22;
 const ECHILD: i64 = 10;
 const ENOMEM: i64 = 12;
 const EAGAIN: i64 = 11;
+const ENOSYS: i64 = 38;
 
 /// Most process table entries alive at once, zombies included (the RLIMIT_NPROC
 /// of this kernel).  A zombie keeps its 16 KiB kernel stack and its PCB until
@@ -293,7 +294,22 @@ pub struct Process {
     pub preempts: u64,
     /// Order of death (1 = first to end since boot), 0 while alive.
     pub exit_seq: u64,
+    /// Thread group id (phase 4.2): the pid of the group leader.  `pid` is
+    /// the thread id (the table key); `tgid` is what getpid(), wait() and
+    /// kill() speak.  Equal to `pid` for a plain process and for a leader.
+    pub tgid: u64,
+    /// CLONE_CHILD_CLEARTID / set_tid_address: a user address that gets 0
+    /// stored in it, and its futex waiters woken, when this thread ends --
+    /// the join primitive.  0 = none.
+    pub clear_child_tid: u64,
+    /// A leader that called thread_exit while workers live: parked until the
+    /// last worker ends, then the process exits with status 0.
+    pub leader_exited: bool,
 }
+
+/// `wait_pid` of a leader parked by thread_exit: no pid ever matches it, so
+/// no child's death wakes the parked leader.
+const PARKED_LEADER: u64 = u64::MAX - 1;
 
 /// The saved context of the main context (the shell / boot flow): the other
 /// side of every process <-> kernel switch.
@@ -353,9 +369,18 @@ pub fn current() -> Option<&'static mut Process> {
     }
 }
 
-/// Pid of the running process (0 = the kernel itself).
+/// Thread id of the running thread (0 = the kernel itself): the table key,
+/// what every kernel wait list (futex, sockets) identifies a parked caller
+/// by.  For a plain process it is also its pid.
 pub fn getpid() -> u64 {
     current().map_or(0, |p| p.pid)
+}
+
+/// Process id of the running thread's group (phase 4.2): what getpid(2),
+/// wait(2), kill(2) and the process-group calls mean by "me".  Equal to
+/// `getpid()` unless the caller is a worker thread.
+pub fn tgid() -> u64 {
+    current().map_or(0, |p| p.tgid)
 }
 
 /// The absolute, normalized form of `path` as the *calling process* sees
@@ -438,6 +463,9 @@ pub fn snapshot_table() -> Vec<ProcInfo> {
         let table = &*addr_of_mut!(TABLE);
         table
             .iter()
+            // Worker threads are not processes: /proc and `ps` list the
+            // group once, under its leader (phase 4.2).
+            .filter(|p| p.tgid == p.pid)
             .map(|p| ProcInfo {
                 pid: p.pid,
                 ppid: p.ppid,
@@ -468,7 +496,9 @@ pub fn group_pids(pgrp: u64) -> Vec<u64> {
         let table = &*addr_of_mut!(TABLE);
         table
             .iter()
-            .filter(|p| p.pgid == pgrp && p.state != State::Zombie)
+            // One entry per process: a signal aimed at the group reaches
+            // each process once, not once per thread (phase 4.2).
+            .filter(|p| p.pgid == pgrp && p.state != State::Zombie && p.tgid == p.pid)
             .map(|p| p.pid)
             .collect()
     };
@@ -486,7 +516,7 @@ pub fn all_pids_but(me: u64) -> Vec<u64> {
         let table = &*addr_of_mut!(TABLE);
         table
             .iter()
-            .filter(|p| p.pid != me && p.pid != 1 && p.state != State::Zombie)
+            .filter(|p| p.tgid != me && p.pid != 1 && p.state != State::Zombie && p.tgid == p.pid)
             .map(|p| p.pid)
             .collect()
     };
@@ -593,6 +623,9 @@ fn spawn_common(
         switches: 0,
         preempts: 0,
         exit_seq: 0,
+        tgid: 0, // assigned with the pid below: a fresh process leads its own group
+        clear_child_tid: 0,
+        leader_exited: false,
     };
     // SAFETY: interrupts masked by the guard taken above, single CPU.
     unsafe {
@@ -614,6 +647,7 @@ fn spawn_common(
         // rearrange the tree later.
         b.pgid = pid;
         b.sid = pid;
+        b.tgid = pid;
         (*addr_of_mut!(TABLE)).push(b);
         Ok(pid)
     }
@@ -729,7 +763,9 @@ pub fn fork_current(frame: &IsrFrame) -> i64 {
     // the kernel itself is soft-float.
     unsafe { cur.fpu.save() };
 
-    let (name, prio, pid_of_parent) = (cur.name.clone(), cur.prio, cur.pid);
+    // The parent is the caller's *process* (phase 4.2): a fork from a worker
+    // thread makes a child of the whole group, whose wait() any thread may do.
+    let (name, prio, pid_of_parent) = (cur.name.clone(), cur.prio, cur.tgid);
     let fpu = cur.fpu.snapshot();
     let signals = cur.signals.fork_copy();
     // The child keeps the caller's command line, binary path and umask
@@ -866,7 +902,8 @@ const TRACE_INIT: bool = false;
 
 pub fn wait_current(pid_arg: u64, status_ptr: u64, flags: u64, rusage_ptr: u64) -> i64 {
     let Some(cur0) = current() else { return -EFAULT };
-    let me = cur0.pid;
+    // Children belong to the process, not to the thread that forked them.
+    let me = cur0.tgid;
     drop(cur0);
     let want = if pid_arg == 0 || pid_arg == u64::MAX { 0 } else { pid_arg };
     let wnohang = flags & WNOHANG != 0;
@@ -878,7 +915,9 @@ pub fn wait_current(pid_arg: u64, status_ptr: u64, flags: u64, rusage_ptr: u64) 
             let mut zpid = None;
             let mut have_kids = false;
             for q in table.iter() {
-                if q.ppid != me {
+                // A worker thread of a child carries the child's ppid but is
+                // not a child itself (phase 4.2).
+                if q.ppid != me || q.tgid != q.pid {
                     continue;
                 }
                 if want != 0 && q.pid != want {
@@ -1518,8 +1557,14 @@ unsafe fn after_death(pid: u64) {
         }
         // 3. wake the waiting parent / raise SIGCHLD
         if ppid != 0 {
+            // The parent is a process, so every thread of its group is a
+            // candidate (phase 4.2): any of them may be the one parked in
+            // wait(), and the SIGCHLD goes to the first thread that is still
+            // a live one.  A plain process is a group of one: the same walk
+            // as ever.
+            let mut raised = false;
             for q in table.iter_mut() {
-                if q.pid == ppid && q.state != State::Zombie {
+                if q.tgid == ppid && q.state != State::Zombie {
                     if TRACE_INIT {
                         crate::kprintln!("[trace] exit pid={} -> parent {} state={} wait_pid={} blocked={:#x}", pid, q.pid, q.state as u8, q.wait_pid, q.signals.blocked);
                     }
@@ -1529,10 +1574,13 @@ unsafe fn after_death(pid: u64) {
                     // A handler, or a *blocked* SIGCHLD: busybox init blocks it
                     // and collects it with sigtimedwait -- without this it
                     // never learns that its login exited and never respawns.
-                    if q.signals.handler_of(SIGCHLD) != 0 || q.signals.blocked & (1 << SIGCHLD) != 0 {
+                    if !raised
+                        && !q.leader_exited
+                        && (q.signals.handler_of(SIGCHLD) != 0 || q.signals.blocked & (1 << SIGCHLD) != 0)
+                    {
                         q.signals.pending |= 1 << SIGCHLD;
+                        raised = true;
                     }
-                    break;
                 }
             }
         }
@@ -1573,20 +1621,380 @@ pub fn exit_current(outcome: Outcome) -> ! {
             crate::arch::intr::park();
         }
         let pid = (*cur).pid;
-        {
+        let tgid = (*cur).tgid;
+        // Phase 4.2: exit(2) and every fatal path end the whole thread group
+        // -- a process with no threads left is what dies.  The other workers
+        // go first (their descriptor handles and tables drop with them).
+        kill_workers_except(tgid, pid);
+        if pid == tgid {
             let p = &mut *cur;
             // crate::kprintln!(
             //     "[exit] pid={} outcome={:?} (used {} user {} sys {})",
             //     pid, outcome, p.used, p.user_used, p.sys_used
             // );
             zombify_common(p, outcome);
+            after_death(pid);
+        } else {
+            // A worker ended the process (a fault, exit(2), a fatal signal):
+            // the leader's entry is the one the parent waits on, so it takes
+            // the outcome and the notification; this thread's own entry is a
+            // plain corpse that the sweep frees.
+            for q in (*addr_of_mut!(TABLE)).iter_mut() {
+                if q.pid == tgid && q.state != State::Zombie {
+                    zombify_common(q, outcome);
+                    break;
+                }
+            }
+            zombify_common(&mut *cur, Outcome::Killed);
+            after_death(tgid);
         }
-        after_death(pid);
         // Abandon this stack; execution continues in run_until_idle.
         switch_to_main(&mut (*cur).saved);
         // Only reachable if a bug resurrected a zombie: park defensively.
         crate::arch::intr::park();
     }
+}
+
+// ------------------------------------------------------ threads (phase 4.2)
+
+/// Zombify every live worker of group `tgid` except `keep` (the caller, or
+/// 0 for none).  The leader's entry is never touched here: its owner decides
+/// how the group's process ends.  Interrupts masked; none of them is the
+/// running thread unless it is `keep`.
+///
+/// # Safety
+/// Interrupts masked, single CPU; `keep` is the running thread or 0.
+unsafe fn kill_workers_except(tgid: u64, keep: u64) {
+    // SAFETY: as the contract; zombify_common only changes the entry itself
+    // and the wait lists, never the table's structure.
+    unsafe {
+        for q in (*addr_of_mut!(TABLE)).iter_mut() {
+            if q.tgid == tgid && q.pid != tgid && q.pid != keep && q.state != State::Zombie {
+                zombify_common(q, Outcome::Killed);
+            }
+        }
+    }
+}
+
+/// (live workers of `tgid` other than `me`, whether the leader parked).
+///
+/// # Safety
+/// Interrupts masked, single CPU.
+unsafe fn group_state(tgid: u64, me: u64) -> (usize, bool) {
+    let mut workers = 0;
+    let mut parked = false;
+    // SAFETY: as the contract; read-only walk.
+    unsafe {
+        for q in (*addr_of_mut!(TABLE)).iter() {
+            if q.tgid != tgid || q.state == State::Zombie {
+                continue;
+            }
+            if q.pid == tgid {
+                parked = q.leader_exited;
+            } else if q.pid != me {
+                workers += 1;
+            }
+        }
+    }
+    (workers, parked)
+}
+
+/// Free the corpses of worker threads (their stacks and PCBs).  A dying
+/// worker is only ever flipped to Zombie -- it cannot free the stack it
+/// still runs on -- and nobody `wait`s for it, so this is what reclaims it.
+/// Safe from the main context and from any process: a zombie other than the
+/// running thread is never switched to again.  Interrupts masked.
+fn sweep_dead_threads() {
+    // SAFETY: structure change with interrupts masked (every caller runs
+    // with IF=0), single CPU; the running thread is skipped.
+    unsafe {
+        let table = &mut *addr_of_mut!(TABLE);
+        let cur = CURRENT as *const Process;
+        let mut i = 0;
+        while i < table.len() {
+            let dead = {
+                let p = &*table[i];
+                p.state == State::Zombie && p.tgid != p.pid && (p as *const Process) != cur
+            };
+            if dead {
+                drop_reaped(table.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Store 0 at the running thread's `clear_child_tid` and wake the futex
+/// waiters on it: how a joiner learns that the thread is gone, whatever its
+/// libc's join is built on.  Must run before the address space handle drops.
+///
+/// # Safety
+/// Interrupts masked, a user thread is running.
+unsafe fn clear_child_tid_current() {
+    // SAFETY: CURRENT is the running thread.
+    unsafe {
+        let cur = &mut *CURRENT;
+        let addr = cur.clear_child_tid;
+        if addr == 0 {
+            return;
+        }
+        cur.clear_child_tid = 0;
+        if let Some(a) = cur.aspace.as_ref() {
+            if a.ensure_writable(addr) && a.write(addr, &0u32.to_le_bytes(), false) {
+                crate::user::futex::wake_all_at(a.id(), addr);
+            }
+        }
+    }
+}
+
+/// `thread_exit()` (syscall 106): end the calling thread only.  The last
+/// thread of a group ends the process (status 0); a leader that leaves
+/// while workers live parks until they are gone -- the POSIX rule for
+/// pthread_exit in the main thread.  Never returns.
+pub fn exit_thread_current() -> ! {
+    // SAFETY: the running thread exists; interrupts are masked on every
+    // syscall path (SFMASK).
+    unsafe {
+        let cur = CURRENT;
+        if cur.is_null() {
+            crate::kprintln!("\nkernel: thread_exit with no running process, parking");
+            crate::arch::intr::park();
+        }
+        let pid = (*cur).pid;
+        let tgid = (*cur).tgid;
+        let (workers, parked) = group_state(tgid, pid);
+        use crate::user::thread_core::{thread_exit, ThreadExit};
+        match thread_exit(pid == tgid, workers, parked) {
+            ThreadExit::ExitProcess => exit_current(Outcome::Exited(0)),
+            ThreadExit::LeaderParks => {
+                clear_child_tid_current();
+                (*cur).leader_exited = true;
+                (*cur).wait_pid = PARKED_LEADER;
+                (*cur).state = State::Waiting;
+                match pick_ready(pid, u8::MAX) {
+                    Some(next) => {
+                        cpu_state_for(next);
+                        switch_ctx(&mut (*cur).saved, &(*next).saved);
+                    }
+                    None => switch_to_main(&mut (*cur).saved),
+                }
+                // Only the group's end can leave the park (it zombifies us
+                // first); a resurrection is a bug: end the process.
+                (*CURRENT).state = State::Running;
+                exit_current(Outcome::Exited(0))
+            }
+            action => {
+                clear_child_tid_current();
+                if action == ThreadExit::DieAndExitProcess {
+                    for q in (*addr_of_mut!(TABLE)).iter_mut() {
+                        if q.pid == tgid && q.state != State::Zombie {
+                            zombify_common(q, Outcome::Exited(0));
+                            break;
+                        }
+                    }
+                    zombify_common(&mut *cur, Outcome::Killed);
+                    after_death(tgid);
+                } else {
+                    zombify_common(&mut *cur, Outcome::Killed);
+                }
+                switch_to_main(&mut (*cur).saved);
+                crate::arch::intr::park();
+            }
+        }
+    }
+}
+
+/// `set_tid_address(addr)` (syscall 107): remember where thread_exit stores
+/// 0 and wakes the futex waiters; answers the caller's thread id.
+pub fn set_tid_address(addr: u64) -> i64 {
+    let Some(cur) = current() else { return -EFAULT };
+    cur.clear_child_tid = addr;
+    cur.pid as i64
+}
+
+/// Highest address a user pointer / stack pointer / TLS base may hold: they
+/// end up in RSP, in the FS base MSR and in an iretq frame, where a
+/// non-canonical value would fault inside the kernel.
+const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
+
+/// `clone(flags, stack, ptid, ctid, tls)` (syscall 104, the Linux x86-64
+/// argument order): create a thread of the caller's group.  The child shares
+/// the address space and (CLONE_FILES) the descriptor table, runs on `stack`
+/// with rax = 0, and gets `tls` as its FS base (CLONE_SETTLS).  Answers the
+/// new thread id, which the parent also finds at `ptid`
+/// (CLONE_PARENT_SETTID, stored before the child can run).
+///
+/// What a thread does NOT share here: cwd, umask, credentials, process
+/// group / session and the controlling terminal are copied at clone, not
+/// shared afterwards; signal dispositions are propagated by sigaction, the
+/// pending set and the mask are the thread's own.
+pub fn clone_current(frame: &IsrFrame, flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) -> i64 {
+    let spec = match crate::user::thread_core::parse_clone(flags) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    if stack >= USER_ADDR_LIMIT || tls >= USER_ADDR_LIMIT {
+        return -EINVAL;
+    }
+    let Some(cur) = current() else { return -EFAULT };
+    if cur.aspace.is_none() {
+        return -EFAULT; // a kernel thread cannot clone
+    }
+    // Process limit: reclaim the corpses first, they count against it.
+    sweep_dead_threads();
+    // SAFETY: syscall context, read-only length probe of the table.
+    if unsafe { (*addr_of_mut!(TABLE)).len() } >= MAX_PROCS {
+        return -EAGAIN;
+    }
+    // The new thread's id is the next pid: knowing it lets the id be stored
+    // for the child *before* the entry exists, so a bad pointer fails the
+    // call with nothing to undo.
+    // SAFETY: syscall context, IF=0, single CPU.
+    let tid = unsafe { NEXT_PID };
+    {
+        let Some(a) = cur.aspace.as_ref() else { return -EFAULT };
+        for (on, addr) in [(spec.parent_settid, ptid), (spec.child_settid, ctid)] {
+            if on && !(addr < USER_ADDR_LIMIT && a.ensure_writable(addr) && a.write(addr, &(tid as u32).to_le_bytes(), false)) {
+                return -EFAULT;
+            }
+        }
+        if spec.child_cleartid && !(ctid < USER_ADDR_LIMIT && a.ensure_writable(ctid)) {
+            return -EFAULT;
+        }
+    }
+    // The live x87 / SSE registers still hold what user code last ran.
+    // SAFETY: the FPU is enabled for user processes.
+    unsafe { cur.fpu.save() };
+
+    let (name, prio) = (cur.name.clone(), cur.prio);
+    let fpu = cur.fpu.snapshot();
+    // Dispositions and the blocked mask carry over, pending starts empty.
+    let signals = cur.signals.fork_copy();
+    let (argv, exe, umask) = (cur.argv.clone(), cur.exe.clone(), cur.umask);
+    let (cred, suid, sgid) = (cur.cred, cur.suid, cur.sgid);
+    let (pgid, sid, ctty) = (cur.pgid, cur.sid, cur.ctty);
+    let (cwd, tgid, ppid, budget) = (cur.cwd.clone(), cur.tgid, cur.ppid, cur.budget);
+    let (fs_base, gs_base) = (if spec.set_tls { tls } else { cur.fs_base }, cur.gs_base);
+    let aspace = match cur.aspace.as_ref() {
+        Some(a) => a.share(),
+        None => return -EFAULT,
+    };
+    let fds = if spec.share_files { cur.fds.share() } else { cur.fds.fork_copy() };
+    // The heap bounds live in the leader (brk_bounds); the copies here only
+    // seed the entry.
+    let (brk_base, brk) = (cur.brk_base, cur.brk);
+
+    // The child resumes as if clone() had just returned 0, on its own stack.
+    let mut child_frame = *frame;
+    child_frame.rax = 0;
+    child_frame.rflags = (child_frame.rflags | 0x200) & !0x100; // IF on, TF off
+    if stack != 0 {
+        child_frame.rsp = stack;
+    }
+    match spawn_common(
+        name,
+        Some(aspace),
+        Entry::UserFrame(child_frame),
+        (0, 0),
+        budget,
+        prio,
+        ppid,
+        cwd,
+        brk_base,
+        brk,
+    ) {
+        Ok(pid) => {
+            // Single CPU: the child cannot run before we yield, so the
+            // fix-ups below happen-before its first switch.
+            let _ = with_pid_mut(pid, |c| {
+                c.tgid = tgid;
+                c.fpu = fpu;
+                c.signals = signals;
+                c.fds = fds;
+                c.fs_base = fs_base;
+                c.gs_base = gs_base;
+                c.argv = argv;
+                c.exe = exe;
+                c.umask = umask;
+                c.cred = cred;
+                c.suid = suid;
+                c.sgid = sgid;
+                c.pgid = pgid;
+                c.sid = sid;
+                c.ctty = ctty;
+                c.clear_child_tid = if spec.child_cleartid { ctid } else { 0 };
+            });
+            pid as i64
+        }
+        Err("too many processes") => -EAGAIN,
+        Err(_) => -ENOMEM,
+    }
+}
+
+/// execve(2) in a threaded process (phase 4.2): the other threads end, the
+/// caller (the leader) keeps the process.  Err(-ENOSYS) when the caller is
+/// a worker -- the exec'ing thread taking over the leader's identity is not
+/// served; fork first, then exec in the child.
+pub fn exec_prepare() -> Result<(), i64> {
+    let Some(cur) = current() else { return Err(-EFAULT) };
+    if cur.pid != cur.tgid {
+        return Err(-ENOSYS);
+    }
+    Ok(())
+}
+
+/// The point of no return of execve: end every worker of the caller's group.
+pub fn exec_kill_workers() {
+    let Some(cur) = current() else { return };
+    let tgid = cur.tgid;
+    cur.clear_child_tid = 0;
+    cur.leader_exited = false;
+    // SAFETY: syscall context, IF=0, the caller is the leader.
+    unsafe { kill_workers_except(tgid, tgid) };
+}
+
+/// The heap bounds of the running thread's *process* (phase 4.2): threads
+/// share one break, kept in the leader's entry.
+pub fn brk_bounds() -> (u64, u64) {
+    let Some(cur) = current() else { return (0, 0) };
+    if cur.pid == cur.tgid {
+        return (cur.brk_base, cur.brk);
+    }
+    let own = (cur.brk_base, cur.brk);
+    with_pid_mut(cur.tgid, |p| (p.brk_base, p.brk)).unwrap_or(own)
+}
+
+/// Move the process's program break (see `brk_bounds`).
+pub fn set_brk(new: u64) {
+    let Some(cur) = current() else { return };
+    if cur.pid == cur.tgid {
+        cur.brk = new;
+        return;
+    }
+    let tgid = cur.tgid;
+    cur.brk = new;
+    let _ = with_pid_mut(tgid, |p| p.brk = new);
+}
+
+/// Run `f` on every live thread of the caller's group except the caller
+/// (sigaction propagating a disposition, setsid / setpgid keeping the group
+/// consistent).  Interrupts are masked for the walk; `f` must not switch.
+pub fn for_siblings(mut f: impl FnMut(&mut Process)) {
+    let Some(cur) = current() else { return };
+    let (tgid, me) = (cur.tgid, cur.pid);
+    let flags = crate::arch::io::cli_save();
+    // SAFETY: table walk with interrupts masked; the callback only edits
+    // the entry it is handed.
+    unsafe {
+        for q in (*addr_of_mut!(TABLE)).iter_mut() {
+            if q.tgid == tgid && q.pid != me && q.state != State::Zombie {
+                f(q);
+            }
+        }
+    }
+    // SAFETY: flags came from cli_save on this stack.
+    unsafe { crate::arch::io::restore_flags(flags) };
 }
 
 /// Flip a *not running* process parked by a bounded wait (a futex, phase
@@ -1617,24 +2025,65 @@ pub fn has_live(pid: u64) -> bool {
 /// Set the pending bit of `sig` in `pid` when it has a handler for it
 /// (sys_kill on another process).  Returns true when the bit was raised.
 pub fn post_signal(pid: u64, sig: u64) -> bool {
+    use crate::user::thread_core::{pick_signal_thread, Candidate};
     let flags = crate::arch::io::cli_save();
     // SAFETY: table walk with interrupts masked; state flips only.
     let raised = unsafe {
         let table = &mut *addr_of_mut!(TABLE);
         let mut raised = false;
+        // A signal aimed at a process (phase 4.2) goes to ONE thread of its
+        // group: the leader when it can take it, else a worker that does not
+        // block it.  A plain process is a group of one.
+        let mut members: Vec<*mut Process> = Vec::new();
+        let mut cands: Vec<Candidate> = Vec::new();
         for p in table.iter_mut() {
-            if p.pid == pid && p.state != State::Zombie {
+            if p.tgid == pid && p.state != State::Zombie {
+                let is_leader = p.pid == p.tgid;
+                cands.push(Candidate {
+                    is_leader,
+                    blocked: p.signals.blocked,
+                    parked: is_leader && p.leader_exited,
+                });
+                members.push(&mut **p as *mut Process);
+            }
+        }
+        if let Some(i) = pick_signal_thread(&cands, sig) {
+            let p = &mut *members[i];
+            if p.signals.handler_of(sig) != 0 {
+                p.signals.pending |= 1 << sig;
+                raised = true;
+                // A parked process must see the bit now, not at its
+                // next alarm: the read paths of a tty / pipe re-check
+                // `interrupt_pending` after every park and answer
+                // -EINTR (phase 3.3, the unix rule for interruptible
+                // waits).  Flipping the state only short-circuits the
+                // park -- the wake_ns bookkeeping needs no undo.
+                if p.state == State::Sleeping {
+                    p.state = State::Ready;
+                }
+            }
+        }
+        raised
+    };
+    // SAFETY: as cli_save.
+    unsafe { crate::arch::io::restore_flags(flags) };
+    raised
+}
+
+/// Set the pending bit of `sig` in the ONE thread `tid` when it has a
+/// handler (tgkill, phase 4.2).  True when the bit was raised.
+pub fn post_signal_thread(tid: u64, sig: u64) -> bool {
+    let flags = crate::arch::io::cli_save();
+    // SAFETY: table walk with interrupts masked; state flips only.
+    let raised = unsafe {
+        let mut raised = false;
+        for p in (*addr_of_mut!(TABLE)).iter_mut() {
+            if p.pid == tid && p.state != State::Zombie {
                 if p.signals.handler_of(sig) != 0 {
                     p.signals.pending |= 1 << sig;
                     raised = true;
-                    // A parked process must see the bit now, not at its
-                    // next alarm: the read paths of a tty / pipe re-check
-                    // `interrupt_pending` after every park and answer
-                    // -EINTR (phase 3.3, the unix rule for interruptible
-                    // waits).  Flipping the state only short-circuits the
-                    // park -- the wake_ns bookkeeping needs no undo.
                     if p.state == State::Sleeping {
-                        p.state = State::Ready;
+                        p.state = State::Ready; // as post_signal: end the park early
                     }
                 }
                 break;
@@ -1657,11 +2106,16 @@ pub fn signal_target(pid: u64, sig: u64) -> bool {
     let found = unsafe {
         let table = &mut *addr_of_mut!(TABLE);
         let mut found = false;
+        // The whole group dies (phase 4.2): the leader's entry takes the
+        // signal for the parent's wait, the workers are plain corpses.
         for p in table.iter_mut() {
-            if p.pid == pid && p.state != State::Zombie {
-                zombify_common(p, Outcome::Signaled(sig));
-                found = true;
-                break;
+            if p.tgid == pid && p.state != State::Zombie {
+                if p.pid == pid {
+                    zombify_common(p, Outcome::Signaled(sig));
+                    found = true;
+                } else {
+                    zombify_common(p, Outcome::Killed);
+                }
             }
         }
         if found {
@@ -1714,6 +2168,9 @@ pub fn run_until_idle() {
     // and preserves the IF=0 invariant on both sides.
     unsafe {
         loop {
+            // A worker thread that ended is a corpse nobody wait()s for
+            // (phase 4.2): free its stack here, between two schedules.
+            sweep_dead_threads();
             let table = &mut *addr_of_mut!(TABLE);
             if table.is_empty() {
                 break;
@@ -1890,10 +2347,11 @@ pub fn kill(pid: u64) -> bool {
     let found = unsafe {
         let table = &mut *addr_of_mut!(TABLE);
         let mut found = false;
+        // A whole thread group (phase 4.2): `pid` is the leader's.
         for p in table.iter_mut() {
-            if p.pid == pid && p.state != State::Zombie {
+            if p.tgid == pid && p.state != State::Zombie {
                 zombify_common(p, Outcome::Killed);
-                found = true;
+                found |= p.pid == pid;
             }
         }
         if found {

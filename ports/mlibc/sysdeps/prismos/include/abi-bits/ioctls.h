@@ -2,8 +2,10 @@
 #define _ABIBITS_IOCTLS_H
 
 /* The tty side PrismOS's ioctl (syscall 29, sys/kern/src/user/fd.rs)
- * actually answers; every other request is -ENOTTY, so nothing else is
- * defined.  The values are the classic Linux ones the kernel expects.
+ * answers, the words libc itself needs.  The values are the classic Linux
+ * ones the kernel expects.  <sys/ioctl.h> adds the rest of the Linux set
+ * through <asm/ioctls.h>, and the VT / KD / evdev / DRM numbers live in
+ * the UAPI headers the sysroot ships (ports/mlibc/linux-headers).
  *
  * Phase 3.3 grew the set: the termios write side (TCSETS and its drain /
  * flush variants -- what tcsetattr rides), and the foreground pair a

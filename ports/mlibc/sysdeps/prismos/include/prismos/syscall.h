@@ -126,6 +126,12 @@ enum {
         PRISM_SYS_GETSOCKOPT = 101,  /* getsockopt(fd, level, name, val, &len) */
         PRISM_SYS_SETSOCKOPT = 102,  /* setsockopt(fd, level, name, val, len) */
         PRISM_SYS_SYNC = 103,        /* sync() */
+        /* phase 4.2: threads (sys/kern/src/user/thread_core.rs) */
+        PRISM_SYS_CLONE = 104,       /* clone(flags, stack, ptid, ctid, tls) -- thread form only */
+        PRISM_SYS_GETTID = 105,      /* gettid() */
+        PRISM_SYS_THREAD_EXIT = 106, /* thread_exit() [noreturn] -- ends the caller, exit() the group */
+        PRISM_SYS_SET_TID_ADDRESS = 107, /* set_tid_address(addr) */
+        PRISM_SYS_TGKILL = 108,      /* tgkill(tgid, tid, sig) */
 };
 
 /* arch_prctl() codes -- the Linux x86-64 values the kernel expects. */

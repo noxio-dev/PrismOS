@@ -35,7 +35,7 @@
  *
  * The PrismOS sysdeps (phase 3.2, step 2): every mlibc tag the kernel has
  * a syscall for, spoken through the raw convention of generic/syscall.cpp.
- * Everything else -- threads / clone, datagram sockets, *at() beyond AT_FDCWD -- is
+ * Everything else -- datagram sockets, *at() beyond AT_FDCWD -- is
  * deliberately absent from the tag list (include/mlibc/sysdeps.hpp), so
  * mlibc's generic layer answers ENOSYS: what the kernel lacks stays
  * ENOSYS, the port's contract.  (Phase 3.4 -- the busybox step -- moved
@@ -281,12 +281,20 @@ int Sysdeps<FutexWake>::operator()(int *pointer, bool all) {
 }
 
 pid_t Sysdeps<FutexTid>::operator()() {
-        /* Single-threaded: the tid is the pid. */
-        return static_cast<pid_t>(sys(PRISM_SYS_GETPID));
+        /* The thread id (phase 4.2): what a mutex records as its owner.  For
+         * the main thread it is the pid; getpid() names the whole group. */
+        return static_cast<pid_t>(sys(PRISM_SYS_GETTID));
 }
 
 pid_t Sysdeps<GetTid>::operator()() {
-        return static_cast<pid_t>(sys(PRISM_SYS_GETPID));
+        return static_cast<pid_t>(sys(PRISM_SYS_GETTID));
+}
+
+int Sysdeps<Tgkill>::operator()(int tgid, int tid, int sig) {
+        auto ret = sys(PRISM_SYS_TGKILL, tgid, tid, sig);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
 }
 
 int Sysdeps<TcbSet>::operator()(void *pointer) {
@@ -1013,7 +1021,7 @@ int Sysdeps<Waitpid>::operator()(pid_t pid, int *status, int flags, struct rusag
 
 int Sysdeps<GetRusage>::operator()(int scope, struct rusage *usage) {
         /* RUSAGE_SELF / RUSAGE_CHILDREN / RUSAGE_THREAD -- the kernel's 67
-         * answers all three (THREAD is SELF: one process, one thread), the
+         * answers all three (THREAD is SELF: the counters are the caller's own), the
          * tick-split pair straight out of the PCB. */
         auto ret = sys(PRISM_SYS_GETRUSAGE, scope, usage);
         if(int e = sc_error(ret); e)
@@ -1098,7 +1106,8 @@ int Sysdeps<Sigprocmask>::operator()(int how, const sigset_t *__restrict set,
 
 int Sysdeps<ThreadSigmask>::operator()(int how, const sigset_t *__restrict set,
                 sigset_t *__restrict retrieve) {
-        /* One process, one thread: the two calls are the same word. */
+        /* The kernel's blocked mask is per thread (phase 4.2), so the
+         * thread-wide call and the process-wide one are the same word. */
         return prism_sigmask(how, set, retrieve);
 }
 

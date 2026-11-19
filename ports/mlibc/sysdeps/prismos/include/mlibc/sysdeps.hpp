@@ -7,8 +7,7 @@
  *
  * The PrismOS sysdeps tag set (phase 3.2, step 2): every tag the kernel has
  * a syscall for.  A tag absent from this list is *missing on purpose* --
- * mlibc's generic layer then answers ENOSYS (pthread_create,
- * *at() beyond AT_FDCWD, ...) -- which is the port's contract:
+ * mlibc's generic layer then answers ENOSYS (*at() beyond AT_FDCWD, ...) -- which is the port's contract:
  * what the kernel lacks stays ENOSYS.
  */
 
@@ -161,7 +160,18 @@ struct PrismOSSysdepTags :
         Sockname,
         Peername,
         GetSockopt,
-        SetSockopt
+        SetSockopt,
+
+        /* phase 4.2: threads.  Clone / PrepareStack / ThreadExit live in
+         * generic/thread.cpp (libc only: ld.so has no use for them);
+         * pthread_create, pthread_join and friends are mlibc's own over
+         * them, on top of FutexWait / FutexWake, which were already here.
+         * Tgkill is pthread_kill's; cancellation (SIGCANCEL) stays
+         * unsupported, the kernel having no SA_SIGINFO. */
+        Clone,
+        PrepareStack,
+        ThreadExit,
+        Tgkill
 {};
 
 struct SysdepTraits {

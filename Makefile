@@ -587,6 +587,13 @@ unixtest:
 	rustc --edition 2021 --test tests/unix_host.rs -o $(B)/unix_host
 	$(B)/unix_host --test-threads=1
 
+# Host-side tests of the thread-group logic (clone flags, thread exit, signal target).
+.PHONY: threadtest
+threadtest:
+	mkdir -p $(B)
+	rustc --edition 2021 --test tests/thread_host.rs -o $(B)/thread_host
+	$(B)/thread_host --test-threads=1
+
 # Host-side tests of the DRM/KMS ABI and driver (no QEMU needed).
 .PHONY: drmtest
 drmtest:

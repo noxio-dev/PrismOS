@@ -17,21 +17,24 @@ Linux-like, x86-64 `syscall` instruction:
 | `rcx`, `r11` | clobbered by the CPU |
 
 * Success returns a value `>= 0`; failure returns `-errno` (Linux numbering).
-* An unknown number returns `-ENOSYS`. Numbers 0..103 are assigned; 104 and up
+* An unknown number returns `-ENOSYS`. Numbers 0..108 are assigned; 109 and up
   are not.
 * A pending signal is delivered between the return value and `sysretq`.
 * `exit` never returns. `execve` returns only on failure, and the caller is
   then untouched.
-* The mlibc port keeps its public `ioctl()` off: `tcgetattr` / `tcsetattr` /
-  `isatty` are library calls, and a program that needs another request uses
-  `prism_ioctl()` from `prism_raw.h`.
+* `ioctl()` is the standard libc call: mlibc's glibc-option `ioctl(fd, req,
+  ...)` goes through the port's `Sysdeps<Ioctl>` (syscall 29), `errno` set
+  from the negative return.  The request numbers and structures come from the
+  Linux UAPI headers the sysroot ships (`<sys/ioctl.h>`, `<linux/{kd,vt,input}.h>`,
+  `<drm/drm.h>` -- `ports/mlibc/linux-headers`).  `prism_ioctl()` in
+  `prism_raw.h` stays as the raw form, for programs that avoid libc.
 
 ## Process and scheduling
 
 | # | Call | Notes |
 |---|------|-------|
 | 0 | `exit(code)` | |
-| 2 | `getpid()` | |
+| 2 | `getpid()` | thread-group id (all threads of a process share it) |
 | 4 | `yield()` | hands the CPU to a process of the same priority level or better |
 | 5 | `sleep(ms)` | parks the process for at least `ms`, capped at 10 s |
 | 6 | `setprio(level)` | levels 0 (best) to 3; can only lower the priority; returns the previous level, `-EINVAL` out of range, `-EPERM` if it would raise it |
@@ -122,7 +125,16 @@ Only a few requests are answered:
   pointer `arg`; `KDSKBMODE` takes the mode itself as `arg`. Mode `K_MEDIUMRAW` (2) delivers
   one byte per key event: the Linux keycode, with bit 7 set on release.
 * Virtual terminals (console only): the `VT_*` requests (`VT_OPENQRY`,
-  `VT_GETMODE`, `VT_SETMODE`, `VT_GETSTATE`, `VT_ACTIVATE`, `VT_WAITACTIVE`, ...).
+  `VT_GETMODE`, `VT_SETMODE`, `VT_GETSTATE`, `VT_ACTIVATE`, `VT_WAITACTIVE`, ...)
+  and `KDGETMODE` / `KDSETMODE` (`KD_GRAPHICS` marks the VT as drawn by a client).
+* A DRM descriptor (`/dev/dri/card0`, `sys/kern/src/drm/`): the ioctl space of
+  magic `'d'` -- version, caps, master, GEM, dumb buffers, the KMS set (CRTC,
+  plane, connector, framebuffer, page flip, atomic).  `mmap` of the fd maps a
+  dumb buffer at the offset `DRM_IOCTL_MODE_MAP_DUMB` returned.
+* An evdev descriptor (`/dev/input/event0`, `event1`, `sys/kern/src/input/`):
+  the ioctl space of type `'E'` (`EVIOCGVERSION`, `EVIOCGBIT`, `EVIOCGKEY`,
+  `EVIOCGRAB`, ...); `read` returns 24-byte `struct input_event`.
+* `FIONREAD` / `FIONBIO` on sockets.
 
 Anything else returns `-ENOTTY`.
 
@@ -183,6 +195,18 @@ Implemented in `user/fd/unix.rs`.
 | 100 | `getpeername(fd, addr, len)` | |
 | 101 | `getsockopt(fd, level, name, val, len)` | 4th and 5th in `r10` / `r8` |
 | 102 | `setsockopt(fd, level, name, val, len)` | 4th and 5th in `r10` / `r8` |
+
+## Threads (phase 4.2)
+
+| # | Call | Notes |
+|---|------|-------|
+| 104 | `clone(flags, stack, ptid, ctid, tls)` | Linux x86-64 register order (`ctid` in `r10`, `tls` in `r8`). Needs `CLONE_VM\|SIGHAND\|THREAD`; fork-style flag sets give `-ENOSYS`. `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID`, `CLONE_CHILD_CLEARTID`, `CLONE_FILES` honoured. Returns the new tid; the child gets 0 on `stack` |
+| 105 | `gettid()` | |
+| 106 | `thread_exit()` | ends the caller only (clears `clear_child_tid` + futex wake); the last thread ends the process |
+| 107 | `set_tid_address(ptr)` | returns the tid |
+| 108 | `tgkill(tgid, tid, sig)` | |
+
+`exit()` ends every thread of the group; `kill`/`wait` act on the group.
 
 ## Framebuffer (PrismOS specific)
 

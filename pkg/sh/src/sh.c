@@ -43,9 +43,10 @@
 #include "prism_raw.h"
 
 /* The TIOC* / TCSA* words come from <termios.h> (abi-bits/ioctls.h);
- * the requests themselves go through prism_ioctl -- mlibc's public
- * ioctl() is glibc-option code the port keeps off, while tcgetattr /
- * tcsetattr are plain library calls. */
+ * the requests themselves go through prism_ioctl (the raw form; mlibc's
+ * public ioctl() is available too -- init and unixsock use it -- this
+ * bootstrap shell just predates that), while tcgetattr / tcsetattr are
+ * plain library calls. */
 
 #define MAXARGS 32
 #define MAXLINE 512
