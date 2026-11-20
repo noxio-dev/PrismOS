@@ -31,7 +31,8 @@ build PrismOS itself.
 | 3.1 – 3.4 | POSIX userspace (syscalls, mlibc, init/TTY/procfs, BusyBox + ash) | done |
 | 3.5 | Precise time, randomness, users and permissions | done |
 | 4.1 | Cross binutils in the image (`ar`, `ranlib`, `nm`, `objdump`, `strip`) | done |
-| 4.2 – 4.5 | Threads, C++, building userspace with the PrismOS toolchain, dev image | todo |
+| 4.2 | Threads (clone, futex, TLS, thread lifecycle) | done |
+| 4.3 – 4.5 | C++, building userspace with the PrismOS toolchain, dev image | todo |
 | 5 | Self-hosting (native binutils, gcc, build tools, full bootstrap) | todo |
 
 The detailed checklist, with the notes behind every step, lives in
