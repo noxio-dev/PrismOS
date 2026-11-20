@@ -413,6 +413,13 @@ pub struct MountInfo {
     pub read_only: bool,
 }
 
+/// A resolved file (mount + inode) that survives across calls; see `Vfs::file_ref`.
+#[derive(Clone, Copy)]
+pub struct FileRef {
+    mount: u32,
+    ino: u64,
+}
+
 pub struct Vfs {
     mounts: Vec<Mount>,
     files: Vec<Option<OpenFile>>,
@@ -720,6 +727,24 @@ impl Vfs {
         }
         buf.truncate(done);
         Ok(buf)
+    }
+
+    /// A file resolved once and read many times (the ELF loader streams a
+    /// program's segments through it instead of reading the whole file).
+    /// Like `read_file` it checks no permissions: the caller did
+    /// (`exec_check`).  Any file type resolves; the caller inspects the stat.
+    pub fn file_ref(&mut self, path: &str) -> FsResult<(FileRef, Stat)> {
+        Self::check_len(path)?;
+        let p = normalize("/", path);
+        let (mi, ino) = self.walk(&p, true)?;
+        let st = self.mounts[mi].fs.stat(ino)?;
+        Ok((FileRef { mount: self.mounts[mi].id, ino }, st))
+    }
+
+    /// Positional read through a `FileRef` (short reads possible, 0 at EOF).
+    pub fn read_ref(&mut self, r: &FileRef, off: u64, buf: &mut [u8]) -> FsResult<usize> {
+        let mi = self.mount_index(r.mount)?;
+        self.mounts[mi].fs.read(r.ino, off, buf)
     }
 
     /// Create or truncate `path` and write `data`.

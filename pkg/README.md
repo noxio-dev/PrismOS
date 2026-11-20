@@ -34,7 +34,7 @@ kernel shell's `prism# ` is the rescue mode,
 
 No Makefile wiring, no editing anywhere else: drop a directory with a
 manifest under `pkg/` and the next `make` builds it, checks it against the
-loader's contract, strips it under the kernel's 4 MiB whole-file read, and
+loader's contract, strips it (the kernel no longer reads whole files, but a stripped binary is still much smaller), and
 installs it at the manifest's `[install]` path.
 
 ## The manifest
@@ -50,7 +50,7 @@ sources = ["src/hello.c"]   # app-relative; glob patterns allowed
 cflags = []                 # extra compile flags (the base set is fixed)
 ldflags = []                # extra link flags
 output = "build/hello"      # app-relative; where the binary lands
-strip = true                # the kernel reads whole files (4 MiB cap)
+strip = true                # smaller image (the old 4 MiB whole-file cap is gone)
 verify = true               # verify.sh's loader-contract checks
 
 [install]

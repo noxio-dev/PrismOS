@@ -52,8 +52,13 @@ use alloc::vec::Vec;
 /// input, measured under `prism_emu` (which runs on exactly this size).
 /// The cost is one anonymous megabyte per process.
 pub const ELF_STACK_SIZE: u64 = 256 * PAGE;
-/// Largest executable the loader reads.
-pub const MAX_ELF_FILE: usize = 4 * 1024 * 1024;
+/// How much of an executable the loader keeps in memory: the ELF header, the
+/// program headers and the `PT_INTERP` string live in the first bytes.  The
+/// segments are streamed from the file, so there is no limit on the file's
+/// size (the footprint is bounded by `MAX_IMAGE_SPAN`).
+const HEAD_MAX: usize = 64 * 1024;
+/// Bytes copied per step when a segment is streamed into the new address space.
+const COPY_CHUNK: usize = 64 * 1024;
 /// Largest memory footprint of the loaded segments.
 const MAX_IMAGE_SPAN: u64 = 64 * 1024 * 1024;
 /// Limits on what `execve` copies onto the new stack.
@@ -182,6 +187,55 @@ fn page_up(x: u64) -> Option<u64> {
 /// Read an executable from the VFS and load it (the `execve` front end).
 /// A file starting with `#!` is a script: the interpreter named on its
 /// first line is loaded instead, with the script path inserted in argv.
+/// Where an executable's bytes come from.  The head (header, program
+/// headers, interpreter string) is in memory; segment data is read on demand,
+/// so the loader never needs the whole file at once.
+trait Source {
+    fn head(&self) -> &[u8];
+    /// The file's full size.
+    fn len(&self) -> u64;
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize, ExecError>;
+}
+
+/// An executable already in memory (tests, the in-kernel callers of `load`).
+struct Mem<'a>(&'a [u8]);
+
+impl Source for Mem<'_> {
+    fn head(&self) -> &[u8] {
+        self.0
+    }
+    fn len(&self) -> u64 {
+        self.0.len() as u64
+    }
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize, ExecError> {
+        let off = (off as usize).min(self.0.len());
+        let n = buf.len().min(self.0.len() - off);
+        buf[..n].copy_from_slice(&self.0[off..off + n]);
+        Ok(n)
+    }
+}
+
+/// An executable on the file system: its head in memory, the rest on disk.
+struct Program {
+    head: Vec<u8>,
+    file: crate::fs::vfs::FileRef,
+    size: u64,
+}
+
+impl Source for Program {
+    fn head(&self) -> &[u8] {
+        &self.head
+    }
+    fn len(&self) -> u64 {
+        self.size
+    }
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize, ExecError> {
+        crate::fs::fsys::vfs()
+            .read_ref(&self.file, off, buf)
+            .map_err(|e| ExecError::File(e.as_str(), 5)) // EIO
+    }
+}
+
 pub fn load_path(path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Loaded, ExecError> {
     load_path_inner(path, path.as_bytes(), argv, envp, 0)
 }
@@ -193,12 +247,13 @@ fn load_path_inner(
     envp: &[Vec<u8>],
     depth: usize,
 ) -> Result<Loaded, ExecError> {
-    let image = read_program(path)?;
+    let prog = read_program(path)?;
+    let image = prog.head();
     if image.starts_with(b"#!") {
         if depth >= MAX_SHEBANG_DEPTH {
             return Err(ExecError::File("too many levels of #! interpreters", 40)); // ELOOP
         }
-        let (interp, arg) = parse_shebang(&image)?;
+        let (interp, arg) = parse_shebang(image)?;
         // argv becomes: interp [optional-arg] script-path argv[1..]
         let mut nargv: Vec<Vec<u8>> = Vec::new();
         nargv.push(interp.as_bytes().to_vec());
@@ -210,7 +265,7 @@ fn load_path_inner(
         // AT_EXECFN stays the script path, like on Linux.
         return load_path_inner(&interp, execfn, &nargv, envp, depth + 1);
     }
-    load(&image, execfn, argv, envp)
+    load_src(&prog, execfn, argv, envp)
 }
 
 /// Parse `#!interpreter [one optional argument]` from the first line.
@@ -235,9 +290,9 @@ fn parse_shebang(image: &[u8]) -> Result<(String, Option<String>), ExecError> {
     Ok((String::from(interp), if rest.is_empty() { None } else { Some(String::from(rest)) }))
 }
 
-/// Read `path` and check it is an executable regular file: what both the
-/// main program and its `PT_INTERP` interpreter go through.
-fn read_program(path: &str) -> Result<Vec<u8>, ExecError> {
+/// Open `path`, check it is an executable regular file and read its head:
+/// what both the main program and its `PT_INTERP` interpreter go through.
+fn read_program(path: &str) -> Result<Program, ExecError> {
     use crate::fs::vfs::{FileType, FsError};
     let vfs = crate::fs::fsys::vfs();
     let errno = |e: FsError| -> ExecError {
@@ -252,7 +307,7 @@ fn read_program(path: &str) -> Result<Vec<u8>, ExecError> {
         };
         ExecError::File(e.as_str(), code)
     };
-    let st = vfs.stat(path).map_err(errno)?;
+    let (file, st) = vfs.file_ref(path).map_err(errno)?;
     if st.ftype != FileType::Regular {
         return Err(if st.ftype == FileType::Dir {
             ExecError::File("is a directory", 21)
@@ -263,7 +318,20 @@ fn read_program(path: &str) -> Result<Vec<u8>, ExecError> {
     if st.mode & 0o111 == 0 {
         return Err(ExecError::File("permission denied (not executable)", 13)); // EACCES
     }
-    vfs.read_file(path, MAX_ELF_FILE).map_err(errno)
+    let want = (st.size as usize).min(HEAD_MAX);
+    let mut head: Vec<u8> = Vec::new();
+    head.try_reserve_exact(want).map_err(|_| ExecError::NoMemory)?;
+    head.resize(want, 0);
+    let mut done = 0usize;
+    while done < want {
+        let n = vfs.read_ref(&file, done as u64, &mut head[done..]).map_err(errno)?;
+        if n == 0 {
+            break;
+        }
+        done += n;
+    }
+    head.truncate(done);
+    Ok(Program { head, file, size: st.size })
 }
 
 /// One image after the header walk: the segments, the dynamic section and,
@@ -280,7 +348,9 @@ struct Parsed {
 
 /// Walk the ELF header and the program headers: the shared front end of
 /// the static and the interpreter paths.
-fn parse(image: &[u8]) -> Result<Parsed, ExecError> {
+fn parse(src: &dyn Source) -> Result<Parsed, ExecError> {
+    let image = src.head();
+    let file_len = src.len();
     // ---- ELF header
     if image.len() < 64 || &image[..4] != b"\x7fELF" {
         return Err(ExecError::NotElf("not an ELF file"));
@@ -306,7 +376,7 @@ fn parse(image: &[u8]) -> Result<Parsed, ExecError> {
         .checked_add(e_phnum * 56)
         .ok_or(ExecError::Corrupt("bad program header table"))?;
     if ph_end > image.len() {
-        return Err(ExecError::Corrupt("program headers past the end of the file"));
+        return Err(ExecError::Corrupt("program headers past the end of the file (or beyond its first 64 KiB)"));
     }
 
     // ---- program headers
@@ -330,7 +400,7 @@ fn parse(image: &[u8]) -> Result<Parsed, ExecError> {
                 }
                 match s.off.checked_add(s.filesz) {
                     Some(e) if e as usize <= image.len() => {}
-                    _ => return Err(ExecError::Corrupt("PT_INTERP past the end of the file")),
+                    _ => return Err(ExecError::Corrupt("PT_INTERP past the end of the file (or beyond its first 64 KiB)")),
                 }
                 interp = Some(s);
             }
@@ -343,7 +413,7 @@ fn parse(image: &[u8]) -> Result<Parsed, ExecError> {
                     return Err(ExecError::Corrupt("segment file size exceeds its memory size"));
                 }
                 match s.off.checked_add(s.filesz) {
-                    Some(e) if e as usize <= image.len() => {}
+                    Some(e) if e <= file_len => {}
                     _ => return Err(ExecError::Corrupt("segment past the end of the file")),
                 }
                 if s.flags & PF_W != 0 && s.flags & PF_X != 0 {
@@ -401,7 +471,7 @@ struct Mapped {
 /// what `ld.so` is about to do to the program it loads.
 fn map_image(
     aspace: &mut AddressSpace,
-    image: &[u8],
+    src: &dyn Source,
     p: &Parsed,
     anchor: u64,
     relocate: bool,
@@ -456,9 +526,23 @@ fn map_image(
         if !aspace.alloc_map(start, len, s.flags & PF_W != 0, s.flags & PF_X != 0) {
             return Err(ExecError::NoMemory);
         }
-        let data = &image[s.off as usize..(s.off + s.filesz) as usize];
-        if !data.is_empty() && !aspace.write(s.vaddr.wrapping_add(bias), data, true) {
-            return Err(ExecError::Corrupt("cannot copy a segment"));
+        // Stream the segment's file bytes in chunks: no whole-file buffer.
+        if s.filesz > 0 {
+            let mut buf: Vec<u8> = Vec::new();
+            buf.try_reserve_exact(COPY_CHUNK.min(s.filesz as usize)).map_err(|_| ExecError::NoMemory)?;
+            buf.resize(COPY_CHUNK.min(s.filesz as usize), 0);
+            let mut done = 0u64;
+            while done < s.filesz {
+                let want = buf.len().min((s.filesz - done) as usize);
+                let got = src.read_at(s.off + done, &mut buf[..want])?;
+                if got == 0 {
+                    return Err(ExecError::Corrupt("segment past the end of the file"));
+                }
+                if !aspace.write(s.vaddr.wrapping_add(bias).wrapping_add(done), &buf[..got], true) {
+                    return Err(ExecError::Corrupt("cannot copy a segment"));
+                }
+                done += got as u64;
+            }
         }
     }
 
@@ -482,16 +566,21 @@ fn map_image(
 
 /// Build the address space of the ELF `image`.  `execfn` is the path shown
 /// to the program (`AT_EXECFN`).
+#[allow(dead_code)]
 pub fn load(image: &[u8], execfn: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Loaded, ExecError> {
-    let p = parse(image)?;
+    load_src(&Mem(image), execfn, argv, envp)
+}
+
+fn load_src(src: &dyn Source, execfn: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Loaded, ExecError> {
+    let p = parse(src)?;
 
     // ---- the interpreter, when the program asks for one: read it before
     // any address-space work, so a bad PT_INTERP fails the execve cleanly
     // (the interpreter is loaded with the same rules as the program:
     // regular file, executable bit, size cap).
-    let interp: Option<Vec<u8>> = match p.interp {
+    let interp: Option<Program> = match p.interp {
         Some(s) => {
-            let path = interp_string(image, s)?;
+            let path = interp_string(src.head(), s)?;
             Some(read_program(&path)?)
         }
         None => None,
@@ -501,7 +590,7 @@ pub fn load(image: &[u8], execfn: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>]) -> 
     // interpreter will do the honors: its DT_NEEDED / DT_JMPREL are then
     // the interpreter's to resolve, in user space.
     let mut aspace = AddressSpace::new().ok_or(ExecError::NoMemory)?;
-    let main = map_image(&mut aspace, image, &p, USER_CODE_BASE, interp.is_none())?;
+    let main = map_image(&mut aspace, src, &p, USER_CODE_BASE, interp.is_none())?;
 
     // ---- the interpreter itself: an ET_DYN mapped unrelocated at its own
     // base.  The process starts at ITS entry; AT_BASE tells it where it

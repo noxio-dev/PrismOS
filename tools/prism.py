@@ -18,9 +18,9 @@
 #   verify   ports/toolchain/verify.sh against the built binary: the
 #            loader-contract shape checks, plus the program's own syscall
 #            and symbol diet when the manifest declares one ([verify])
-#   stage    the stripped binary into build/pkg-out/<name> -- the whole
-#            file the kernel's exec reads must stay under MAX_ELF_FILE
-#            (4 MiB), and the meson debug sections buy the loader nothing
+#   stage    the stripped binary into build/pkg-out/<name> -- the kernel
+#            no longer caps an executable's size, but the meson debug
+#            sections buy the loader nothing
 #   install  the staged binary into an image root tree, at [install] path
 #
 # Usage (or, the same through the ./prism shim at the repo root):

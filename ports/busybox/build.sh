@@ -335,12 +335,7 @@ do_stage() {
         say stage "stripping busybox"
         $PREFIX/bin/x86_64-prismos-strip --strip-all -o "$OUT/busybox" \
                 "$SRC/busybox-$BUSYBOX_VER/busybox_unstripped"
-        sz=$(wc -c < "$OUT/busybox")
-        if [ "$sz" -gt $((4 * 1024 * 1024)) ]; then
-                echo "ports/busybox: $OUT/busybox is $sz bytes -- over the kernel's 4 MiB cap" >&2
-                exit 1
-        fi
-        say stage "$OUT/busybox ($(du -h "$OUT/busybox" | cut -f1), under the 4 MiB cap)"
+        say stage "$OUT/busybox ($(du -h "$OUT/busybox" | cut -f1))"
 }
 
 # ---- stage: verify -------------------------------------------------------------
