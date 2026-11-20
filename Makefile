@@ -263,7 +263,7 @@ BUSYBOX_APPLETS := sh ash ls cat echo printf test [ mkdir rmdir rm cp mv ln \
                    head tail id whoami basename dirname time ps mount \
                    umount df grep sed awk tar vi loadkmap dumpkmap kbd_mode showkey hostname \
                    clear setsid cttyhack find chown chgrp login su adduser addgroup sync \
-                   date which reboot poweroff
+                   date which reboot poweroff kill tree
 
 # ---- mlibc toolchain + sysroot (phase 3.2, steps 3 + 4) ---------------------
 # ports/toolchain drives the phase's third and fourth steps: the
