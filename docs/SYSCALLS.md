@@ -17,7 +17,7 @@ Linux-like, x86-64 `syscall` instruction:
 | `rcx`, `r11` | clobbered by the CPU |
 
 * Success returns a value `>= 0`; failure returns `-errno` (Linux numbering).
-* An unknown number returns `-ENOSYS`. Numbers 0..108 are assigned; 109 and up
+* An unknown number returns `-ENOSYS`. Numbers 0..111 are assigned; 112 and up
   are not.
 * A pending signal is delivered between the return value and `sysretq`.
 * `exit` never returns. `execve` returns only on failure, and the caller is
@@ -110,6 +110,36 @@ Linux-like, x86-64 `syscall` instruction:
 | 56 | `umount(target)` | |
 | 41 | `poll(fds, nfds, timeout_ms)` | |
 | 42 | `select(nfds, r, w, e, tv)` | 4th and 5th arguments in `r10` / `r8` |
+
+## epoll
+
+Implemented in `user/fd/epoll.rs` over the host-tested interest list
+`user/epoll_core.rs` (`make epolltest`; `/usr/bin/epolltest` from ring 3).
+
+| # | Call | Notes |
+|---|------|-------|
+| 109 | `epoll_create1(flags)` | `EPOLL_CLOEXEC` only, else `-EINVAL` |
+| 110 | `epoll_ctl(epfd, op, fd, event)` | `ADD` / `DEL` / `MOD`; 4th argument in `r10`. `-EEXIST`, `-ENOENT`, `-EBADF`, `-EINVAL` (epfd not an epoll, watching itself, bad op), `-ELOOP` (nesting cycle or deeper than 4), `-ENOSPC` (256 entries), `-EPERM` on regular files and directories |
+| 111 | `epoll_wait(epfd, events, maxevents, timeout_ms)` | 4th argument in `r10`; `maxevents` 1..1024; `-EINTR` when a handler is about to run |
+
+`struct epoll_event` is the packed 12-byte x86-64 layout (`u32 events`, `u64
+data`). Supported: `EPOLLIN/OUT/ERR/HUP/RDHUP` (plus the `RDNORM`/`WRNORM`/band
+aliases), `EPOLLET`, `EPOLLONESHOT`, epoll watched by another epoll, any
+description `poll` can watch (pipes, sockets, ttys, evdev, DRM, /dev nodes).
+
+Differences from Linux:
+
+* the interest list holds weak references: an entry disappears once every
+  descriptor on the watched description is closed (as on Linux), and `DEL` /
+  `MOD` match on (fd number, description);
+* readiness is sampled when somebody waits (the same probe as `poll`), so
+  `EPOLLET` reports the bits that turned on since the *previous wait*: a rise
+  and fall between two waits is not seen, and a second write to an already
+  readable pipe is not a new edge;
+* a timeout above 10 s is capped like every bounded wait here (`poll` does the
+  same), and a negative timeout re-arms the cap and waits for an event;
+* `epoll_pwait` with a signal mask is `-ENOSYS` (the mlibc sysdep refuses it);
+  `EPOLLEXCLUSIVE` / `EPOLLWAKEUP` are accepted and have no effect.
 
 ### `ioctl(fd, request, arg)` (29)
 

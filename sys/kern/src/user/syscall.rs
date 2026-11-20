@@ -69,6 +69,8 @@
 //           gettid(), thread_exit(), set_tid_address(addr), tgkill(tgid,
 //           tid, sig).  getpid() answers the thread GROUP's id; exit(2)
 //           ends the whole group, thread_exit(2) the caller only.
+//    109..111 epoll: epoll_create1(flags), epoll_ctl(epfd, op, fd, ev),
+//           epoll_wait(epfd, events, max, timeout_ms) (user/fd/epoll.rs)
 //    59 setsid()                    60 setpgid(pid, pgid)   61 getpgid(pid)
 //    (a negative kill pid names a group; TIOCSCTTY claims a terminal)
 //
@@ -433,6 +435,10 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         106 => process::exit_thread_current(),
         107 => process::set_tid_address(a0),
         108 => signal::sys_tgkill(a0, a1, a2),
+        // ---- epoll (user/fd/epoll.rs) -----------------------------------
+        109 => fd::epoll::sys_epoll_create1(a0),
+        110 => fd::epoll::sys_epoll_ctl(a0, a1, a2, frame.r10),
+        111 => fd::epoll::sys_epoll_wait(a0, a1, a2, frame.r10),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

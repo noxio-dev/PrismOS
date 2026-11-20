@@ -95,6 +95,7 @@ Phase 5 — self-hosting
 
 Beyond (nice to have)
 - [ ] hidden kernel prerequisites that the phases above keep running into: file-backed `MAP_SHARED` with a page cache, `epoll`, move them before 4.2 / 5.2 when they block
+  - [x] `epoll` (syscalls 109-111): `epoll_create1` / `epoll_ctl` / `epoll_wait`, level / `EPOLLET` / `EPOLLONESHOT`, nesting, on top of the `poll` readiness probe; `user/fd/epoll.rs` over the host-tested `user/epoll_core.rs` (`make epolltest`, `/usr/bin/epolltest`).  Not yet: `epoll_pwait` with a signal mask, `signalfd` / `eventfd` / `timerfd` to feed it, true edge detection between waits
 - [x] Unix domain sockets (`AF_UNIX` `SOCK_STREAM`, syscalls 90-102): socketpair, named + abstract sockets, accept / connect, `SCM_RIGHTS`, non-blocking I/O, `poll` / `select`, `SO_PEERCRED`; `sys/kern/src/user/fd/unix.rs` over the host-tested state machine `user/unix_core.rs` (`make unixtest`, `/bin/unixsock`).  Not yet: `SOCK_DGRAM` / `SOCK_SEQPACKET`, `SCM_CREDENTIALS`, a socket inode type in the VFS (a bound path stats as a regular file), permission checks on connect
 - [ ] networking: virtio-net or e1000, ARP/IP/UDP/TCP, a tiny `ping` and `wget`
 - [x] USB (xHCI) keyboard and mass storage, NVMe (polling drivers; root ports only, no hubs, see docs/USB-NVME.md)

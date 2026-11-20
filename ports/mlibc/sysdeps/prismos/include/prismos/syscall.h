@@ -132,6 +132,10 @@ enum {
         PRISM_SYS_THREAD_EXIT = 106, /* thread_exit() [noreturn] -- ends the caller, exit() the group */
         PRISM_SYS_SET_TID_ADDRESS = 107, /* set_tid_address(addr) */
         PRISM_SYS_TGKILL = 108,      /* tgkill(tgid, tid, sig) */
+        /* epoll (sys/kern/src/user/fd/epoll.rs) */
+        PRISM_SYS_EPOLL_CREATE1 = 109, /* epoll_create1(flags) */
+        PRISM_SYS_EPOLL_CTL = 110,   /* epoll_ctl(epfd, op, fd, &event) */
+        PRISM_SYS_EPOLL_WAIT = 111,  /* epoll_wait(epfd, &events, max, timeout_ms) */
 };
 
 /* arch_prctl() codes -- the Linux x86-64 values the kernel expects. */

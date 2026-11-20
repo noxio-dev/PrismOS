@@ -587,6 +587,14 @@ unixtest:
 	rustc --edition 2021 --test tests/unix_host.rs -o $(B)/unix_host
 	$(B)/unix_host --test-threads=1
 
+# Host-side tests of the epoll interest list (no QEMU needed): level / edge /
+# oneshot, entry keys, dead targets, fair scanning.
+.PHONY: epolltest
+epolltest:
+	mkdir -p $(B)
+	rustc --edition 2021 --test tests/epoll_host.rs -o $(B)/epoll_host
+	$(B)/epoll_host --test-threads=1
+
 # Host-side tests of the thread-group logic (clone flags, thread exit, signal target).
 .PHONY: threadtest
 threadtest:

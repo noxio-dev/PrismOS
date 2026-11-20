@@ -92,6 +92,8 @@ use crate::user::usermode::{EBADF, EFAULT, EINVAL};
 
 /// AF_UNIX stream sockets (the syscall half; user/unix_core.rs is the state machine).
 pub(crate) mod unix;
+/// epoll (the syscall half; user/epoll_core.rs is the interest list).
+pub(crate) mod epoll;
 
 // ------------------------------------------------------------- limits
 
@@ -191,6 +193,8 @@ pub(crate) enum Kind {
     PipeWrite(Rc<RefCell<Pipe>>),
     /// An AF_UNIX stream socket (user/fd/unix.rs).
     Unix(Rc<RefCell<unix::UnixSock>>),
+    /// An epoll instance (user/fd/epoll.rs).
+    Epoll(Rc<RefCell<epoll::Set>>),
 }
 
 /// Which terminal a descriptor talks to, if it is a terminal at all.
@@ -397,6 +401,7 @@ impl FdInner {
                     Kind::Evdev(e) => alloc::format!("/dev/input/event{}", e.dev()),
                     Kind::PipeRead(_) | Kind::PipeWrite(_) => String::from("pipe"),
                     Kind::Unix(_) => unix::proc_name(),
+                    Kind::Epoll(_) => String::from("anon_inode:[eventpoll]"),
                 };
                 Some((i, name))
             })
@@ -606,6 +611,7 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> i64 {
         Kind::PipeRead(p) => read_pipe(p, &desc, buf, len),
         Kind::PipeWrite(_) => -EBADF,
         Kind::Unix(s) => unix::read(s, &desc, buf, len),
+        Kind::Epoll(_) => -EINVAL,
     }
 }
 
@@ -898,6 +904,7 @@ pub fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
         Kind::PipeWrite(p) => write_pipe(p, &desc, buf, len),
         Kind::PipeRead(_) => -EBADF,
         Kind::Unix(s) => unix::write(s, &desc, buf, len),
+        Kind::Epoll(_) => -EINVAL,
     }
 }
 
@@ -1406,7 +1413,7 @@ pub fn sys_fstat(fd: u64, buf: u64) -> i64 {
                 -EFAULT
             }
         }
-        Kind::PipeRead(_) | Kind::PipeWrite(_) => {
+        Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::Epoll(_) => {
             if put_stat(buf, 0, 0o600, (0, 0), &FileType::Other, 0, 1, 0, 0, (0, 0, 0)) {
                 0
             } else {
@@ -2005,7 +2012,7 @@ pub fn sys_fsync(fd: u64) -> i64 {
         Kind::Vfs(slot) => {
             crate::fs::fsys::vfs().fsync_fd(*slot).map_or_else(|e| -fs_errno(e), |_| 0)
         }
-        Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::Unix(_) => -EINVAL,
+        Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::Unix(_) | Kind::Epoll(_) => -EINVAL,
         _ => 0,
     }
 }
@@ -2288,6 +2295,7 @@ fn desc_ready(desc: &Rc<FileDesc>) -> Ready {
             let (read, write, err, hup) = unix::ready(s);
             Ready { read, write, err, hup }
         }
+        Kind::Epoll(s) => Ready { read: epoll::nested_ready(s), write: false, err: false, hup: false },
     }
 }
 

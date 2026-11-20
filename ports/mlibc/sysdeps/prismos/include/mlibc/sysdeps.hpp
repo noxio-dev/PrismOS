@@ -171,7 +171,12 @@ struct PrismOSSysdepTags :
         Clone,
         PrepareStack,
         ThreadExit,
-        Tgkill
+        Tgkill,
+        /* epoll (kernel user/fd/epoll.rs, syscalls 109..111).  mlibc's
+         * epoll_create / epoll_wait are built on these three. */
+        EpollCreate,
+        EpollCtl,
+        EpollPwait
 {};
 
 struct SysdepTraits {

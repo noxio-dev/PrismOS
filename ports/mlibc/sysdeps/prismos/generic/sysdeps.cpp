@@ -23,6 +23,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/epoll.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -552,6 +553,34 @@ int Sysdeps<Pselect>::operator()(int num_fds, fd_set *read_set, fd_set *write_se
         if(except_set)
                 memset(except_set, 0, sizeof(fd_set));
         *num_events = static_cast<int>(ret);
+        return 0;
+}
+
+/* epoll: the kernel keeps the interest list; these only translate the
+ * result words.  epoll_wait reaches the kernel through EpollPwait with a
+ * null mask (epoll_pwait with a real mask is refused, like pselect: the
+ * kernel keeps no per-call signal mask). */
+int Sysdeps<EpollCreate>::operator()(int flags, int *fd) {
+        auto ret = sys(PRISM_SYS_EPOLL_CREATE1, flags);
+        if(int e = sc_error(ret); e)
+                return e;
+        *fd = static_cast<int>(ret);
+        return 0;
+}
+
+int Sysdeps<EpollCtl>::operator()(int epfd, int mode, int fd, struct epoll_event *ev) {
+        auto ret = sys(PRISM_SYS_EPOLL_CTL, epfd, mode, fd, ev);
+        return sc_error(ret);
+}
+
+int Sysdeps<EpollPwait>::operator()(int epfd, struct epoll_event *ev, int n, int timeout,
+                const sigset_t *sigmask, int *raised) {
+        if(sigmask)
+                return ENOSYS;
+        auto ret = sys(PRISM_SYS_EPOLL_WAIT, epfd, ev, n, timeout);
+        if(int e = sc_error(ret); e)
+                return e;
+        *raised = static_cast<int>(ret);
         return 0;
 }
 

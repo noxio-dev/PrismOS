@@ -33,6 +33,7 @@
 // exposes them as `user` / `usertest` / `ps` / `kill`.
 
 pub mod elf;
+pub mod epoll_core;
 pub mod fd;
 pub mod fpu;
 pub mod ident;
