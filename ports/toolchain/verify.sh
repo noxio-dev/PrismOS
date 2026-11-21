@@ -498,13 +498,20 @@ custom) SYSCALLS=${PRISM_VERIFY_SYSCALLS:-}
 *)      echo "verify: unknown program '$PROG' (hello | fork | fd | posix | cube | custom)" >&2; exit 2 ;;
 esac
 
-for n in $SYSCALLS; do
-        if reaches "$n"; then
-                ok "$(scname "$n") reaches syscall $n"
-        else
-                bad "no syscall $n ($(scname "$n"))"
-        fi
-done
+# The disassembly is the slow part of a build.  PRISM_SKIP_SYSCALL_CHECK
+# (set by `make ... NOSYSCHECK=1`) skips it: the shape checks above and the
+# symbol checks below still run.
+if [ -n "${PRISM_SKIP_SYSCALL_CHECK:-}" ]; then
+        echo "  skip syscall diet (NOSYSCHECK): $SYSCALLS"
+else
+        for n in $SYSCALLS; do
+                if reaches "$n"; then
+                        ok "$(scname "$n") reaches syscall $n"
+                else
+                        bad "no syscall $n ($(scname "$n"))"
+                fi
+        done
+fi
 
 # The symbols those paths live in.
 for s in $SYMBOLS; do

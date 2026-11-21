@@ -24,6 +24,16 @@ QEMU_DATA := -drive id=data,file=$(DATA_IMG),format=raw,if=none -device ide-hd,d
 # $(call qemu_boot_drive,image) - the bootable disk, AHCI port 0
 qemu_boot_drive = -drive id=boot,file=$(1),format=raw,if=none -device ide-hd,drive=boot,bus=ahci0.0
 QEMUFLAGS ?= -m 256M $(QEMU_AHCI) $(QEMU_DATA)
+
+# NOSYSCHECK=1 skips the syscall-diet checks (verify.sh's disassembly, the slow
+# part of building the packages and ports):
+#   make run-uefi-kvm NOSYSCHECK=1
+# The loader-contract shape checks and the symbol checks still run.  A package
+# built this way is not re-verified by a later plain `make` unless its sources
+# change -- touch them (or `make clean`) to get the full check back.
+ifneq ($(filter-out 0 no false,$(strip $(NOSYSCHECK))),)
+export PRISM_SKIP_SYSCALL_CHECK := 1
+endif
 OVMF_CODE ?= $(firstword $(wildcard \
     /usr/share/OVMF/OVMF_CODE_4M.fd \
     /usr/share/OVMF/OVMF_CODE.fd \
