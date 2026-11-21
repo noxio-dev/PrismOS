@@ -167,7 +167,8 @@ struct PrismOSSysdepTags :
          * pthread_create, pthread_join and friends are mlibc's own over
          * them, on top of FutexWait / FutexWake, which were already here.
          * Tgkill is pthread_kill's; cancellation (SIGCANCEL) stays
-         * unsupported, the kernel having no SA_SIGINFO. */
+         * unsupported: its signal number (32) is past the 31 the kernel
+         * tracks (SA_SIGINFO itself is served since the Xorg step). */
         Clone,
         PrepareStack,
         ThreadExit,
@@ -176,7 +177,10 @@ struct PrismOSSysdepTags :
          * epoll_create / epoll_wait are built on these three. */
         EpollCreate,
         EpollCtl,
-        EpollPwait
+        EpollPwait,
+        /* sigaltstack (kernel syscall 112): the alternate signal stack an
+         * SA_ONSTACK handler runs on -- Xorg's crash handler asks for one. */
+        Sigaltstack
 {};
 
 struct SysdepTraits {

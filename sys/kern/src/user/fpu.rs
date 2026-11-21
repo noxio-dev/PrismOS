@@ -54,6 +54,25 @@ impl FpuState {
         FpuState { area }
     }
 
+    /// The raw FXSAVE image (what a signal frame's `__fpregs_mem` carries).
+    pub fn as_bytes(&self) -> &[u8; 512] {
+        &self.area
+    }
+
+    /// A state built from an image a program handed back (`sigreturn`): the
+    /// bytes are user-controlled, so the one field the CPU validates -- the
+    /// MXCSR, whose reserved bits raise #GP on FXRSTOR -- is masked with
+    /// 0xFFBF: the low 16 bits minus bit 6 (DAZ, which not every CPU
+    /// implements), and nothing above bit 15.  Everything else in the area
+    /// is accepted as is (x87 control words and register values cannot
+    /// fault).
+    pub fn from_user(bytes: &[u8; 512]) -> FpuState {
+        let mut s = FpuState { area: *bytes };
+        let m = u32::from_le_bytes([s.area[24], s.area[25], s.area[26], s.area[27]]) & 0x0000_FFBF;
+        s.area[24..28].copy_from_slice(&m.to_le_bytes());
+        s
+    }
+
     /// Store the CPU's x87/SSE registers here.
     ///
     /// # Safety

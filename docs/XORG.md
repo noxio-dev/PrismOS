@@ -20,9 +20,8 @@ Basis: analysis of the repository as read (Rust kernel, mlibc port,
 ## 2. Missing kernel / ABI pieces
 
 ### 2.1 Signals
-- [ ] `SA_SIGINFO` (siginfo + ucontext passed to the handler) -- currently
-      refused in `user/signal.rs`
-- [ ] `sigaltstack` + `SA_ONSTACK`
+- [x] `SA_SIGINFO` (siginfo + ucontext passed to the handler)
+- [x] `sigaltstack` + `SA_ONSTACK` (syscall 112)
 - [ ] `SIGIO`: `F_SETOWN`, `F_SETSIG`, `O_ASYNC`
 
 ### 2.2 Shared memory

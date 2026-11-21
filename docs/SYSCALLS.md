@@ -17,7 +17,7 @@ Linux-like, x86-64 `syscall` instruction:
 | `rcx`, `r11` | clobbered by the CPU |
 
 * Success returns a value `>= 0`; failure returns `-errno` (Linux numbering).
-* An unknown number returns `-ENOSYS`. Numbers 0..111 are assigned; 112 and up
+* An unknown number returns `-ENOSYS`. Numbers 0..112 are assigned; 113 and up
   are not.
 * A pending signal is delivered between the return value and `sysretq`.
 * `exit` never returns. `execve` returns only on failure, and the caller is
@@ -59,7 +59,7 @@ Linux-like, x86-64 `syscall` instruction:
 | 10 | `kill(pid, sig)` | a negative pid names a process group |
 | 11 | `signal(sig, handler)` | basic API |
 | 12 | `sigreturn()` | what a handler returns into through the trampoline page; not called directly by programs |
-| 38 | `sigaction(sig, act, oldact)` | |
+| 38 | `sigaction(sig, act, oldact)` | handler, flags, restorer, 8-byte mask; `SA_SIGINFO` (handler gets `rsi` = `siginfo_t`, `rdx` = `ucontext_t`) and `SA_ONSTACK` are honoured; every delivery pushes the Linux rt frame (`ucontext_t` with gregs and the 512-byte FXSAVE image) that `sigreturn` reads back |
 | 39 | `sigprocmask(how, set, oldset)` | |
 | 72 | `sigtimedwait(set, info, timeout, sigsetsize)` | `sigsetsize` (4th argument, in `r10`) must be 8, otherwise `-EINVAL` |
 
@@ -121,6 +121,7 @@ Implemented in `user/fd/epoll.rs` over the host-tested interest list
 | 109 | `epoll_create1(flags)` | `EPOLL_CLOEXEC` only, else `-EINVAL` |
 | 110 | `epoll_ctl(epfd, op, fd, event)` | `ADD` / `DEL` / `MOD`; 4th argument in `r10`. `-EEXIST`, `-ENOENT`, `-EBADF`, `-EINVAL` (epfd not an epoll, watching itself, bad op), `-ELOOP` (nesting cycle or deeper than 4), `-ENOSPC` (256 entries), `-EPERM` on regular files and directories |
 | 111 | `epoll_wait(epfd, events, maxevents, timeout_ms)` | 4th argument in `r10`; `maxevents` 1..1024; `-EINTR` when a handler is about to run |
+| 112 | `sigaltstack(ss, old_ss)` | Linux `stack_t` (24 bytes: `ss_sp`, `ss_flags` + pad, `ss_size`); `SS_DISABLE` / `SS_ONSTACK`; `-EPERM` while running on the area, `-ENOMEM` below 2048 bytes, `-EINVAL` for bad flags or an area outside user space. Per thread: copied by `fork`, dropped by `execve`, disabled in a new thread |
 
 `struct epoll_event` is the packed 12-byte x86-64 layout (`u32 events`, `u64
 data`). Supported: `EPOLLIN/OUT/ERR/HUP/RDHUP` (plus the `RDNORM`/`WRNORM`/band

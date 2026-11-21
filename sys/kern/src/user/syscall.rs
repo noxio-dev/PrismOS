@@ -71,6 +71,8 @@
 //           ends the whole group, thread_exit(2) the caller only.
 //    109..111 epoll: epoll_create1(flags), epoll_ctl(epfd, op, fd, ev),
 //           epoll_wait(epfd, events, max, timeout_ms) (user/fd/epoll.rs)
+//    112 sigaltstack(ss, old_ss)    the alternate signal stack (SA_ONSTACK);
+//           sigaction now also takes SA_SIGINFO (user/signal.rs)
 //    59 setsid()                    60 setpgid(pid, pgid)   61 getpgid(pid)
 //    (a negative kill pid names a group; TIOCSCTTY claims a terminal)
 //
@@ -439,6 +441,8 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         109 => fd::epoll::sys_epoll_create1(a0),
         110 => fd::epoll::sys_epoll_ctl(a0, a1, a2, frame.r10),
         111 => fd::epoll::sys_epoll_wait(a0, a1, a2, frame.r10),
+        // ---- signals, the Xorg step: the alternate stack -----------------
+        112 => signal::sys_sigaltstack(a0, a1, frame.rsp),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

@@ -1089,12 +1089,12 @@ int Sysdeps<Sigaction>::operator()(int signum, const struct sigaction *act,
         /* The kernel exchanges four u64 words -- handler, flags, restorer,
          * 8-byte mask (the x86-64 Linux rt_sigaction shape); SA_RESTORER
          * plants our restorer so a handler's `ret` lands in x86_64/signal.S.
-         * SA_SIGINFO / SA_ONSTACK the kernel refuses; those errors ride
-         * through untouched. */
+         * SA_SIGINFO (rsi / rdx = siginfo / ucontext) and SA_ONSTACK (see
+         * Sigaltstack below) ride through in sa_flags untouched. */
 #ifdef SIGCANCEL
-        /* Thread cancellation rides on SIGCANCEL with SA_SIGINFO and tgkill; the
-         * kernel has neither (user/signal.rs refuses SA_SIGINFO).  ENOSYS is the
-         * answer mlibc's PthreadSignalInstaller accepts as "cancellation not
+        /* Thread cancellation rides on SIGCANCEL (signal 32, past the 31 the
+         * kernel tracks) with SA_SIGINFO and tgkill.  ENOSYS is the answer
+         * mlibc's PthreadSignalInstaller accepts as "cancellation not
          * supported" -- any other error trips its __ensure at load time. */
         if(signum == SIGCANCEL)
                 return ENOSYS;
@@ -1131,6 +1131,13 @@ int Sysdeps<Sigaction>::operator()(int signum, const struct sigaction *act,
 int Sysdeps<Sigprocmask>::operator()(int how, const sigset_t *__restrict set,
                 sigset_t *__restrict retrieve) {
         return prism_sigmask(how, set, retrieve);
+}
+
+int Sysdeps<Sigaltstack>::operator()(const stack_t *ss, stack_t *oss) {
+        /* stack_t is the kernel's layout too (ss_sp, ss_flags + padding,
+         * ss_size: 24 bytes), so both pointers go through as they are. */
+        auto ret = sys(PRISM_SYS_SIGALTSTACK, ss, oss);
+        return sc_error(ret);
 }
 
 int Sysdeps<ThreadSigmask>::operator()(int how, const sigset_t *__restrict set,

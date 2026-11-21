@@ -1,0 +1,19 @@
+# /usr/bin/siginfo -- SA_SIGINFO, SA_ONSTACK and sigaltstack from ring 3:
+# siginfo fields, a forked sender, edited registers, FPU state, the
+# alternate stack and the signal mask.
+[package]
+name = "siginfo"
+version = "0.1.0"
+description = "SA_SIGINFO / SA_ONSTACK / sigaltstack scenarios"
+
+[build]
+sources = ["src/siginfo.c"]
+
+[install]
+path = "/usr/bin/siginfo"
+
+[verify]
+# 1 write, 2 getpid, 7 exit, 8 fork, 9 waitpid, 10 kill (also raw),
+# 38 sigaction, 39 sigprocmask, 50 getuid, 54 nanosleep (usleep), 112 sigaltstack.
+syscalls = [1, 2, 5, 7, 8, 9, 10, 38, 39, 50, 112]
+symbols = ["write", "getpid", "getuid", "fork", "waitpid", "kill", "sigaction", "sigprocmask", "sigaltstack", "usleep"]

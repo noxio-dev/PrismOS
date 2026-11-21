@@ -136,6 +136,8 @@ enum {
         PRISM_SYS_EPOLL_CREATE1 = 109, /* epoll_create1(flags) */
         PRISM_SYS_EPOLL_CTL = 110,   /* epoll_ctl(epfd, op, fd, &event) */
         PRISM_SYS_EPOLL_WAIT = 111,  /* epoll_wait(epfd, &events, max, timeout_ms) */
+        /* signals, the Xorg step (sys/kern/src/user/signal.rs) */
+        PRISM_SYS_SIGALTSTACK = 112, /* sigaltstack(&ss, &old_ss) -- Linux's stack_t */
 };
 
 /* arch_prctl() codes -- the Linux x86-64 values the kernel expects. */

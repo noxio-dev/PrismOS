@@ -1870,7 +1870,11 @@ pub fn clone_current(frame: &IsrFrame, flags: u64, stack: u64, ptid: u64, ctid: 
     let (name, prio) = (cur.name.clone(), cur.prio);
     let fpu = cur.fpu.snapshot();
     // Dispositions and the blocked mask carry over, pending starts empty.
-    let signals = cur.signals.fork_copy();
+    // The thread shares the address space, so the parent's alternate signal
+    // stack would be shared too: the new thread starts without one
+    // (sigaltstack(2): a CLONE_VM child has it disabled).
+    let mut signals = cur.signals.fork_copy();
+    signals.disable_altstack();
     let (argv, exe, umask) = (cur.argv.clone(), cur.exe.clone(), cur.umask);
     let (cred, suid, sgid) = (cur.cred, cur.suid, cur.sgid);
     let (pgid, sid, ctty) = (cur.pgid, cur.sid, cur.ctty);
@@ -2024,7 +2028,16 @@ pub fn has_live(pid: u64) -> bool {
 
 /// Set the pending bit of `sig` in `pid` when it has a handler for it
 /// (sys_kill on another process).  Returns true when the bit was raised.
+/// The siginfo is the kernel's own (`SI_KERNEL`): this is the entry point
+/// of the kernel-side raisers (the VT switch); `sys_kill` uses
+/// `post_signal_from` to name the sending process.
 pub fn post_signal(pid: u64, sig: u64) -> bool {
+    post_signal_from(pid, sig, signal::SigInfoRec::KERNEL)
+}
+
+/// `post_signal` with the siginfo (`si_code` / `si_pid` / `si_uid`) the
+/// handler will see recorded alongside the pending bit.
+pub fn post_signal_from(pid: u64, sig: u64, rec: signal::SigInfoRec) -> bool {
     use crate::user::thread_core::{pick_signal_thread, Candidate};
     let flags = crate::arch::io::cli_save();
     // SAFETY: table walk with interrupts masked; state flips only.
@@ -2051,6 +2064,7 @@ pub fn post_signal(pid: u64, sig: u64) -> bool {
             let p = &mut *members[i];
             if p.signals.handler_of(sig) != 0 {
                 p.signals.pending |= 1 << sig;
+                p.signals.info[sig as usize] = rec;
                 raised = true;
                 // A parked process must see the bit now, not at its
                 // next alarm: the read paths of a tty / pipe re-check
@@ -2072,7 +2086,7 @@ pub fn post_signal(pid: u64, sig: u64) -> bool {
 
 /// Set the pending bit of `sig` in the ONE thread `tid` when it has a
 /// handler (tgkill, phase 4.2).  True when the bit was raised.
-pub fn post_signal_thread(tid: u64, sig: u64) -> bool {
+pub fn post_signal_thread(tid: u64, sig: u64, rec: signal::SigInfoRec) -> bool {
     let flags = crate::arch::io::cli_save();
     // SAFETY: table walk with interrupts masked; state flips only.
     let raised = unsafe {
@@ -2081,6 +2095,7 @@ pub fn post_signal_thread(tid: u64, sig: u64) -> bool {
             if p.pid == tid && p.state != State::Zombie {
                 if p.signals.handler_of(sig) != 0 {
                     p.signals.pending |= 1 << sig;
+                    p.signals.info[sig as usize] = rec;
                     raised = true;
                     if p.state == State::Sleeping {
                         p.state = State::Ready; // as post_signal: end the park early
