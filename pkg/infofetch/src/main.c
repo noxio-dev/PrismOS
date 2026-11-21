@@ -119,6 +119,46 @@ static void print_memory(char *buffer, size_t size)
              used * 100 / total);
 }
 
+static const char *gpu_vendor(unsigned vendor)
+{
+    switch (vendor) {
+    case 0x10de: return "NVIDIA";
+    case 0x1002: return "AMD";
+    case 0x8086: return "Intel";
+    case 0x1af4: return "Red Hat virtio";
+    case 0x1234: return "QEMU";
+    case 0x15ad: return "VMware";
+    default:     return "Unknown vendor";
+    }
+}
+
+/* Display controllers (PCI class 03) from /proc/pci; up to max entries. */
+static int find_gpus(char gpus[][64], int max)
+{
+    FILE *fp = fopen("/proc/pci", "r");
+    char line[128];
+    int n = 0;
+
+    if (!fp)
+        return 0;
+
+    while (n < max && fgets(line, sizeof(line), fp)) {
+        unsigned bus, dev, func, cls, ven, did;
+
+        if (sscanf(line, "%x:%x.%u %x %x:%x",
+                   &bus, &dev, &func, &cls, &ven, &did) != 6)
+            continue;
+        if ((cls >> 8) != 0x03)
+            continue;
+
+        snprintf(gpus[n], 64, "%s [%04x:%04x]", gpu_vendor(ven), ven, did);
+        n++;
+    }
+
+    fclose(fp);
+    return n;
+}
+
 static void print_cpu(char *buffer, size_t size)
 {
     FILE *fp = fopen("/proc/cpuinfo", "r");
@@ -189,7 +229,8 @@ static void print_fetch(const char *user,
                         const struct utsname *uts,
                         const char *uptime,
                         const char *cpu,
-                        const char *memory)
+                        const char *memory,
+                        char gpus[][64], int gpu_count)
 {
     char identity[128];
 
@@ -215,6 +256,8 @@ static void print_fetch(const char *user,
     print_row(logo[4], PURPLE, "Uptime", uptime);
     print_row(NULL, NULL, "Arch", uts->machine);
     print_row(NULL, NULL, "CPU", cpu);
+    for (int i = 0; i < gpu_count; i++)
+        print_row(NULL, NULL, "GPU", gpus[i]);
     print_row(NULL, NULL, "RAM", memory);
 
     printf("│%*s│\n", WIDTH, "");
@@ -231,6 +274,8 @@ int main(void)
     char uptime[96];
     char memory[96];
     char cpu[256];
+    char gpus[4][64];
+    int gpu_count;
     char hostname[128] = "prismos";
 
     const char *user = getenv("USER");
@@ -251,8 +296,9 @@ int main(void)
     print_uptime(uptime, sizeof(uptime));
     print_memory(memory, sizeof(memory));
     print_cpu(cpu, sizeof(cpu));
+    gpu_count = find_gpus(gpus, 4);
 
-    print_fetch(user, hostname, &uts, uptime, cpu, memory);
+    print_fetch(user, hostname, &uts, uptime, cpu, memory, gpus, gpu_count);
 
     return 0;
 }

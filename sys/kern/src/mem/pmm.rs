@@ -31,7 +31,8 @@ const MAX_PAGES: u64 = 1 << 28;
 const FOUR_GIB: u64 = 1 << 32;
 
 pub struct Stats {
-    pub total_pages: u64,
+    pub total_pages: u64, // span: highest managed address / PAGE (holes included)
+    pub managed_pages: u64, // pages that really are RAM (what MemTotal reports)
     pub free_pages: AtomicU64,
     pub base: u64, // lowest managed physical address
     pub top: u64,  // highest managed physical address + 1
@@ -39,6 +40,7 @@ pub struct Stats {
 
 static mut STATS: Stats = Stats {
     total_pages: 0,
+    managed_pages: 0,
     free_pages: AtomicU64::new(0),
     base: 0,
     top: 0,
@@ -173,6 +175,9 @@ pub fn init(bi: &BootInfo) -> Stats {
     for w in 0..words {
         free += bm_read(w).count_zeros() as u64;
     }
+    // Real RAM pages: the usable pages open before the kernel and the bitmap
+    // were closed, i.e. what is free now plus those two.
+    let managed = free + (kern_top - kern_base) / PAGE + bitmap_pages;
 
     // SAFETY: boot context, single CPU, interrupts masked; single plain
     // write of the whole stats block.
@@ -180,6 +185,7 @@ pub fn init(bi: &BootInfo) -> Stats {
         let sp = core::ptr::addr_of_mut!(STATS);
         sp.write(Stats {
             total_pages,
+            managed_pages: managed,
             free_pages: AtomicU64::new(free),
             base,
             top: total_pages * PAGE,
@@ -349,6 +355,7 @@ pub fn stats_snapshot() -> Stats {
         let s = core::ptr::addr_of!(STATS).read();
         Stats {
             total_pages: s.total_pages,
+            managed_pages: s.managed_pages,
             free_pages: AtomicU64::new(s.free_pages.load(Ordering::Relaxed)),
             base: s.base,
             top: s.top,

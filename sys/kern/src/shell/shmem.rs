@@ -190,9 +190,9 @@ pub(super) fn cmd_meminfo(_args: &mut Args) {
     let ps = crate::mem::pmm::stats_snapshot();
     let free = ps.free_pages.load(core::sync::atomic::Ordering::Relaxed);
     crate::kprintln!("pmm      : {} pages total, {} free, {} used, {} allocated",
-        ps.total_pages,
+        ps.managed_pages,
         free,
-        ps.total_pages - free,
+        ps.managed_pages - free,
         crate::mem::pmm::alloc_count()
     );
     crate::kprintln!("           managed {:#x}..{:#x} ({}/{} MiB)",

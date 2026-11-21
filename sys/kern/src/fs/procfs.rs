@@ -46,6 +46,7 @@ const CPUINFO: u64 = 5;
 const CMDLINE: u64 = 6;
 const MOUNTS: u64 = 7;
 const SELF: u64 = 8;
+const PCI: u64 = 9;
 
 /// First inode of a pid's block: `pid_base(pid) + n`, n = 0 the directory,
 /// 1 cmdline, 2 stat, 3 status, 4 exe, 5 cwd, 6 the fd directory,
@@ -132,9 +133,22 @@ fn uptime_str() -> String {
 /// The pmm's view of memory, MemTotal / MemFree style (kB, like Linux).
 fn meminfo_str() -> String {
     let s = crate::mem::pmm::stats_snapshot();
-    let total = s.total_pages * 4;
+    let total = s.managed_pages * 4;
     let free = s.free_pages.load(Ordering::Relaxed) * 4;
     format!("MemTotal:       {total} kB\nMemFree:        {free} kB\nMemAvailable:   {free} kB\n")
+}
+
+/// One line per PCI function: `bb:dd.f cccc vvvv:dddd` (class+subclass,
+/// vendor:device, hex).  infofetch reads the display controllers (class 03).
+fn pci_str() -> String {
+    let mut out = String::new();
+    for d in crate::hw::pci::devices() {
+        out.push_str(&format!(
+            "{:02x}:{:02x}.{} {:02x}{:02x} {:04x}:{:04x}\n",
+            d.bus, d.dev, d.func, d.class, d.subclass, d.vendor, d.device
+        ));
+    }
+    out
 }
 
 fn mount_token(label: &str) -> String {
@@ -183,6 +197,7 @@ fn content(ino: u64) -> Option<String> {
             format!("{}\n", b.cmdline)
         }
         MOUNTS => mounts_str(),
+        PCI => pci_str(),
         _ => return pid_content(ino),
     })
 }
@@ -314,7 +329,7 @@ impl FileSystem for ProcFs {
     fn stat(&mut self, ino: u64) -> FsResult<Stat> {
         match ino {
             ROOT => Ok(stat_of(ROOT, FileType::Dir)),
-            VERSION | UPTIME | MEMINFO | CPUINFO | CMDLINE | MOUNTS => {
+            VERSION | UPTIME | MEMINFO | CPUINFO | CMDLINE | MOUNTS | PCI => {
                 Ok(stat_of(ino, FileType::Regular))
             }
             SELF => Ok(stat_of(SELF, FileType::Symlink)),
@@ -340,6 +355,7 @@ impl FileSystem for ProcFs {
                 "uptime" => Ok(UPTIME),
                 "meminfo" => Ok(MEMINFO),
                 "cpuinfo" => Ok(CPUINFO),
+                "pci" => Ok(PCI),
                 "cmdline" => Ok(CMDLINE),
                 "mounts" => Ok(MOUNTS),
                 "self" => Ok(SELF),
@@ -391,6 +407,7 @@ impl FileSystem for ProcFs {
                 ("uptime", UPTIME, FileType::Regular),
                 ("meminfo", MEMINFO, FileType::Regular),
                 ("cpuinfo", CPUINFO, FileType::Regular),
+                ("pci", PCI, FileType::Regular),
                 ("cmdline", CMDLINE, FileType::Regular),
                 ("mounts", MOUNTS, FileType::Regular),
                 ("self", SELF, FileType::Symlink),
