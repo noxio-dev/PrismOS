@@ -14,13 +14,16 @@
  *   fpu       xmm0 survives a handler that clobbers it (the FXSAVE image
  *             rides in the ucontext)
  *   altstack  SA_ONSTACK runs the handler inside the sigaltstack area,
- *             uc_stack reports SS_ONSTACK there, EPERM to replace it from
- *             inside, and the original stack is back afterwards
+ *             sigaltstack(NULL, &q) reports SS_ONSTACK there and uc_stack
+ *             names the area (its flags describe the interrupted stack,
+ *             so 0 here, as on Linux), EPERM to replace it from inside,
+ *             and flags 0 again afterwards
  *   altquery  sigaltstack query / disable round trip; too small -> ENOMEM,
  *             bad flags -> EINVAL
  *   mask      the handler runs with its signal blocked (uc_sigmask is the
  *             interrupted mask), and sigreturn restores it
  */
+/* REG_* (ucontext gregs) need _GNU_SOURCE; SS_* need _DEFAULT_SOURCE. */
 #define _GNU_SOURCE 1
 
 #include <errno.h>
@@ -157,7 +160,7 @@ static void t_fpu(void)
 
 #define ALT_SIZE 16384
 static char altbuf[ALT_SIZE] __attribute__((aligned(16)));
-static volatile int a_inside, a_flags_ok, a_eperm;
+static volatile int a_inside, a_flags_ok, a_eperm, a_query_ok;
 
 static void h_alt(int sig, siginfo_t *si, void *ctx)
 {
@@ -166,7 +169,10 @@ static void h_alt(int sig, siginfo_t *si, void *ctx)
         char here;
         uintptr_t p = (uintptr_t)&here;
         a_inside = p >= (uintptr_t)altbuf && p < (uintptr_t)altbuf + ALT_SIZE;
-        a_flags_ok = uc->uc_stack.ss_flags == SS_ONSTACK
+        stack_t q;
+        memset(&q, 0, sizeof q);
+        a_query_ok = sigaltstack(NULL, &q) == 0 && q.ss_flags == SS_ONSTACK;
+        a_flags_ok = uc->uc_stack.ss_flags == 0
                      && uc->uc_stack.ss_sp == altbuf && uc->uc_stack.ss_size == ALT_SIZE;
         stack_t other = { .ss_sp = altbuf, .ss_size = ALT_SIZE, .ss_flags = 0 };
         a_eperm = sigaltstack(&other, NULL) == -1 && errno == EPERM;
@@ -180,8 +186,15 @@ static void t_altstack(void)
         kill(getpid(), SIGUSR1);
         stack_t now;
         sigaltstack(NULL, &now);
-        check("altstack", r == 0 && a_inside && a_flags_ok && a_eperm && now.ss_flags == 0,
-              "ran on the alternate stack, SS_ONSTACK inside, EPERM to replace it, flags 0 after");
+        char detail[160];
+        int ok = r == 0 && a_inside && a_query_ok && a_flags_ok && a_eperm && now.ss_flags == 0;
+        if (ok)
+                snprintf(detail, sizeof detail, "on the alternate stack, SS_ONSTACK inside, EPERM to replace it, flags 0 after");
+        else
+                snprintf(detail, sizeof detail,
+                         "install=%d inside=%d query=%d uc_stack=%d eperm=%d after_flags=%d",
+                         r, a_inside, a_query_ok, a_flags_ok, a_eperm, now.ss_flags);
+        check("altstack", ok, detail);
 }
 
 /* -------------------------------------------------------------- altquery */
