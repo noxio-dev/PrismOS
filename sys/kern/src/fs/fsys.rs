@@ -173,15 +173,36 @@ pub fn mount(f: &Found, path: &str, read_only: bool) -> Result<(), FsError> {
     vfs().mount(path, Box::new(fs))
 }
 
+/// The volume PrismOS lives on: the first ext volume that holds the system
+/// (`/sbin/init` or `/boot/loader.conf`).  Each candidate is probed
+/// read-only (no journal replay, nothing written to a foreign Linux root);
+/// with no match the first volume is used, as before.
+fn pick_root(found: &[Found]) -> Option<Found> {
+    for f in found {
+        let Some(dev) = open_dev(f) else { continue };
+        let Ok(fs) = Ext4::mount_ro(dev) else { continue };
+        if vfs().mount("/", Box::new(fs)).is_err() {
+            continue;
+        }
+        let ours = vfs().exists("/sbin/init") || vfs().exists("/boot/loader.conf");
+        let _ = vfs().umount("/");
+        if ours {
+            return Some(*f);
+        }
+    }
+    found.first().copied()
+}
+
 /// Boot-time setup: install the clock, mount the first ext volume on "/"
 /// and the device directory on /dev (phase 2.6).
 pub fn init() {
     vfs::set_clock(unix_now);
     let found = scan();
-    let Some(f) = found.first() else {
+    let Some(f) = pick_root(&found) else {
         crate::kprintln!("vfs      : no ext2/3/4 volume found, nothing mounted");
         return;
     };
+    let f = &f;
     let name = |f: &Found| -> String {
         match f.part {
             None => alloc::format!("disk {}", f.disk),

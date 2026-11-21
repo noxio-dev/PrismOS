@@ -46,6 +46,9 @@ const OP_USBCMD: u64 = 0x00;
 const OP_USBSTS: u64 = 0x04;
 const OP_PAGESIZE: u64 = 0x08;
 const OP_CRCR: u64 = 0x18;
+const CRCR_CA: u32 = 1 << 2;
+const CRCR_CRR: u32 = 1 << 3;
+const CMD_BSR: u32 = 1 << 9;
 const OP_DCBAAP: u64 = 0x30;
 const OP_CONFIG: u64 = 0x38;
 const OP_PORTS: u64 = 0x400;
@@ -429,7 +432,27 @@ impl Xhci {
             _ => None,
         }) {
             Some((c, s)) => Ok((c, s)),
-            None => Err(XErr::Timeout),
+            None => {
+                self.abort_cmd_ring();
+                Err(XErr::Timeout)
+            }
+        }
+    }
+
+    /// A command never completed: abort it (CRCR.CA), wait for the ring to
+    /// stop, drop the stale events and restart the ring at the enqueue
+    /// position so that the next command is not queued behind a dead one.
+    fn abort_cmd_ring(&mut self) {
+        let op = self.op;
+        hal::wr32(op + OP_CRCR, CRCR_CA);
+        let stopped = hal::wait_event(500, || hal::rd32(op + OP_CRCR) & CRCR_CRR == 0);
+        let _ = self.wait_for(50, |_: &Ev| None::<()>); // drain the stop event
+        if !stopped {
+            kprintln!("xhci: command ring did not stop after abort");
+            return;
+        }
+        if let Some(r) = self.cmd.as_ref() {
+            hal::wr64(op + OP_CRCR, r.restart_ptr());
         }
     }
 
@@ -837,7 +860,12 @@ impl Xhci {
         self.cw(in_ctx, e + 8, deq as u32);
         self.cw(in_ctx, e + 12, (deq >> 32) as u32);
         self.cw(in_ctx, e + 16, 8);
-        match self.command_ok(in_ctx, 0, (CMD_ADDRESS_DEV << 10) | (slot as u32) << 24) {
+        // Two steps like Linux: BSR=1 first (slot -> Default, no SET_ADDRESS
+        // on the wire), then the real Address Device.
+        let r = self
+            .command_ok(in_ctx, 0, (CMD_ADDRESS_DEV << 10) | CMD_BSR | (slot as u32) << 24)
+            .and_then(|_| self.command_ok(in_ctx, 0, (CMD_ADDRESS_DEV << 10) | (slot as u32) << 24));
+        match r {
             Ok(_) => Ok(slot),
             Err(e) => {
                 self.free_dev(slot);
@@ -886,13 +914,20 @@ impl Xhci {
     /// Full enumeration of the device on `port`.  Returns what to hand to a
     /// class driver once the lock is dropped.
     fn enumerate(&mut self, ctrl: u8, port: u8, found: &mut Vec<Found>) {
-        let Some(v) = self.reset_port(port) else { return };
-        let speed = ((v >> 10) & 0xF) as u8;
-        let slot = match self.address_device(port, speed) {
-            Ok(s) => s,
-            Err(e) => {
-                kprintln!("xhci: port {}: address device failed ({:?})", port, e);
-                return;
+        let mut tries = 0;
+        let (slot, speed) = loop {
+            let Some(v) = self.reset_port(port) else { return };
+            let speed = ((v >> 10) & 0xF) as u8;
+            match self.address_device(port, speed) {
+                Ok(s) => break (s, speed),
+                Err(e) => {
+                    tries += 1;
+                    kprintln!("xhci: port {}: address device failed ({:?}), try {}", port, e, tries);
+                    if tries >= 2 {
+                        return;
+                    }
+                    hal::delay_ms(100);
+                }
             }
         };
         let mut desc = [0u8; 18];
