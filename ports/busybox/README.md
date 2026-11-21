@@ -34,7 +34,22 @@ tail id whoami basename dirname readlink time`), ash's job control and line
 editing on, and `FEATURE_SH_STANDALONE` / `NOFORK` **off** on purpose: the
 honest fork + execve path is the one this phase is testing.  (`time` earns
 its place: its report of a child's user / system ticks is the wait4 /
-rusage pair's own proof, syscall 66 answering at runtime.)  Committed
+rusage pair's own proof, syscall 66 answering at runtime.)  **every applet the kernel can run (2026-11).**  The config has since been
+widened to all ~200 applets that need no syscall or device PrismOS lacks:
+archival (`tar gzip bzip2 xz unzip cpio ar rpm dpkg ...`), coreutils minus
+`mknod mkfifo truncate nice chroot nproc`, text / find / editors (`sort uniq
+cut tr diff patch ed xargs less more hexdump ...`), `kill killall pkill
+pgrep pidof pstree watch`, login (`getty passwd deluser su sulogin ...`),
+`hush`, `bc dc man tree ts`, the VT tools.  Left **off** on purpose, each for
+a named gap (see docs/SYSCALLS.md): the whole networking menu (no TCP/IP),
+SELinux, runit, modutils, mail transport, syslog (no `SOCK_DGRAM` AF_UNIX),
+block / partition tools, `free top uptime dmesg sysctl` (no `sysinfo` /
+`syslog`), `flock` (no locks), `script` (no ptys), `date -s` / `hwclock`
+(no `settimeofday`), utmp readers (`who w last wall`).  The list was
+validated with `make oldconfig` on the 1.37 sources (fixpoint) and a host
+build (204 applets); the PrismOS cross build and a boot run are still to do.
+
+Committed
 rather than regenerated: same tree, same config, same binary -- the same
 determinism a pinned tarball buys.
 

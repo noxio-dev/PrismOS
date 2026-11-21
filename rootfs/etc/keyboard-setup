@@ -57,7 +57,6 @@ cell() {
         "$tag" "$description" "$pad" ""
 }
 
-clear
 printf "\n"
 
 top_line

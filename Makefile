@@ -258,12 +258,28 @@ $B/nano.stamp: $B/toolchain/usr/.stamp $B/mlibc-port.md5 $(NANO_PORT_FILES)
 # the new syscall 66 answering with the child's own user / system ticks.
 # `sh` is in the list on purpose: busybox's ash owns the name now, what
 # every #!/bin/sh and every PATH walk means on this system.
+# Then every other applet the config enables (ports/busybox/*.config: all
+# that need no syscall or device PrismOS lacks) -- keep the two in step.
 BUSYBOX_APPLETS := sh ash ls cat echo printf test [ mkdir rmdir rm cp mv ln \
                    touch chmod readlink pwd true false env sleep uname wc \
                    head tail id whoami basename dirname time ps mount \
                    umount df grep sed awk tar vi loadkmap dumpkmap kbd_mode showkey hostname \
                    clear setsid cttyhack find chown chgrp login su adduser addgroup sync \
-                   date which reboot poweroff kill tree
+                   date which reboot poweroff kill tree \
+                   [[ add-shell ar arch ascii base32 base64 bbconfig bunzip2 bzcat bzip2 \
+                   cal chpasswd chvt cksum cmp comm cpio crc32 cryptpw cut dd deallocvt \
+                   delgroup deluser diff dos2unix dpkg dpkg-deb du ed egrep envdir envuidgid \
+                   expand expr factor fgconsole fgrep fold fsync getopt groups gunzip \
+                   gzip halt hd hexdump hexedit hostid hush install ipcalc killall \
+                   killall5 less link logname lzcat lzma lzop lzopcat makemime man md5sum \
+                   mesg mkpasswd mktemp modinfo more mountpoint nl nohup od \
+                   openvt passwd paste patch pgrep pidof pipe_progress pkill printenv pstree \
+                   pwdx realpath reformime remove-shell reset resize rev rpm rpm2cpio \
+                   run-parts scriptreplay seq setuidgid sha1sum sha256sum sha3sum \
+                   sha512sum shred shuf sort split start-stop-daemon stat strings stty \
+                   sulogin sum tac tee timeout tr ts tsort tty ttysize uncompress \
+                   unexpand uniq unix2dos unlink unlzma unlzop unxz unzip usleep uudecode \
+                   uuencode watch xargs xxd xz xzcat yes zcat
 
 # ---- mlibc toolchain + sysroot (phase 3.2, steps 3 + 4) ---------------------
 # ports/toolchain drives the phase's third and fourth steps: the
