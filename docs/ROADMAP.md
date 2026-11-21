@@ -102,7 +102,7 @@ Beyond (nice to have)
 - [x] USB (xHCI) keyboard and mass storage, NVMe (polling drivers; root ports only, no hubs, see docs/USB-NVME.md)
 - [ ] other file systems: FAT32 R/W in the kernel
 - [ ] graphics: framebuffer userspace API, a minimal window system
-- [ ] desktop (Xorg, then KDE): mlibc is the entry ticket, not the whole price, also `epoll` (Unix domain sockets landed), shared memory (`MAP_SHARED` of files, `shm`), a display / input device interface (KMS-style), and a lot of the Linux surface (`/proc`, `/sys`, `udev`-like discovery)
+- [ ] desktop (Xorg, then XFCE): mlibc is the entry ticket, not the whole price, also `epoll` (Unix domain sockets landed), shared memory (`MAP_SHARED` of files, `shm`), a display / input device interface (KMS-style), and a lot of the Linux surface (`/proc`, `/sys`, `udev`-like discovery)
 - [ ] AArch64 port of the kernel and loader
 
 *One day, perhaps, PrismOS will be self-hosted lol*

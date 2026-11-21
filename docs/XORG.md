@@ -101,7 +101,7 @@ with a minimal `xorg.conf` (`Driver "modesetting"`, `kmsdev
 
 ## 5. After Xorg
 
-- [ ] C++ (phase 4.3) for Mesa (llvmpipe/softpipe), then KDE
+- [ ] C++ (phase 4.3) for Mesa (llvmpipe/softpipe), then XFCE
 - [ ] Mesa + DRI3 + `memfd` / PRIME
-- [ ] a light window manager (`twm`, `openbox`) before KDE
+- [ ] a light window manager (`twm`, `openbox`) before XFCE
 - [ ] a real GPU driver (virtio-gpu) to move off the firmware framebuffer
