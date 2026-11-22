@@ -191,7 +191,7 @@ fn page_up(x: u64) -> Option<u64> {
 /// Where an executable's bytes come from.  The head (header, program
 /// headers, interpreter string) is in memory; segment data is read on demand,
 /// so the loader never needs the whole file at once.
-trait Source {
+pub(crate) trait Source {
     fn head(&self) -> &[u8];
     /// The file's full size.
     fn len(&self) -> u64;
@@ -217,7 +217,7 @@ impl Source for Mem<'_> {
 }
 
 /// An executable on the file system: its head in memory, the rest on disk.
-struct Program {
+pub(crate) struct Program {
     head: Vec<u8>,
     file: crate::fs::vfs::FileRef,
     size: u64,
@@ -321,7 +321,7 @@ fn parse_shebang(image: &[u8]) -> Result<(String, Option<String>), ExecError> {
 
 /// Open `path`, check it is an executable regular file and read its head:
 /// what both the main program and its `PT_INTERP` interpreter go through.
-fn read_program(path: &str) -> Result<Program, ExecError> {
+pub(crate) fn read_program(path: &str) -> Result<Program, ExecError> {
     use crate::fs::vfs::{FileType, FsError};
     let vfs = crate::fs::fsys::vfs();
     let errno = |e: FsError| -> ExecError {

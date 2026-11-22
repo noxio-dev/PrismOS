@@ -649,3 +649,10 @@ abitest:
 	mkdir -p $(B)
 	rustc --edition 2021 --test tests/abi_host.rs -o $(B)/abi_host
 	$(B)/abi_host --test-threads=1
+
+# Host-side test of the Linux layer's ELF loader (linux/fs/binfmt_elf), no QEMU needed.
+.PHONY: linuxelftest
+linuxelftest:
+	mkdir -p $(B)
+	rustc --edition 2021 --test tests/linux_elf_host.rs -o $(B)/linux_elf_host
+	$(B)/linux_elf_host --test-threads=1

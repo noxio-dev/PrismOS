@@ -34,6 +34,7 @@ mod fs;
 mod hw;
 mod input;
 mod lib;
+mod linux;
 mod mem;
 mod random;
 mod shell;
