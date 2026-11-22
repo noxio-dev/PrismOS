@@ -39,6 +39,7 @@
 // `AT_ENTRY`, `AT_RANDOM`, `AT_EXECFN`, ... terminated by `AT_NULL`); the
 // strings themselves sit above, at the top of the stack.
 
+use crate::user::abi::{self, Abi};
 use crate::mem::vmm::{AddressSpace, PAGE, USER_BASE, USER_CODE_BASE, USER_END, USER_INTERP_BASE, USER_SIGCODE, USER_STACK_TOP};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -265,7 +266,35 @@ fn load_path_inner(
         // AT_EXECFN stays the script path, like on Linux.
         return load_path_inner(&interp, execfn, &nargv, envp, depth + 1);
     }
+    // A program built for Linux cannot run on PrismOS's system calls: it is
+    // handed to the compatibility handler, like a script to its interpreter.
+    // (The handler itself is never redirected, whatever it turns out to be.)
+    if path != abi::LINUX_COMPAT && abi::classify(image) == Abi::Linux {
+        return redirect_linux(path, execfn, argv, envp, depth);
+    }
     load_src(&prog, execfn, argv, envp)
+}
+
+/// Run `abi::LINUX_COMPAT <program> args...` in place of a Linux program.
+/// Without the handler (a stripped down image) the exec fails with ENOEXEC
+/// and the kernel log says why.
+fn redirect_linux(path: &str, execfn: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>], depth: usize) -> Result<Loaded, ExecError> {
+    const NOT_SUPPORTED: &str = "linux programs not supported yet";
+    if depth >= MAX_SHEBANG_DEPTH {
+        return Err(ExecError::File("too many levels of #! interpreters", 40)); // ELOOP
+    }
+    // argv becomes: handler program-path argv[1..]
+    let mut nargv: Vec<Vec<u8>> = Vec::new();
+    nargv.push(abi::LINUX_COMPAT.as_bytes().to_vec());
+    nargv.push(path.as_bytes().to_vec());
+    nargv.extend(argv.iter().skip(1).cloned());
+    match load_path_inner(abi::LINUX_COMPAT, execfn, &nargv, envp, depth + 1) {
+        Err(ExecError::File(_, 2)) => {
+            crate::klog_warn!("exec {}: a Linux program, and no {} to run it", path, abi::LINUX_COMPAT);
+            Err(ExecError::Unsupported(NOT_SUPPORTED))
+        }
+        other => other,
+    }
 }
 
 /// Parse `#!interpreter [one optional argument]` from the first line.

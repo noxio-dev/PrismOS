@@ -1,0 +1,8 @@
+#!/bin/sh
+# Where the kernel sends programs built for Linux: it runs
+#   /usr/sbin/linux-compat <program> [args...]
+# in place of the program (see sys/kern/src/user/abi.rs).  PrismOS has its
+# own system calls, so for now there is nothing to run them with.  A real
+# Linux layer can take this file's place without any kernel change.
+echo "linux programs not supported yet" >&2
+exit 126

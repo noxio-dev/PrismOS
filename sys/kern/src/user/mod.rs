@@ -32,6 +32,7 @@
 // usermode.rs also carries the built-in flat test programs; shell/shuser.rs
 // exposes them as `user` / `usertest` / `ps` / `kill`.
 
+pub mod abi;
 pub mod elf;
 pub mod epoll_core;
 pub mod fd;

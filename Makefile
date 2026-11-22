@@ -23,7 +23,7 @@ QEMU_AHCI := -device ahci,id=ahci0
 QEMU_DATA := -drive id=data,file=$(DATA_IMG),format=raw,if=none -device ide-hd,drive=data,bus=ahci0.1
 # $(call qemu_boot_drive,image) - the bootable disk, AHCI port 0
 qemu_boot_drive = -drive id=boot,file=$(1),format=raw,if=none -device ide-hd,drive=boot,bus=ahci0.0
-QEMUFLAGS ?= -m 256M $(QEMU_AHCI) $(QEMU_DATA)
+QEMUFLAGS ?= -m 256M $(QEMU_AHCI) $(QEMU_DATA) -smp 2
 
 # NOSYSCHECK=1 skips the syscall-diet checks (verify.sh's disassembly, the slow
 # part of building the packages and ports):
@@ -642,3 +642,10 @@ drmtest:
 	$(B)/random_host --test-threads=1
 	rustc --edition 2021 --test tests/perm_host.rs -o $(B)/perm_host
 	$(B)/perm_host --test-threads=1
+
+# Host-side test of the Linux / PrismOS executable classifier (no QEMU needed).
+.PHONY: abitest
+abitest:
+	mkdir -p $(B)
+	rustc --edition 2021 --test tests/abi_host.rs -o $(B)/abi_host
+	$(B)/abi_host --test-threads=1
