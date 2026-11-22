@@ -336,9 +336,59 @@ fn handle_exception(frame: &mut IsrFrame) {
                 crate::kprintln!("cr2 = {:#x}", super::regs::read_cr2());
             }
             dump_frame(frame);
+            if v == 13 {
+                dump_gp_extra(frame);
+            }
             park();
         }
     }
+}
+
+/// Extra report for a #GP (the failure that only shows on some machines): the
+/// CPU, the five words an `iretq` was about to pop (the faulting rsp points at
+/// them when it is an iretq), the live GDT and the control registers.
+fn dump_gp_extra(f: &IsrFrame) {
+    let cpu = super::cpu::Cpu::detect();
+    crate::kprintln!(
+        "cpu {} / {} fam {:#x} model {:#x} step {}",
+        cpu.vendor(),
+        cpu.brand(),
+        cpu.family(),
+        cpu.model(),
+        cpu.stepping()
+    );
+    // The frame an iretq pops sits at the faulting rsp; only read it when
+    // that is a kernel-half address.
+    if f.rsp >= 0xffff_8000_0000_0000 && f.rsp % 8 == 0 {
+        // SAFETY: a kernel stack address the fault itself ran on; the five
+        // words are the last 40 bytes of that stack.
+        let w = unsafe { core::slice::from_raw_parts(f.rsp as *const u64, 5) };
+        crate::kprintln!(
+            "iretq frame @{:#x}: rip {:#x} cs {:#x} rfl {:#x} rsp {:#x} ss {:#x}",
+            f.rsp, w[0], w[1], w[2], w[3], w[4]
+        );
+    }
+    let mut gdtr = [0u8; 10];
+    // SAFETY: SGDT stores 10 bytes into the buffer.
+    unsafe { asm!("sgdt [{}]", in(reg) gdtr.as_mut_ptr(), options(nostack, preserves_flags)) };
+    let limit = u16::from_le_bytes([gdtr[0], gdtr[1]]);
+    let base = u64::from_le_bytes([gdtr[2], gdtr[3], gdtr[4], gdtr[5], gdtr[6], gdtr[7], gdtr[8], gdtr[9]]);
+    crate::kprintln!("gdtr base {:#x} limit {:#x}", base, limit);
+    if base >= 0xffff_8000_0000_0000 {
+        for i in 0..5u64 {
+            // SAFETY: the live GDT of this CPU is mapped in the kernel half.
+            let d = unsafe { core::ptr::read_volatile((base + i * 8) as *const u64) };
+            crate::kprintln!("  gdt[{:#04x}] = {:#018x}", i * 8, d);
+        }
+    }
+    let (cr0, cr3, cr4): (u64, u64, u64);
+    // SAFETY: reading control registers in ring 0.
+    unsafe {
+        asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
+        asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+    }
+    crate::kprintln!("cr0 {:#x} cr3 {:#x} cr4 {:#x}", cr0, cr3, cr4);
 }
 
 fn dump_frame(f: &IsrFrame) {

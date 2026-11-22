@@ -237,6 +237,11 @@ pub unsafe extern "C" fn iretq_to_user(frame: *mut IsrFrame) -> ! {
         "pop r14",
         "pop r15",
         "add rsp, 16",             // vector + errcode
+        // Force RPL 3 on CS and SS: a frame copied from `syscall_entry`
+        // (fork/clone/signals) carries the bare 0x20/0x18, and iretq to
+        // ring 3 with SS.RPL != 3 faults #GP(0x18).  Idempotent for 0x23/0x1b.
+        "or qword ptr [rsp + 8], 3",
+        "or qword ptr [rsp + 32], 3",
         "swapgs",
         "iretq",                   // rip, cs, rflags, rsp, ss
     );
@@ -287,8 +292,12 @@ pub fn init() -> InitInfo {
         let efer = crate::arch::io::rdmsr(MSR_EFER);
         crate::arch::io::wrmsr(MSR_EFER, efer | EFER_SCE);
         // SYSCALL: CS = STAR[47:32] (0x08), SS = +8 (0x10).
-        // SYSRET64: SS = STAR[63:48] + 8 (0x18 -> 0x1b), CS = +16 (0x20 -> 0x23).
-        crate::arch::io::wrmsr(MSR_STAR, (0x10u64 << 48) | ((KERNEL_CS as u64) << 32));
+        // SYSRET64: SS = STAR[63:48] + 8, CS = +16.  The RPL 3 is put in
+        // STAR itself (0x13 -> SS 0x1b, CS 0x23), as Linux does: Intel ORs
+        // the 3 in, but AMD (Zen) loads the bare selector (SS 0x18), and the
+        // next interrupt frame then carries ss=0x18 and its iretq faults
+        // #GP(0x18).
+        crate::arch::io::wrmsr(MSR_STAR, (0x13u64 << 48) | ((KERNEL_CS as u64) << 32));
         crate::arch::io::wrmsr(MSR_LSTAR, syscall_entry as usize as u64);
         crate::arch::io::wrmsr(MSR_SFMASK, SFMASK);
         // The BSP takes per-CPU slot 0; APs set their own in hw/smp.rs.

@@ -63,10 +63,14 @@ struct Gdt {
 static mut GDT: Gdt = Gdt {
     words: [
         0,               // 0x00 null
-        flat(0x9A, 0xA), // 0x08 kernel code (L=1)
-        flat(0x92, 0xC), // 0x10 kernel data
-        flat(0xF2, 0xC), // 0x18 user data (sysretq: SS = STAR[63:48]+8)
-        flat(0xFA, 0xA), // 0x20 user code (sysretq: CS = STAR[63:48]+16)
+        // The Accessed bit (access bit 0) is set in every descriptor up
+        // front: otherwise the CPU writes it itself the first time a selector
+        // is loaded (the user ones on the first iretq to ring 3), and that
+        // write into the GDT must succeed in whatever page tables are live.
+        flat(0x9B, 0xA), // 0x08 kernel code (L=1)
+        flat(0x93, 0xC), // 0x10 kernel data
+        flat(0xF3, 0xC), // 0x18 user data (sysretq: SS = STAR[63:48]+8)
+        flat(0xFB, 0xA), // 0x20 user code (sysretq: CS = STAR[63:48]+16)
         0,               // 0x28 TSS low (patched at init)
         0,               //      TSS high
         0,               // padding
