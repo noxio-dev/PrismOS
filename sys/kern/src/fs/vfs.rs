@@ -138,6 +138,77 @@ pub fn cred() -> Cred {
     f()
 }
 
+// ------------------------------------------------------------ page frames
+//
+// A tmpfs keeps its file data in whole 4 KiB frames (so a file page can be
+// mapped MAP_SHARED into several address spaces).  The VFS knows nothing of
+// the kernel's allocator: the kernel installs the three operations below at
+// boot (`fsys::init`), and the host tests (which build this file and
+// tmpfs.rs unchanged) fall back to leaked heap pages.  A frame is an opaque
+// non-zero id: the physical address in the kernel, the pointer on the host.
+
+pub const FRAME_SIZE: usize = 4096;
+
+#[derive(Clone, Copy)]
+pub struct PageOps {
+    /// A zeroed frame, None when memory is out.
+    pub alloc: fn() -> Option<u64>,
+    /// The file lets go of a frame (a mapping may still hold it).
+    pub free: fn(u64),
+    /// The kernel-visible address of a frame's bytes.
+    pub ptr: fn(u64) -> *mut u8,
+}
+
+static PAGE_ALLOC: AtomicUsize = AtomicUsize::new(0);
+static PAGE_FREE: AtomicUsize = AtomicUsize::new(0);
+static PAGE_PTR: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the frame source (kernel boot).
+pub fn set_page_ops(ops: PageOps) {
+    PAGE_ALLOC.store(ops.alloc as usize, Ordering::Relaxed);
+    PAGE_FREE.store(ops.free as usize, Ordering::Relaxed);
+    PAGE_PTR.store(ops.ptr as usize, Ordering::Relaxed);
+}
+
+#[repr(C, align(4096))]
+struct HostPage([u8; FRAME_SIZE]);
+
+/// A zeroed frame for file data.
+pub fn page_alloc() -> Option<u64> {
+    let p = PAGE_ALLOC.load(Ordering::Relaxed);
+    if p == 0 {
+        let b = Box::new(HostPage([0; FRAME_SIZE]));
+        return Some(Box::into_raw(b) as u64);
+    }
+    // SAFETY: only `set_page_ops` writes this, always with a valid `fn() -> Option<u64>`.
+    let f: fn() -> Option<u64> = unsafe { core::mem::transmute::<usize, fn() -> Option<u64>>(p) };
+    f()
+}
+
+/// Give a frame back (the mapping holders, if any, keep it alive).
+pub fn page_free(id: u64) {
+    let p = PAGE_FREE.load(Ordering::Relaxed);
+    if p == 0 {
+        // SAFETY: host fallback: `id` came from `page_alloc`'s Box::into_raw.
+        drop(unsafe { Box::from_raw(id as *mut HostPage) });
+        return;
+    }
+    // SAFETY: only `set_page_ops` writes this, always with a valid `fn(u64)`.
+    let f: fn(u64) = unsafe { core::mem::transmute::<usize, fn(u64)>(p) };
+    f(id)
+}
+
+/// The bytes of a frame.
+pub fn page_ptr(id: u64) -> *mut u8 {
+    let p = PAGE_PTR.load(Ordering::Relaxed);
+    if p == 0 {
+        return id as *mut u8;
+    }
+    // SAFETY: only `set_page_ops` writes this, always with a valid `fn(u64) -> *mut u8`.
+    let f: fn(u64) -> *mut u8 = unsafe { core::mem::transmute::<usize, fn(u64) -> *mut u8>(p) };
+    f(id)
+}
+
 pub const R_OK: u8 = 4;
 pub const W_OK: u8 = 2;
 pub const X_OK: u8 = 1;
@@ -303,6 +374,18 @@ pub trait FileSystem {
     /// Push every pending change to the device.
     fn sync(&mut self) -> FsResult<()> {
         Ok(())
+    }
+    /// The VFS opened a descriptor on `ino` (phase 2.2 for Xorg): a file
+    /// system that can keep an unlinked inode alive (tmpfs) counts them.
+    fn open_ref(&mut self, _ino: u64) {}
+    /// That descriptor is gone: the last one lets an unlinked inode die.
+    fn close_ref(&mut self, _ino: u64) {}
+    /// The frame holding page `index` of file `ino`, allocated (zeroed) if
+    /// the page was a hole -- what a MAP_SHARED mapping maps.  Only a file
+    /// system whose data lives in RAM frames can answer; the rest says
+    /// `Unsupported` (no page cache to share through).
+    fn page_frame(&mut self, _ino: u64, _index: u64) -> FsResult<u64> {
+        Err(FsError::Unsupported)
     }
 }
 
@@ -1128,6 +1211,7 @@ impl Vfs {
             self.mounts[mi].fs.truncate(ino, 0)?;
         }
         let of = OpenFile { mount: self.mounts[mi].id, ino, off: 0, flags, is_dir };
+        self.mounts[mi].fs.open_ref(ino);
         if let Some(i) = self.files.iter().position(|f| f.is_none()) {
             self.files[i] = Some(of);
             Ok(Opened::File(i))
@@ -1140,11 +1224,35 @@ impl Vfs {
     pub fn close(&mut self, fd: usize) -> FsResult<()> {
         match self.files.get_mut(fd) {
             Some(slot @ Some(_)) => {
-                *slot = None;
+                let of = slot.take();
+                if let Some(of) = of {
+                    if let Ok(mi) = self.mount_index(of.mount) {
+                        self.mounts[mi].fs.close_ref(of.ino);
+                    }
+                }
                 Ok(())
             }
             _ => Err(FsError::BadFd),
         }
+    }
+
+    /// The frame behind page `index` of an open file (MAP_SHARED, phase 2.2).
+    pub fn file_page(&mut self, fd: usize, index: u64) -> FsResult<u64> {
+        let f = self.file(fd)?;
+        let (mid, ino) = (f.mount, f.ino);
+        let mi = self.mount_index(mid)?;
+        self.mounts[mi].fs.page_frame(ino, index)
+    }
+
+    /// fallocate(2) by descriptor: the open file must be writable.
+    pub fn fallocate_fd(&mut self, fd: usize, start: u64, len: u64, keep_size: bool) -> FsResult<()> {
+        let f = self.file(fd)?;
+        if f.flags & O_WRITE == 0 {
+            return Err(FsError::BadFd);
+        }
+        let (mid, ino) = (f.mount, f.ino);
+        let mi = self.mount_index(mid)?;
+        self.mounts[mi].fs.fallocate(ino, start, len, keep_size)
     }
 
     pub fn read(&mut self, fd: usize, buf: &mut [u8]) -> FsResult<usize> {

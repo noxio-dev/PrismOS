@@ -40,11 +40,13 @@
 //   access SIGSEGVs; mprotect can upgrade them later) and refused for
 //   files: a page nobody may touch has nothing to be filled with.
 //   Without MAP_FIXED the address is a hint we ignore: the first fit
-//   above USER_MMAP_BASE wins.  MAP_SHARED file mappings are -ENOSYS --
-//   there is no page cache to write back through yet.  Free ranges are
-//   found by probing the page tables (`range_free`), so there is no VMA
-//   list; munmap unmasks whatever is there (absent pages are skipped,
-//   like on Linux).
+//   above USER_MMAP_BASE wins.  MAP_SHARED file mappings (phase 2.2 for
+//   Xorg) map the file's own RAM frames, so they work on tmpfs only
+//   (/dev/shm, /tmp, memfd); any other file system answers -ENODEV, there
+//   is no page cache to share through yet -- see `mmap_shared_file`.
+//   Free ranges are found by probing the page tables (`range_free`), so
+//   there is no VMA list; munmap unmasks whatever is there (absent pages
+//   are skipped, like on Linux).
 // * `chdir` / `getcwd`: the cwd is a plain String in the PCB (fork copies
 //   it, execve keeps it; the shell's own cwd is a different one in
 //   fsys.rs).  `getcwd` returns the length including the NUL, -ERANGE
@@ -58,10 +60,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::fs::vfs::{FileType, O_READ};
+use crate::fs::vfs::{FileType, O_READ, O_WRITE};
 use crate::mem::vmm::{self, AddressSpace, PAGE, USER_BASE, USER_END, USER_SIGCODE};
 use crate::user::process;
-use crate::user::usermode::{self, EBADF, EFAULT, EINVAL, ENOSYS};
+use crate::user::usermode::{self, EBADF, EFAULT, EINVAL};
 
 const ENOENT: i64 = 2;
 const EINTR: i64 = 4;
@@ -201,7 +203,9 @@ pub fn sys_mmap(a: [u64; 6]) -> i64 {
     let mut file: Option<usize> = None; // the VFS slot of a file mapping
     if flags & MAP_ANONYMOUS == 0 {
         if flags & MAP_SHARED != 0 {
-            return -ENOSYS; // no page cache to write back through yet
+            // The file's own frames go into the caller (tmpfs only: any
+            // other file system has no page cache to share through).
+            return mmap_shared_file(addr, len, prot, flags, fd, off);
         }
         if off & (PAGE - 1) != 0 {
             return -EINVAL;
@@ -305,6 +309,128 @@ pub fn sys_mmap(a: [u64; 6]) -> i64 {
                 return -EFAULT;
             }
             pos += got as u64;
+        }
+    }
+    start as i64
+}
+
+/// Where a mapping of `len` bytes goes: `MAP_FIXED` pins (replacing whatever
+/// was there), otherwise first-fit above the mmap base.  The same placement
+/// rules as `sys_mmap`'s anonymous path.
+fn place_mapping(aspace: &mut AddressSpace, addr: u64, len: u64, flags: u64) -> Result<u64, i64> {
+    let start = if flags & MAP_FIXED != 0 {
+        if addr & (PAGE - 1) != 0 {
+            return Err(-EINVAL);
+        }
+        // SAFETY: syscall context, our CR3 is live.
+        unsafe { aspace.unmap(addr, len) };
+        addr
+    } else {
+        let mut v = vmm::USER_MMAP_BASE;
+        loop {
+            if v + len > MMAP_LIMIT {
+                return Err(-ENOMEM);
+            }
+            if aspace.range_free(v, len) {
+                break;
+            }
+            v += PAGE;
+        }
+        v
+    };
+    if start & (PAGE - 1) != 0 || start < vmm::USER_BASE || start + len > MMAP_LIMIT {
+        return Err(-ENOMEM);
+    }
+    let sig_lo = vmm::USER_SIGCODE & !(PAGE - 1);
+    if start < sig_lo + PAGE && start + len > sig_lo {
+        return Err(-ENOMEM);
+    }
+    Ok(start)
+}
+
+/// `mmap(MAP_SHARED)` of a file (phase 2.2 for Xorg): map the file's own
+/// frames into the caller, so every mapper -- and `read` / `write` on the
+/// descriptor -- sees the same bytes.
+///
+/// Only a file system whose data lives in RAM frames can do it (tmpfs, which
+/// is what /dev/shm and memfd are); the others answer -ENODEV.  Like the DRM
+/// mapping above, each page gets one more `cow` reference (the file keeps its
+/// own) and a SHARED PTE, so `fork` keeps parent and child on the same frame;
+/// `munmap` / exit release the references, and a file truncated, unlinked or
+/// closed while mapped hands its frames over to the last unmap.
+///
+/// Differences from Linux, on purpose: the range must lie inside the file
+/// when mapping (no SIGBUS machinery: -EINVAL past the end), a later
+/// truncate leaves existing mappings on their (now private) frames, and a
+/// shared mapping is never executable.
+fn mmap_shared_file(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> i64 {
+    if off & (PAGE - 1) != 0 {
+        return -EINVAL;
+    }
+    if prot & PROT_EXEC != 0 {
+        return -EACCES;
+    }
+    let desc = match crate::user::fd::desc_of(fd as usize) {
+        Some(d) => d,
+        None => return -EBADF,
+    };
+    let fl = desc.flags();
+    if fl & O_READ == 0 {
+        return -EACCES; // not opened for reading (POSIX, even for PROT_WRITE)
+    }
+    let w = prot & PROT_WRITE != 0;
+    if w && fl & O_WRITE == 0 {
+        return -EACCES; // a writable shared mapping needs a writable file
+    }
+    let Some(slot) = crate::user::fd::vfs_slot_of(&desc) else { return -ENODEV };
+    let vfs = crate::fs::fsys::vfs();
+    let st = match vfs.fstat(slot) {
+        Ok(s) => s,
+        Err(_) => return -ENODEV,
+    };
+    if st.ftype == FileType::Dir {
+        return -EISDIR;
+    }
+    let len = page_up(len);
+    let first = off / PAGE;
+    let n = len / PAGE;
+    let Some(last) = first.checked_add(n) else { return -EINVAL };
+    if last > page_up(st.size) / PAGE {
+        return -EINVAL; // beyond the end of the file
+    }
+    let Some(cur) = process::current() else { return -EFAULT };
+    let Some(aspace) = cur.aspace.as_mut() else { return -EFAULT };
+    let start = match place_mapping(aspace, addr, len, flags) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    // Page tables are the only fresh memory this needs (the frames exist
+    // already, or the file allocates them on first touch below).
+    let free = crate::mem::pmm::stats_snapshot().free_pages.load(core::sync::atomic::Ordering::Relaxed);
+    if free < 64 + n / 512 {
+        return -ENOMEM;
+    }
+    for i in 0..n {
+        let phys = match vfs.file_page(slot, first + i) {
+            Ok(p) => p,
+            Err(e) => {
+                // SAFETY: syscall context, our CR3 is live.
+                unsafe { aspace.unmap(start, len) };
+                return match e {
+                    crate::fs::vfs::FsError::Unsupported => -ENODEV,
+                    crate::fs::vfs::FsError::NoSpace => -ENOMEM,
+                    _ => -EINVAL,
+                };
+            }
+        };
+        if !crate::mem::cow::track(phys) {
+            unsafe { aspace.unmap(start, len) };
+            return -ENOMEM;
+        }
+        if !aspace.map_page_shared(start + i * PAGE, phys, w) {
+            let _ = crate::mem::cow::release(phys); // this page never got mapped
+            unsafe { aspace.unmap(start, len) };
+            return -ENOMEM;
         }
     }
     start as i64

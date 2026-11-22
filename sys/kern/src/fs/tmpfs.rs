@@ -51,8 +51,161 @@ const LINK_MAX: u32 = 65000;
 /// anyway; the cap keeps a corrupt length from ever being stored).
 const SYMLINK_MAX: usize = 4095;
 
+const PAGE: u64 = vfs::FRAME_SIZE as u64;
+const PAGE_USIZE: usize = vfs::FRAME_SIZE;
+
+/// File data (phase 2.2 for Xorg): a list of whole frames, so a page of the
+/// file can be mapped MAP_SHARED.  A zero entry is a hole (reads as zeros,
+/// takes no memory until written or mapped).
+///
+/// Invariants: every allocated frame holds zeros at and beyond `size` (so
+/// growing the file never shows stale bytes), and `pages.len()` covers at
+/// least `size` (it may be longer only between a failed write and its
+/// clean-up).
+struct FileData {
+    size: u64,
+    pages: Vec<u64>,
+}
+
+impl FileData {
+    fn new() -> FileData {
+        FileData { size: 0, pages: Vec::new() }
+    }
+
+    fn npages(size: u64) -> usize {
+        ((size + PAGE - 1) / PAGE) as usize
+    }
+
+    /// Free every frame from page `keep` on and cut the list there.
+    fn free_from(&mut self, keep: usize) {
+        if keep >= self.pages.len() {
+            return;
+        }
+        for &f in &self.pages[keep..] {
+            if f != 0 {
+                vfs::page_free(f);
+            }
+        }
+        self.pages.truncate(keep);
+    }
+
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> usize {
+        if off >= self.size {
+            return 0;
+        }
+        let want = (buf.len() as u64).min(self.size - off) as usize;
+        let mut done = 0usize;
+        while done < want {
+            let pos = off + done as u64;
+            let idx = (pos / PAGE) as usize;
+            let po = (pos % PAGE) as usize;
+            let n = (PAGE_USIZE - po).min(want - done);
+            match self.pages.get(idx).copied() {
+                Some(f) if f != 0 => {
+                    // SAFETY: `f` is a live frame of PAGE_USIZE bytes and
+                    // po + n <= PAGE_USIZE; the destination slice has n bytes.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(vfs::page_ptr(f).add(po), buf.as_mut_ptr().add(done), n)
+                    };
+                }
+                _ => buf[done..done + n].fill(0),
+            }
+            done += n;
+        }
+        want
+    }
+
+    /// Write `data` at `off`, growing the file when it ends past `size`.
+    /// Nothing is written (and the file is unchanged) when a frame cannot
+    /// be had.
+    fn write_at(&mut self, off: u64, data: &[u8]) -> FsResult<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let end = off + data.len() as u64;
+        let first = (off / PAGE) as usize;
+        let last = ((end - 1) / PAGE) as usize;
+        if self.pages.len() <= last {
+            self.pages.resize(last + 1, 0);
+        }
+        for i in first..=last {
+            if self.pages[i] == 0 {
+                match vfs::page_alloc() {
+                    Some(f) => self.pages[i] = f,
+                    None => {
+                        self.free_from(Self::npages(self.size));
+                        return Err(FsError::NoSpace);
+                    }
+                }
+            }
+        }
+        let mut done = 0usize;
+        while done < data.len() {
+            let pos = off + done as u64;
+            let idx = (pos / PAGE) as usize;
+            let po = (pos % PAGE) as usize;
+            let n = (PAGE_USIZE - po).min(data.len() - done);
+            // SAFETY: every frame of the range was allocated above; the
+            // source slice has n bytes left and po + n <= PAGE_USIZE.
+            unsafe {
+                core::ptr::copy_nonoverlapping(data.as_ptr().add(done), vfs::page_ptr(self.pages[idx]).add(po), n)
+            };
+            done += n;
+        }
+        if end > self.size {
+            self.size = end;
+        }
+        Ok(())
+    }
+
+    /// Set the length: a shrink frees the frames past it and zeroes the tail
+    /// of the last one, a growth only adds holes.
+    fn set_size(&mut self, new: u64) {
+        if new < self.size {
+            let keep = Self::npages(new);
+            self.free_from(keep);
+            let tail = (new % PAGE) as usize;
+            if tail != 0 {
+                if let Some(&f) = self.pages.get(keep - 1) {
+                    if f != 0 {
+                        // SAFETY: a live frame; the range tail..PAGE_USIZE is inside it.
+                        unsafe { core::ptr::write_bytes(vfs::page_ptr(f).add(tail), 0, PAGE_USIZE - tail) };
+                    }
+                }
+            }
+        } else {
+            let need = Self::npages(new);
+            if self.pages.len() < need {
+                self.pages.resize(need, 0);
+            }
+        }
+        self.size = new;
+    }
+
+    /// The frame of page `index`, allocated when it was a hole.
+    fn frame(&mut self, index: u64) -> FsResult<u64> {
+        let idx = index as usize;
+        if index >= Self::npages(self.size) as u64 {
+            return Err(FsError::Invalid); // past the end: nothing to map
+        }
+        if self.pages.len() <= idx {
+            self.pages.resize(idx + 1, 0);
+        }
+        if self.pages[idx] == 0 {
+            self.pages[idx] = vfs::page_alloc().ok_or(FsError::NoSpace)?;
+        }
+        Ok(self.pages[idx])
+    }
+}
+
+impl Drop for FileData {
+    fn drop(&mut self) {
+        self.free_from(0);
+    }
+}
+
 enum Payload {
-    File(Vec<u8>),
+    File(FileData),
     Dir(BTreeMap<String, u64>),
     Link(String),
 }
@@ -63,6 +216,10 @@ struct Node {
     /// Permission bits only, like the rest of the kernel's stat.
     mode: u16,
     nlink: u32,
+    /// Open descriptors on this inode (the VFS tells us through
+    /// `open_ref` / `close_ref`): an unlinked file lives until the last
+    /// one closes -- the shm_open + shm_unlink idiom.
+    opens: u32,
     uid: u32,
     gid: u32,
     atime: u32,
@@ -74,14 +231,14 @@ struct Node {
 impl Node {
     fn size(&self) -> u64 {
         match &self.payload {
-            Payload::File(d) => d.len() as u64,
+            Payload::File(d) => d.size,
             Payload::Link(t) => t.len() as u64,
             Payload::Dir(_) => DIR_SIZE,
         }
     }
     fn payload_bytes(&self) -> u64 {
         match &self.payload {
-            Payload::File(d) => d.len() as u64,
+            Payload::File(d) => d.size,
             Payload::Link(t) => t.len() as u64,
             Payload::Dir(_) => 0,
         }
@@ -120,6 +277,7 @@ impl TmpFs {
             ftype: FileType::Dir,
             mode: 0o1777, // the classic /tmp: sticky, world-writable
             nlink: 2,
+            opens: 0,
             uid: 0,
             gid: 0,
             atime: now,
@@ -179,15 +337,28 @@ impl TmpFs {
         let now = vfs::now();
         self.nodes.insert(
             ino,
-            Node { parent, ftype, mode: mode & 0o7777, nlink: 1, uid: 0, gid: 0, atime: now, mtime: now, ctime: now, payload },
+            Node { parent, ftype, mode: mode & 0o7777, nlink: 1, opens: 0, uid: 0, gid: 0, atime: now, mtime: now, ctime: now, payload },
         );
         Ok(ino)
     }
 
-    /// Remove a node whose last name is gone, giving its bytes back.
+    /// Remove a node whose last name is gone, giving its bytes back (the
+    /// frames go with the dropped payload).
     fn drop_node(&mut self, ino: u64) {
         if let Some(n) = self.nodes.remove(&ino) {
             self.refund(n.payload_bytes());
+        }
+    }
+
+    /// A node just lost its last name: it dies now, unless a descriptor
+    /// still holds the (regular) file -- then `close_ref` finishes it.
+    fn release_inode(&mut self, ino: u64) {
+        let keep = match self.nodes.get(&ino) {
+            Some(n) => n.opens > 0 && n.ftype == FileType::Regular,
+            None => false,
+        };
+        if !keep {
+            self.drop_node(ino);
         }
     }
 
@@ -290,16 +461,7 @@ impl FileSystem for TmpFs {
         let n = {
             let n = self.node(ino)?;
             match &n.payload {
-                Payload::File(d) => {
-                    if off >= d.len() as u64 {
-                        0
-                    } else {
-                        let start = off as usize;
-                        let want = buf.len().min(d.len() - start);
-                        buf[..want].copy_from_slice(&d[start..start + want]);
-                        want
-                    }
-                }
+                Payload::File(d) => d.read_at(off, buf),
                 Payload::Dir(_) => return Err(FsError::IsDir),
                 Payload::Link(_) => return Err(FsError::Invalid),
             }
@@ -325,7 +487,7 @@ impl FileSystem for TmpFs {
         let old_len = {
             let n = self.node(ino)?;
             match &n.payload {
-                Payload::File(d) => d.len() as u64,
+                Payload::File(d) => d.size,
                 Payload::Dir(_) => return Err(FsError::IsDir),
                 Payload::Link(_) => return Err(FsError::Invalid),
             }
@@ -334,19 +496,27 @@ impl FileSystem for TmpFs {
             self.charge(end - old_len)?;
         }
         let now = vfs::now();
-        let n = self.node_mut(ino)?;
-        let d = match &mut n.payload {
-            Payload::File(d) => d,
-            Payload::Dir(_) => return Err(FsError::IsDir), // unchanged in between
-            Payload::Link(_) => return Err(FsError::Invalid),
+        let res = {
+            let n = self.node_mut(ino)?;
+            match &mut n.payload {
+                // Any gap off > len reads as zeros (holes).
+                Payload::File(d) => d.write_at(off, data).map(|_| {
+                    n.mtime = now;
+                    n.ctime = now;
+                }),
+                Payload::Dir(_) => Err(FsError::IsDir), // unchanged in between
+                Payload::Link(_) => Err(FsError::Invalid),
+            }
         };
-        if end > old_len {
-            d.resize(end as usize, 0); // zero-fill any gap off > len
+        match res {
+            Ok(()) => Ok(data.len()),
+            Err(e) => {
+                if end > old_len {
+                    self.refund(end - old_len); // the growth never happened
+                }
+                Err(e)
+            }
         }
-        d[off as usize..end as usize].copy_from_slice(data);
-        n.mtime = now;
-        n.ctime = now;
-        Ok(data.len())
     }
 
     fn truncate(&mut self, ino: u64, size: u64) -> FsResult<()> {
@@ -356,7 +526,7 @@ impl FileSystem for TmpFs {
         let old_len = {
             let n = self.node(ino)?;
             match &n.payload {
-                Payload::File(d) => d.len() as u64,
+                Payload::File(d) => d.size,
                 Payload::Dir(_) => return Err(FsError::IsDir),
                 Payload::Link(_) => return Err(FsError::Invalid),
             }
@@ -369,7 +539,7 @@ impl FileSystem for TmpFs {
         let now = vfs::now();
         let n = self.node_mut(ino)?;
         match &mut n.payload {
-            Payload::File(d) => d.resize(size as usize, 0),
+            Payload::File(d) => d.set_size(size),
             Payload::Dir(_) => return Err(FsError::IsDir),
             Payload::Link(_) => return Err(FsError::Invalid),
         }
@@ -381,7 +551,7 @@ impl FileSystem for TmpFs {
     fn create(&mut self, dir: u64, name: &str, mode: u16) -> FsResult<u64> {
         validate_name(name)?;
         self.must_not_exist(dir, name)?;
-        let ino = self.alloc_node(dir, FileType::Regular, mode, Payload::File(Vec::new()))?;
+        let ino = self.alloc_node(dir, FileType::Regular, mode, Payload::File(FileData::new()))?;
         self.link_into(dir, name, ino)?;
         Ok(ino)
     }
@@ -448,7 +618,7 @@ impl FileSystem for TmpFs {
             n.nlink == 0
         };
         if gone {
-            self.drop_node(ino);
+            self.release_inode(ino);
         }
         Ok(())
     }
@@ -538,7 +708,7 @@ impl FileSystem for TmpFs {
                 t.nlink == 0
             };
             if gone {
-                self.drop_node(t_ino);
+                self.release_inode(t_ino);
             }
             if o_is_dir {
                 // The replaced directory was a child of the new parent.
@@ -609,5 +779,33 @@ impl FileSystem for TmpFs {
             self.truncate(ino, end)?;
         }
         Ok(())
+    }
+
+    fn open_ref(&mut self, ino: u64) {
+        if let Some(n) = self.nodes.get_mut(&ino) {
+            n.opens += 1;
+        }
+    }
+
+    /// The last descriptor of an unlinked file closing is what frees it.
+    fn close_ref(&mut self, ino: u64) {
+        let die = match self.nodes.get_mut(&ino) {
+            Some(n) => {
+                n.opens = n.opens.saturating_sub(1);
+                n.opens == 0 && n.nlink == 0
+            }
+            None => false,
+        };
+        if die {
+            self.drop_node(ino);
+        }
+    }
+
+    fn page_frame(&mut self, ino: u64, index: u64) -> FsResult<u64> {
+        match &mut self.node_mut(ino)?.payload {
+            Payload::File(d) => d.frame(index),
+            Payload::Dir(_) => Err(FsError::IsDir),
+            Payload::Link(_) => Err(FsError::Invalid),
+        }
     }
 }

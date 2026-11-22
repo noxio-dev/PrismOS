@@ -75,6 +75,10 @@
 //           sigaction now also takes SA_SIGINFO (user/signal.rs)
 //    59 setsid()                    60 setpgid(pid, pgid)   61 getpgid(pid)
 //    (a negative kill pid names a group; TIOCSCTTY claims a terminal)
+//    113 ftruncate(fd, len)         114 truncate(path, len)
+//    115 fallocate(fd, mode, off, len)   116 memfd_create(name, flags)
+//           (phase 2.2 for Xorg: with MAP_SHARED on tmpfs files and /dev/shm,
+//           user/fd.rs and user/sysc.rs)
 //
 // Phase 3.4 (the BusyBox step -- the gaps the port revealed):
 //    62 fchdir(fd)                  the directory an fd is open on
@@ -443,6 +447,11 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         111 => fd::epoll::sys_epoll_wait(a0, a1, a2, frame.r10),
         // ---- signals, the Xorg step: the alternate stack -----------------
         112 => signal::sys_sigaltstack(a0, a1, frame.rsp),
+        // ---- shared memory, the Xorg step (phase 2.2) --------------------
+        113 => fd::sys_ftruncate(a0, a1),
+        114 => fd::sys_truncate(a0, a1),
+        115 => fd::sys_fallocate(a0, a1, a2, frame.r10),
+        116 => fd::sys_memfd_create(a0, a1),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

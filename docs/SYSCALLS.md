@@ -68,7 +68,7 @@ Linux-like, x86-64 `syscall` instruction:
 | # | Call | Notes |
 |---|------|-------|
 | 21 | `brk(addr)` | one break per process, growing up from the end of the image; on failure returns the old break (like Linux) |
-| 22 | `mmap(addr, len, prot, flags, fd, off)` | anonymous (shared or private) and `MAP_PRIVATE` file mappings; `MAP_SHARED` on a file is `-ENOSYS`; `PROT_WRITE \| PROT_EXEC` is refused (W^X); without `MAP_FIXED` the address is a hint that is ignored |
+| 22 | `mmap(addr, len, prot, flags, fd, off)` | anonymous (shared or private) and `MAP_PRIVATE` file mappings; `MAP_SHARED` on a file works on tmpfs only (`-ENODEV` elsewhere; never executable; range must lie inside the file); `PROT_WRITE \| PROT_EXEC` is refused (W^X); without `MAP_FIXED` the address is a hint that is ignored |
 | 23 | `munmap(addr, len)` | absent pages are skipped |
 | 40 | `mprotect(addr, len, prot)` | copy-on-write aware |
 
@@ -122,6 +122,10 @@ Implemented in `user/fd/epoll.rs` over the host-tested interest list
 | 110 | `epoll_ctl(epfd, op, fd, event)` | `ADD` / `DEL` / `MOD`; 4th argument in `r10`. `-EEXIST`, `-ENOENT`, `-EBADF`, `-EINVAL` (epfd not an epoll, watching itself, bad op), `-ELOOP` (nesting cycle or deeper than 4), `-ENOSPC` (256 entries), `-EPERM` on regular files and directories |
 | 111 | `epoll_wait(epfd, events, maxevents, timeout_ms)` | 4th argument in `r10`; `maxevents` 1..1024; `-EINTR` when a handler is about to run |
 | 112 | `sigaltstack(ss, old_ss)` | Linux `stack_t` (24 bytes: `ss_sp`, `ss_flags` + pad, `ss_size`); `SS_DISABLE` / `SS_ONSTACK`; `-EPERM` while running on the area, `-ENOMEM` below 2048 bytes, `-EINVAL` for bad flags or an area outside user space. Per thread: copied by `fork`, dropped by `execve`, disabled in a new thread |
+| 113 | `ftruncate(fd, len)` | open, writable regular file; tmpfs growth adds holes (no memory until written or mapped), a shrink frees the frames and zeroes the tail; `-EINVAL` on pipes/sockets/devices |
+| 114 | `truncate(path, len)` | same, by path, with the VFS write-permission check |
+| 115 | `fallocate(fd, mode, off, len)` | mode 0 and `FALLOC_FL_KEEP_SIZE` only; other modes `-EOPNOTSUPP` |
+| 116 | `memfd_create(name, flags)` | anonymous file on `/dev/shm` (created then unlinked), `MFD_CLOEXEC` honoured, `MFD_ALLOW_SEALING` accepted but no seals; `-ENOSYS` without `/dev/shm` |
 
 `struct epoll_event` is the packed 12-byte x86-64 layout (`u32 events`, `u64
 data`). Supported: `EPOLLIN/OUT/ERR/HUP/RDHUP` (plus the `RDNORM`/`WRNORM`/band

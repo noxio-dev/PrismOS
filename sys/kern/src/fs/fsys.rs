@@ -193,10 +193,43 @@ fn pick_root(found: &[Found]) -> Option<Found> {
     found.first().copied()
 }
 
+/// Frames below this many free pages are never handed to a tmpfs: the
+/// kernel (page tables, stacks) must keep a margin to breathe.
+const TMPFS_PAGE_MARGIN: usize = 256;
+
+fn tmp_page_alloc() -> Option<u64> {
+    let free = crate::mem::pmm::stats_snapshot().free_pages.load(core::sync::atomic::Ordering::Relaxed);
+    if (free as usize) < TMPFS_PAGE_MARGIN {
+        return None;
+    }
+    crate::mem::pmm::alloc_page()
+}
+
+fn tmp_page_free(phys: u64) {
+    // The file stops owning the frame: free it unless a mapping still holds
+    // it (then the last unmap frees it, through the same release).
+    if crate::mem::cow::release(phys) {
+        crate::mem::pmm::free_page(phys);
+    }
+}
+
+fn tmp_page_ptr(phys: u64) -> *mut u8 {
+    crate::mem::vmm::phys_access(phys).unwrap_or_else(|| crate::mem::vmm::phys_to_virt(phys)) as *mut u8
+}
+
+/// Size of the POSIX shared memory tmpfs on /dev/shm (phase 2.2).
+const SHM_BYTES: u64 = 32 * 1024 * 1024;
+const SHM_FILES: u64 = 1024;
+
 /// Boot-time setup: install the clock, mount the first ext volume on "/"
 /// and the device directory on /dev (phase 2.6).
 pub fn init() {
     vfs::set_clock(unix_now);
+    // tmpfs file data lives in PMM frames (phase 2.2 for Xorg): that is what
+    // lets a file page be mapped MAP_SHARED.  The file owns its frames
+    // through the same refcount table fork and DRM use, so a frame a mapping
+    // still holds outlives the file.
+    vfs::set_page_ops(vfs::PageOps { alloc: tmp_page_alloc, free: tmp_page_free, ptr: tmp_page_ptr });
     let found = scan();
     let Some(f) = pick_root(&found) else {
         crate::kprintln!("vfs      : no ext2/3/4 volume found, nothing mounted");
@@ -232,7 +265,20 @@ pub fn init() {
     // root mount there is nothing to hang it on either.
     if vfs().is_mounted() {
         match vfs().mount("/dev", Box::new(DevFs::new())) {
-            Ok(()) => crate::kprintln!("vfs      : devfs on /dev (console, tty, tty0, ttyS0, null, zero, full)"),
+            Ok(()) => {
+                crate::kprintln!("vfs      : devfs on /dev (console, tty, tty0, ttyS0, null, zero, full)");
+                // /dev/shm: the POSIX shared memory tmpfs (shm_open,
+                // memfd_create).  Its mount point is a directory devfs
+                // itself provides, so nothing on the root disk is needed.
+                match vfs().mount("/dev/shm", Box::new(TmpFs::with_limits(SHM_BYTES, SHM_FILES))) {
+                    Ok(()) => crate::kprintln!(
+                        "vfs      : tmpfs on /dev/shm (RAM, {} MiB / {} files quota)",
+                        SHM_BYTES >> 20,
+                        SHM_FILES
+                    ),
+                    Err(e) => crate::kprintln!("vfs      : cannot mount tmpfs on /dev/shm: {}", e.as_str()),
+                }
+            }
             Err(e) => crate::kprintln!("vfs      : cannot mount devfs on /dev: {}", e.as_str()),
         }
     }

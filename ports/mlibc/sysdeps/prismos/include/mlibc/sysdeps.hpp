@@ -180,7 +180,12 @@ struct PrismOSSysdepTags :
         EpollPwait,
         /* sigaltstack (kernel syscall 112): the alternate signal stack an
          * SA_ONSTACK handler runs on -- Xorg's crash handler asks for one. */
-        Sigaltstack
+        Sigaltstack,
+        /* ftruncate (kernel syscall 113): what shm_open'ed files and
+         * memfds are sized with before a MAP_SHARED mmap (MIT-SHM, shm
+         * clients).  truncate / fallocate / memfd_create (114..116) have
+         * no tag here yet: reach them through prism_raw.h or syscall(). */
+        Ftruncate
 {};
 
 struct SysdepTraits {

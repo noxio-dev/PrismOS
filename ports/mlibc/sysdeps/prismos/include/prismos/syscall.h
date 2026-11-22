@@ -138,6 +138,11 @@ enum {
         PRISM_SYS_EPOLL_WAIT = 111,  /* epoll_wait(epfd, &events, max, timeout_ms) */
         /* signals, the Xorg step (sys/kern/src/user/signal.rs) */
         PRISM_SYS_SIGALTSTACK = 112, /* sigaltstack(&ss, &old_ss) -- Linux's stack_t */
+        /* shared memory, the Xorg step (kernel user/fd.rs, MAP_SHARED in sysc.rs) */
+        PRISM_SYS_FTRUNCATE = 113,   /* ftruncate(fd, length) */
+        PRISM_SYS_TRUNCATE = 114,    /* truncate(path, length) */
+        PRISM_SYS_FALLOCATE = 115,   /* fallocate(fd, mode, offset, len) -- plain and KEEP_SIZE only */
+        PRISM_SYS_MEMFD_CREATE = 116, /* memfd_create(name, flags) -- a /dev/shm file, anonymous */
 };
 
 /* arch_prctl() codes -- the Linux x86-64 values the kernel expects. */

@@ -56,6 +56,9 @@ pub const N_VT_NODES: u32 = 6;
 pub const DEV_EVENT0: u32 = 24;
 pub const N_EVENT_NODES: u32 = 2;
 const INPUT_DIR_INO: u64 = 0x101;
+/// /dev/shm: an empty directory, only the mount point of the POSIX shared
+/// memory tmpfs (fs/fsys.rs mounts it at boot, phase 2.2 for Xorg).
+const SHM_DIR_INO: u64 = 0x102;
 const INPUT_NODES: [(&str, u32, u16); 2] = [("event0", DEV_EVENT0, 0o660), ("event1", DEV_EVENT0 + 1, 0o660)];
 const VT_NODES: [(&str, u32, u16); 6] = [
     ("tty1", DEV_TTY1, 0o620),
@@ -102,7 +105,7 @@ impl DevFs {
 
     fn stat_of(&mut self, ino: u64) -> Stat {
         let now = vfs::now();
-        if ino == ROOT_INO || ino == DRI_DIR_INO || ino == INPUT_DIR_INO {
+        if ino == ROOT_INO || ino == DRI_DIR_INO || ino == INPUT_DIR_INO || ino == SHM_DIR_INO {
             return Stat {
                 ino,
                 ftype: FileType::Dir,
@@ -164,7 +167,12 @@ impl FileSystem for DevFs {
     }
 
     fn stat(&mut self, ino: u64) -> FsResult<Stat> {
-        if ino == ROOT_INO || ino == DRI_DIR_INO || ino == INPUT_DIR_INO || (ino < 0x100 && Self::node(ino as u32).is_some()) {
+        if ino == ROOT_INO
+            || ino == DRI_DIR_INO
+            || ino == INPUT_DIR_INO
+            || ino == SHM_DIR_INO
+            || (ino < 0x100 && Self::node(ino as u32).is_some())
+        {
             Ok(self.stat_of(ino))
         } else {
             Err(FsError::NotFound)
@@ -188,6 +196,9 @@ impl FileSystem for DevFs {
             }
             return Err(FsError::NotFound);
         }
+        if dir == SHM_DIR_INO {
+            return Err(FsError::NotFound); // empty: the tmpfs mounted over it answers
+        }
         if dir != ROOT_INO {
             return Err(FsError::NotDir);
         }
@@ -196,6 +207,9 @@ impl FileSystem for DevFs {
         }
         if name == "input" {
             return Ok(INPUT_DIR_INO);
+        }
+        if name == "shm" {
+            return Ok(SHM_DIR_INO);
         }
         for (n, id, _) in VT_NODES {
             if name == n {
@@ -229,6 +243,12 @@ impl FileSystem for DevFs {
             }
             return Ok(out);
         }
+        if dir == SHM_DIR_INO {
+            let mut out = Vec::new();
+            out.push(DirEntry { ino: SHM_DIR_INO, ftype: FileType::Dir, name: String::from(".") });
+            out.push(DirEntry { ino: ROOT_INO, ftype: FileType::Dir, name: String::from("..") });
+            return Ok(out);
+        }
         if dir != ROOT_INO {
             return Err(FsError::NotDir);
         }
@@ -244,6 +264,7 @@ impl FileSystem for DevFs {
             out.push(DirEntry { ino: id as u64, ftype: FileType::Dev(id), name: String::from(n) });
         }
         out.push(DirEntry { ino: INPUT_DIR_INO, ftype: FileType::Dir, name: String::from("input") });
+        out.push(DirEntry { ino: SHM_DIR_INO, ftype: FileType::Dir, name: String::from("shm") });
         if crate::drm::present() {
             out.push(DirEntry { ino: DRI_DIR_INO, ftype: FileType::Dir, name: String::from("dri") });
         }

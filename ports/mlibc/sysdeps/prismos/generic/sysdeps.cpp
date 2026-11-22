@@ -1140,6 +1140,11 @@ int Sysdeps<Sigaltstack>::operator()(const stack_t *ss, stack_t *oss) {
         return sc_error(ret);
 }
 
+int Sysdeps<Ftruncate>::operator()(int fd, size_t size) {
+        auto ret = sys(PRISM_SYS_FTRUNCATE, fd, size);
+        return sc_error(ret);
+}
+
 int Sysdeps<ThreadSigmask>::operator()(int how, const sigset_t *__restrict set,
                 sigset_t *__restrict retrieve) {
         /* The kernel's blocked mask is per thread (phase 4.2), so the

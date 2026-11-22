@@ -25,9 +25,9 @@ Basis: analysis of the repository as read (Rust kernel, mlibc port,
 - [ ] `SIGIO`: `F_SETOWN`, `F_SETSIG`, `O_ASYNC`
 
 ### 2.2 Shared memory
-- [ ] `MAP_SHARED` on files (at least on tmpfs, ideally a real page cache)
-- [ ] `ftruncate` / `fallocate`
-- [ ] `shm_open` + `/dev/shm` (tmpfs)
+- [x] `MAP_SHARED` on tmpfs files (file frames mapped directly; other file systems answer `-ENODEV`, a real page cache stays optional)
+- [x] `ftruncate` / `truncate` / `fallocate` (syscalls 113..115)
+- [x] `/dev/shm` (tmpfs, 32 MiB) + `memfd_create` (116); `shm_open` = mlibc's open on `/dev/shm`, **to verify at mlibc build time**; unlinked-but-open files stay alive
 - [ ] `memfd_create`
 - [ ] SysV `shmget` / `shmat` / `shmdt` / `shmctl` (MIT-SHM)
 

@@ -1293,9 +1293,11 @@ impl AddressSpace {
                     }
                     // SAFETY: as above.
                     pte = unsafe { (slot as *const u64).read_volatile() };
-                } else if crate::mem::cow::refcount(pte & PHYS_MASK) > 1 {
+                } else if pte & SHARED == 0 && crate::mem::cow::refcount(pte & PHYS_MASK) > 1 {
                     // A shared read-only page (code / rodata a fork sibling
-                    // maps too): copy before handing out the write.
+                    // maps too): copy before handing out the write.  A
+                    // MAP_SHARED page (SHARED bit) is the exception: its
+                    // whole point is that every mapper sees the writes.
                     let phys = pte & PHYS_MASK;
                     let Some(fresh) = crate::mem::pmm::alloc_page() else { return false };
                     let (src, dst) = match (phys_access(phys), phys_access(fresh)) {
@@ -1324,7 +1326,7 @@ impl AddressSpace {
             // The plain rewrite: keep the frame and the COW bit (a COW page
             // staying read-only keeps its copy-on-write contract), set /
             // clear RW and NX per the asked protection.
-            let mut npte = (pte & PHYS_MASK) | P | US;
+            let mut npte = (pte & PHYS_MASK) | P | US | (pte & SHARED);
             if w {
                 npte |= RW;
             }

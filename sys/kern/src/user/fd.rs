@@ -2017,6 +2017,116 @@ pub fn sys_fsync(fd: u64) -> i64 {
     }
 }
 
+// ------------------------------------- shared memory (phase 2.2 for Xorg)
+
+const EOPNOTSUPP: i64 = 95;
+
+/// `ftruncate(fd, length)` (syscall 113): set the length of an open,
+/// writable regular file.  A tmpfs growth only adds holes (no memory until a
+/// page is written or mapped), a shrink frees the frames past the new end.
+pub fn sys_ftruncate(fd: u64, len: u64) -> i64 {
+    let desc = match desc_of_or_errno(fd) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    if (len as i64) < 0 {
+        return -EINVAL;
+    }
+    match &desc.kind {
+        Kind::Vfs(slot) => {
+            if desc.flags() & O_WRITE == 0 {
+                return -EINVAL; // not open for writing (the Linux answer)
+            }
+            crate::fs::fsys::vfs().ftruncate(*slot, len).map_or_else(|e| -fs_errno(e), |_| 0)
+        }
+        _ => -EINVAL, // pipes, sockets, devices: nothing to resize
+    }
+}
+
+/// `truncate(path, length)` (syscall 114): the same by path, with the
+/// write-permission check of the VFS.
+pub fn sys_truncate(path_p: u64, len: u64) -> i64 {
+    let abs = match user_path(path_p) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if (len as i64) < 0 {
+        return -EINVAL;
+    }
+    crate::fs::fsys::vfs().truncate(&abs, len).map_or_else(|e| -fs_errno(e), |_| 0)
+}
+
+/// `fallocate(fd, mode, offset, len)` (syscall 115): the plain form and
+/// `FALLOC_FL_KEEP_SIZE` -- hole punching and the other modes answer
+/// -EOPNOTSUPP.
+pub fn sys_fallocate(fd: u64, mode: u64, off: u64, len: u64) -> i64 {
+    const FALLOC_FL_KEEP_SIZE: u64 = 1;
+    let desc = match desc_of_or_errno(fd) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    if mode & !FALLOC_FL_KEEP_SIZE != 0 {
+        return -EOPNOTSUPP;
+    }
+    if (off as i64) < 0 || (len as i64) <= 0 {
+        return -EINVAL;
+    }
+    match &desc.kind {
+        Kind::Vfs(slot) => crate::fs::fsys::vfs()
+            .fallocate_fd(*slot, off, len, mode & FALLOC_FL_KEEP_SIZE != 0)
+            .map_or_else(|e| -fs_errno(e), |_| 0),
+        _ => -ENODEV,
+    }
+}
+
+/// `memfd_create(name, flags)` (syscall 116): an anonymous file in RAM,
+/// readable, writable, resizable and mappable MAP_SHARED -- the descriptor
+/// Wayland / Mesa / MIT-SHM style clients pass around with SCM_RIGHTS.
+///
+/// It is a file of the /dev/shm tmpfs created and unlinked on the spot (the
+/// tmpfs keeps an unlinked file alive while a descriptor holds it), so it
+/// vanishes with its last descriptor and mapping.  `name` is only a label
+/// (/proc/self/fd shows it), at most 249 bytes.  MFD_CLOEXEC is honoured;
+/// MFD_ALLOW_SEALING is accepted but sealing itself (F_ADD_SEALS) is not
+/// implemented.  Without a /dev/shm mount the answer is -ENOSYS.
+pub fn sys_memfd_create(name_p: u64, flags: u64) -> i64 {
+    const MFD_CLOEXEC: u64 = 1;
+    const MFD_ALLOW_SEALING: u64 = 2;
+    static SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING) != 0 {
+        return -EINVAL;
+    }
+    let Some(cur) = process::current() else { return -EFAULT };
+    let name = {
+        let Some(aspace) = cur.aspace.as_ref() else { return -EFAULT };
+        match crate::user::syscall::read_user_cstr(aspace, name_p, 249) {
+            Ok(v) => String::from_utf8_lossy(&v).into_owned(),
+            Err(-7) => return -EINVAL, // over memfd's 249-byte name limit
+            Err(e) => return e,
+        }
+    };
+    let n = SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let path = alloc::format!("/dev/shm/.memfd-{}-{}", process::getpid(), n);
+    let vfs = crate::fs::fsys::vfs();
+    vfs.create_mode = 0o600;
+    let slot = match vfs.open_desc(&path, O_READ | O_WRITE | O_CREATE | O_EXCL) {
+        Ok(Opened::File(slot)) => slot,
+        Ok(_) => return -ENODEV,
+        Err(FsError::NotFound) => return -ENOSYS, // no /dev/shm mounted
+        Err(e) => return -fs_errno(e),
+    };
+    // Anonymous from here on: the name goes, the open slot keeps the file.
+    if let Err(e) = vfs.unlink(&path) {
+        let _ = vfs.close(slot);
+        return -fs_errno(e);
+    }
+    let desc = Rc::new(FileDesc::with_path(Kind::Vfs(slot), O_READ | O_WRITE, alloc::format!("/memfd:{}", name)));
+    match cur.fds.install(desc, flags & MFD_CLOEXEC != 0) {
+        Some(fd) => fd as i64,
+        None => -EMFILE,
+    }
+}
+
 /// `chmod(path, mode)` (syscall 64): the permission bits of a file the
 /// walk finds -- the VFS call the kernel shell's `chmod` command already
 /// speaks, on ext4 through the journal, on tmpfs in memory.
