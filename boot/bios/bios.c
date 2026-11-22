@@ -79,18 +79,53 @@ void plat_idle(void)
     bios_call(&r);
 }
 
+/* INT 16h AH=01h: the key waiting in the BIOS buffer, without taking it.
+ * Returns its AX (ascii | scan << 8), or -1 when the buffer is empty. */
+static int bios_key_peek(void)
+{
+    struct bios_regs r = { 0 };
+    r.intno = 0x16; r.eax = 0x0100;
+    bios_call(&r);
+    if (r.eflags & FLAG_ZF) return -1;
+    return (int)(r.eax & 0xFFFF);
+}
+
+/* Some BIOSes (seen on an ASRock board with a USB keyboard) queue a
+ * navigation key twice for one press -- the menu then moved two entries
+ * where other machines moved one.  The interrupt that delivers the second
+ * copy is only let through while a BIOS call runs (boot1's thunk does an
+ * `sti` around the INT only), so wait a few ms in a call that lets it in,
+ * then swallow identical copies that are already queued.  A person cannot
+ * press a key twice in 8 ms, and a held key repeats every 33 ms or more, so
+ * real presses and auto-repeat are untouched; at worst a pile-up of repeats
+ * behind a slow redraw collapses into one step. */
+static void bios_key_coalesce(int ax)
+{
+    plat_sleep(8);
+    for (int n = 0; n < 8; n++) {
+        if (bios_key_peek() != ax) break;
+        struct bios_regs r = { 0 };
+        r.intno = 0x16; r.eax = 0x0000;
+        bios_call(&r);                      /* take and drop the copy */
+    }
+}
+
 int plat_key_poll(void)
 {
     int k = serial_key();
     if (k) return k;
+    if (bios_key_peek() < 0) return 0;
     struct bios_regs r = { 0 };
-    r.intno = 0x16; r.eax = 0x0100;
-    bios_call(&r);
-    if (r.eflags & FLAG_ZF) return 0;
     r.intno = 0x16; r.eax = 0x0000;
     bios_call(&r);
     int ascii = r.eax & 0xFF, scan = (r.eax >> 8) & 0xFF;
     if (ascii && ascii != 0xE0) return ascii;
+    switch (scan) {
+    case 0x48: case 0x50: case 0x4B: case 0x4D:    /* arrows */
+    case 0x47: case 0x4F: case 0x49: case 0x51:    /* home end pgup pgdn */
+        bios_key_coalesce((int)(r.eax & 0xFFFF));
+        break;
+    }
     switch (scan) {
     case 0x48: return KEY_UP;   case 0x50: return KEY_DOWN;
     case 0x4B: return KEY_LEFT; case 0x4D: return KEY_RIGHT;
