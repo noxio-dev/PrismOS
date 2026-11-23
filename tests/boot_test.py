@@ -8,6 +8,14 @@ the serial console.
 
     tests/boot_test.py build/prismos.img [qemu] [ovmf_code] [ovmf_vars]
 
+QEMU runs with KVM when /dev/kvm is usable (PRISM_KVM=0 forces TCG,
+PRISM_KVM=1 asks for KVM), and every autoboot scenario boots verbose: the
+test builds build/prismos-verbose.img (loader.conf kernel_options="-v") next
+to the rescue image.  The two `boot -v` prompt scenarios keep the image as
+built.  PRISM_SCENARIOS="text,..." runs only the scenarios whose name
+contains one of the substrings.  The keyboard-setup menu that /etc/rc opens
+is answered with "2" (US) by run_vm.
+
 Each scenario starts a fresh VM, optionally sends keystrokes when a given
 text shows up, and succeeds when every expected string has been seen before
 the timeout.  Expectations are substrings of the whole serial output, or
@@ -43,6 +51,9 @@ import subprocess
 import sys
 import tempfile
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from qemu_common import KBD_ANSWER, KBD_PROMPT, kvm_usable  # noqa: E402
 
 
 def kernel_version():
@@ -99,6 +110,7 @@ def run_vm(cmd, steps, expect, timeout, autologin=False):
     steps = list(steps)
     deadline = time.time() + timeout
     login_sent = 0
+    kbd_sent = 0
     try:
         while time.time() < deadline:
             r, _, _ = select.select([proc.stdout], [], [], 0.2)
@@ -109,6 +121,16 @@ def run_vm(cmd, steps, expect, timeout, autologin=False):
                 out += chunk
                 sys.stdout.write(chunk.decode("latin-1", errors="replace"))
                 sys.stdout.flush()
+            # /etc/keyboard-setup (run by /etc/rc) blocks on a layout menu.
+            # Answer it as soon as it is shown -- US (2), so the scripted
+            # keystrokes below keep their QWERTY meaning -- instead of
+            # waiting for the tty read to give up with EOF.
+            seen = out.count(KBD_PROMPT.encode())
+            if seen > kbd_sent:
+                kbd_sent = seen
+                time.sleep(0.2)
+                proc.stdin.write(KBD_ANSWER)
+                proc.stdin.flush()
             if autologin:
                 # Every re-printed login prompt gets a fast root: the login
                 # process's blocking read dies with EAGAIN after 10 s (the
@@ -153,8 +175,12 @@ def main():
     code = sys.argv[3] if len(sys.argv) > 3 else ""
     vars_ = sys.argv[4] if len(sys.argv) > 4 else ""
 
-    base = [qemu, "-m", "256M", "-display", "none", "-no-reboot",
+    use_kvm = kvm_usable()
+    base = [qemu] + (["-enable-kvm"] if use_kvm else []) + [
+            "-m", "256M", "-display", "none", "-no-reboot",
             "-chardev", "stdio,id=ser,signal=off", "-serial", "chardev:ser"]
+    print("note: QEMU runs with %s" % ("KVM" if use_kvm else "TCG (software emulation)"),
+          flush=True)
     tmp = tempfile.mkdtemp()
     work = os.path.join(tmp, "disk.img")
     fswork = os.path.join(tmp, "fsdisk.img")
@@ -165,9 +191,13 @@ def main():
                 "-drive", "id=boot,file=%s,format=raw,if=none" % disk,
                 "-device", "ide-hd,drive=boot,bus=ahci0.0"]
 
-    def bios_cmd():
-        shutil.copyfile(image, work)
+    def bios_cmd(img=None):
+        shutil.copyfile(img or verbose_img, work)
         return base + ahci_boot(work)
+
+    def bios_plain_cmd():
+        """the image as built: the loader prompt gets to type `boot -v`"""
+        return bios_cmd(image)
 
     # an extra bare ext4 disk (no boot tree): the loader must skip it and the
     # kernel must still pick the boot disk's P3 as its root
@@ -186,8 +216,8 @@ def main():
         return ["-drive", "id=data,file=%s,format=raw,if=none" % data,
                 "-device", "ide-hd,drive=data,bus=ahci0.1"]
 
-    def uefi_cmd():
-        shutil.copyfile(image, work)
+    def uefi_cmd(img=None):
+        shutil.copyfile(img or verbose_img, work)
         v = os.path.join(tmp, "vars.fd")
         shutil.copyfile(vars_, v)
         cmd = base + ["-drive", "if=pflash,format=raw,readonly=on,file=" + code,
@@ -195,6 +225,10 @@ def main():
         if have_fs:
             cmd += data_drive()
         return cmd
+
+    def uefi_plain_cmd():
+        """the image as built: the loader prompt gets to type `boot -v`"""
+        return uefi_cmd(image)
 
     # ---- boot-report expectations -----------------------------------------
     # The unqualified boot lines (no -v): the CSPRNG seeding and the two vfs
@@ -217,7 +251,8 @@ def main():
         "starting pid 2, tty '': '/etc/init.d/rcS'",
         "PrismOS: system startup",
         "S00mounts", "S05hostname", "S10keymap",
-        "Keyboard layout successfully loaded!",
+        KBD_PROMPT,
+        "Keyboard layout 'us' loaded successfully.",
         "PrismOS: startup complete",
         "tty '/dev/ttyS0': '-/bin/login'",
         LOGIN_PROMPT,
@@ -242,7 +277,7 @@ def main():
         "kernel   : 6144 KiB at phys 0x200000, virt 0xffffffff80200000",
         "display  : 1920x1080 framebuffer",
         "cpu      : QEMU Virtual CPU version 2.5+",
-        "machine  : QEMU (TCG",
+        "machine  : " + ("KVM" if use_kvm else "QEMU (TCG"),
         "gdt/tss  : loaded (code 0x8, data 0x10, tss 0x28)",
         "idt      : 256 gates, exceptions 0..20 + irqs 0x20..0x2f",
         "pic      : 8259 remapped to 0x20..0x2f, all lines masked",
@@ -283,31 +318,34 @@ def main():
     # fast, because the login's read dies after 10 s without input).
     build = os.path.dirname(os.path.abspath(image))
 
-    def make_rescue():
-        rescue = os.path.join(build, "prismos-rescue.img")
-        rroot = os.path.join(build, "root-rescue")
-        conf = os.path.join(rroot, "boot", "loader.conf")
-        fresh = not (os.path.exists(rescue) and os.path.exists(conf))
+    def make_variant(name, options, why):
+        """A copy of the image whose /boot/loader.conf carries
+        kernel_options="<options>" (the same root tree, rebuilt with the
+        same tools).  Rebuilt whenever the tree it embeds is newer."""
+        img = os.path.join(build, "prismos-%s.img" % name)
+        vroot = os.path.join(build, "root-%s" % name)
+        conf = os.path.join(vroot, "boot", "loader.conf")
+        want = 'kernel_options="%s"' % options
+        fresh = not (os.path.exists(img) and os.path.exists(conf))
         if not fresh:
             with open(conf) as f:
-                fresh = "init=kshell" not in f.read()
-        # The tree the rescue image embeds must follow the root it was
-        # copied from: a newer kernel / app build (root.stamp) means the
-        # copy -- and the image -- are stale.
+                fresh = want not in f.read()
+        # The tree the image embeds must follow the root it was copied
+        # from: a newer kernel / app build (root.stamp) means the copy --
+        # and the image -- are stale.
         stamp = os.path.join(build, "root.stamp")
         if not fresh and os.path.exists(stamp):
-            fresh = os.path.getmtime(stamp) > os.path.getmtime(rescue)
+            fresh = os.path.getmtime(stamp) > os.path.getmtime(img)
         if fresh:
-            if os.path.exists(rroot):
-                shutil.rmtree(rroot)
+            if os.path.exists(vroot):
+                shutil.rmtree(vroot)
             # symlinks=True: the usr-merge /bin -> usr/bin must survive
             # the copy as the link it is (copytree's default FOLLOWS it
             # and pastes the target directory in its place, which the
             # image builder's usr-merge check then rightly refuses).
-            shutil.copytree(os.path.join(build, "root"), rroot, symlinks=True)
+            shutil.copytree(os.path.join(build, "root"), vroot, symlinks=True)
             with open(conf, "a") as f:
-                f.write('\n# rescue boot: the kernel shell instead of /sbin/init\n'
-                        'kernel_options="init=kshell"\n')
+                f.write('\n# %s\n%s\n' % (why, want))
             mkimage = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    "..", "tools", "mkimage.py")
             subprocess.run([sys.executable, mkimage,
@@ -315,8 +353,19 @@ def main():
                             "--boot1", os.path.join(build, "boot1.bin"),
                             "--loader", os.path.join(build, "loader.bin"),
                             "--esp-dir", os.path.join(build, "esp"),
-                            "--root-dir", rroot, "-o", rescue], check=True)
-        return rescue
+                            "--root-dir", vroot, "-o", img], check=True)
+        return img
+
+    def make_rescue():
+        # the kernel shell instead of /sbin/init -- and the verbose report
+        return make_variant("rescue", "-v init=kshell",
+                            "rescue boot: the kernel shell instead of /sbin/init")
+
+    # Every autoboot scenario runs verbose: the default image is rebuilt
+    # with kernel_options="-v", so the whole kernel boot report is in each
+    # run's log.  The scenarios that drive the loader's own `boot -v` keep
+    # the image as built (kernel_options empty), else -v would be given twice.
+    verbose_img = make_variant("verbose", "-v", "verbose boot: the kernel report on every run")
 
     rescue = make_rescue()
 
@@ -349,7 +398,7 @@ def main():
         # The framebuffer lines are -v-only now: the autoboot expectations
         # are the brief kernel lines plus init's whole hand-over.
         ("BIOS autoboot: loader, init hand-over, login", bios_cmd, [], userland_start, 60),
-        ("BIOS prompt: Esc, then boot -v (kernel report)", bios_cmd,
+        ("BIOS prompt: Esc, then boot -v (kernel report)", bios_plain_cmd,
          [("Autoboot in", "\x1b"), ("OK ", "boot -v\r")],
          ["OK ", "PrismOS loader (bios)", "Loading kernel /boot/kernel/kernel"]
          + verbose_report + [LOGIN_PROMPT], 60),
@@ -526,7 +575,7 @@ def main():
         scenarios += [
             ("UEFI autoboot: loader, init hand-over, login", uefi_cmd, [],
              userland_start + ["PrismOS loader (uefi)", "prismos login:"], 120),
-            ("UEFI prompt: Esc, lsmem, boot -v", uefi_cmd,
+            ("UEFI prompt: Esc, lsmem, boot -v", uefi_plain_cmd,
              [("Autoboot in", "\x1b"), ("OK ", "lsmem\rboot -v\r")],
              ["OK ", "usable", "Hello, world!", 'cmdline  : "-v"',
               "firmware : UEFI", LOGIN_PROMPT], 120),

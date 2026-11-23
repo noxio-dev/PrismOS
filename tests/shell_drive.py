@@ -4,6 +4,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from qemu_common import KBD_ANSWER, KBD_PROMPT, kvm_flags  # noqa: E402
+
 LOGIN_PROMPT = "prismos login:"
 
 
@@ -21,7 +24,8 @@ def run(image, cmds, timeout=60, extra=None, prompt=b"prism$ "):
     output as text."""
     # The disk on AHCI port 0 like the Makefile's run target: the kernel
     # only speaks AHCI, a bare -drive lands on IDE and boots nothing.
-    base = ["qemu-system-x86_64", "-m", "256M", "-display", "none", "-no-reboot",
+    base = ["qemu-system-x86_64"] + kvm_flags() + [
+            "-m", "256M", "-display", "none", "-no-reboot",
             "-chardev", "stdio,id=ser,signal=off", "-serial", "chardev:ser",
             "-device", "ahci,id=ahci0",
             "-drive", "id=boot,file=%s,format=raw,if=none" % image,
@@ -37,6 +41,7 @@ def run(image, cmds, timeout=60, extra=None, prompt=b"prism$ "):
     sent = 0
     last_data = time.time()
     login_sent = 0
+    kbd_sent = 0
     try:
         while time.time() < deadline:
             r, _, _ = select.select([proc.stdout], [], [], 0.2)
@@ -46,6 +51,13 @@ def run(image, cmds, timeout=60, extra=None, prompt=b"prism$ "):
                     break
                 out += chunk
                 last_data = time.time()
+            # /etc/keyboard-setup waits for a layout: answer it at once
+            seen_kbd = out.count(KBD_PROMPT.encode())
+            if seen_kbd > kbd_sent:
+                kbd_sent = seen_kbd
+                time.sleep(0.2)
+                proc.stdin.write(KBD_ANSWER)
+                proc.stdin.flush()
             # the login: every re-printed prompt gets one fast root (busybox
             # init respawns the login after the 10 s read death, and the
             # boot's own prompt is the first of them)

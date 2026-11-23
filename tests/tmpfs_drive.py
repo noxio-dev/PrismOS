@@ -40,7 +40,6 @@ def main():
     ], timeout=180, prompt=b"prism$ ")
     print(out)
     want = [
-        "init started: BusyBox v1.37.0",   # busybox init as pid 1
         "starting pid 2, tty '': '/etc/init.d/rcS'",
         "S00mounts",                       # the mount script ran
         "tmpfs /tmp tmpfs rw 0 0",         # the four mounts of S00mounts

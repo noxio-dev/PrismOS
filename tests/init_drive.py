@@ -76,7 +76,7 @@ def main():
         "cmdline", "cwd", "exe", "fd", "status",  # ls /proc/1's columns
         "(cat) R",                               # /proc/self/stat (comm, state)
         "ttyS0",                                 # /dev's serial node
-        "root::0:0:root:/:/usr/bin/sh",          # /etc/passwd (empty password)
+        "root::0:0:root:/root:/usr/bin/sh",      # /etc/passwd (empty password)
         "No space left on device",               # the /dev/full redirection
         "type 4 bytes (EXACTLY wxyz):",          # fd reached its stdin prompt
         "survived-interrupt",                    # the shell survived the ^C
@@ -96,7 +96,7 @@ def main():
     # appear twice (boot + respawn).
     if out.count("prismos login:") < 2:
         missing.append("the respawned login prompt")
-    if out.count("Welcome to PrismOS (busybox + ash, phase 3.4).") < 2:
+    if out.count("Welcome to PrismOS.") < 2:
         missing.append("the motd of the respawned session")
     if out.count("prism$ ") < 3:
         missing.append("the respawned session's prompt")
