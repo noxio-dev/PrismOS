@@ -41,6 +41,7 @@ pub mod ident;
 pub mod ident_rules;
 pub mod futex;
 pub mod process;
+pub mod rlimit_core;
 pub mod signal;
 pub mod sysc;
 pub mod syscall;

@@ -969,6 +969,210 @@ pub fn sys_umask(mask: u64) -> i64 {
     old as i64
 }
 
+// ------------------------------- resource limits, mlock, CPU affinity
+//
+// The Xorg step (phase 2.4): the calls a stock X server and its libraries make
+// at start-up and that must not answer -ENOSYS.  The rules of the limit table
+// live in user/rlimit_core.rs (host-tested); here is only the user-memory side.
+
+/// Read `buf.len()` bytes at the user address `p` of the calling process.
+fn rl_read_user(p: u64, buf: &mut [u8]) -> bool {
+    let Some(cur) = process::current() else { return false };
+    let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return false };
+    aspace.read(p, buf)
+}
+
+/// Write `data` at the user address `p` of the calling process.
+fn rl_write_user(p: u64, data: &[u8]) -> bool {
+    let Some(cur) = process::current() else { return false };
+    let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return false };
+    aspace.ensure_writable(p) && aspace.write(p, data, false)
+}
+
+/// `struct rlimit` (two u64: soft, hard) to and from its 16 bytes.
+fn rl_pack(l: crate::user::rlimit_core::Rlimit) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[0..8].copy_from_slice(&l.cur.to_le_bytes());
+    b[8..16].copy_from_slice(&l.max.to_le_bytes());
+    b
+}
+
+fn rl_unpack(b: &[u8; 16]) -> crate::user::rlimit_core::Rlimit {
+    let mut w = [0u8; 8];
+    w.copy_from_slice(&b[0..8]);
+    let cur = u64::from_le_bytes(w);
+    w.copy_from_slice(&b[8..16]);
+    crate::user::rlimit_core::Rlimit { cur, max: u64::from_le_bytes(w) }
+}
+
+/// `getrlimit(resource, rlim)` (syscall 117): `-EINVAL` for a resource that
+/// does not exist, `-EFAULT` for a buffer that will not take the answer.
+pub fn sys_getrlimit(res: u64, rlim_p: u64) -> i64 {
+    let Some(cur) = process::current() else { return -EFAULT };
+    let l = match cur.rlim.get(res) {
+        Ok(l) => l,
+        Err(e) => return e,
+    };
+    if rl_write_user(rlim_p, &rl_pack(l)) { 0 } else { -EFAULT }
+}
+
+/// `setrlimit(resource, rlim)` (syscall 118): the rules of
+/// `RlimitTable::set`; the caller is privileged when its effective uid is 0.
+/// The limits are stored and reported, not enforced.
+pub fn sys_setrlimit(res: u64, rlim_p: u64) -> i64 {
+    let mut b = [0u8; 16];
+    if !rl_read_user(rlim_p, &mut b) {
+        return -EFAULT;
+    }
+    let new = rl_unpack(&b);
+    let Some(cur) = process::current() else { return -EFAULT };
+    let privileged = cur.cred.euid == 0;
+    match cur.rlim.set(res, new, privileged) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// `prlimit64(pid, resource, new, old)` (syscall 119; `old` rides in r10):
+/// read and/or replace one limit in one call.  Only the caller's own limits
+/// are reachable (`pid` 0 or its own pid); another process is `-EPERM`.  As on
+/// Linux the old value is copied out after the new one is applied.
+pub fn sys_prlimit64(pid: u64, res: u64, new_p: u64, old_p: u64) -> i64 {
+    if pid != 0 && pid != process::getpid() {
+        return -crate::user::rlimit_core::EPERM;
+    }
+    let new = if new_p != 0 {
+        let mut b = [0u8; 16];
+        if !rl_read_user(new_p, &mut b) {
+            return -EFAULT;
+        }
+        Some(rl_unpack(&b))
+    } else {
+        None
+    };
+    let Some(cur) = process::current() else { return -EFAULT };
+    let old = match cur.rlim.get(res) {
+        Ok(l) => l,
+        Err(e) => return e,
+    };
+    if let Some(n) = new {
+        let privileged = cur.cred.euid == 0;
+        if let Err(e) = cur.rlim.set(res, n, privileged) {
+            return e;
+        }
+    }
+    if old_p != 0 && !rl_write_user(old_p, &rl_pack(old)) {
+        return -EFAULT;
+    }
+    0
+}
+
+/// The page-rounded `[start, end)` of a `mlock` / `munlock` range, or `None`
+/// when it wraps or leaves user space.
+fn lock_range(addr: u64, len: u64) -> Option<(u64, u64)> {
+    let end = addr.checked_add(len)?;
+    let start = addr & !(PAGE - 1);
+    let end = end.checked_add(PAGE - 1)? & !(PAGE - 1);
+    if start < USER_BASE || end > USER_END {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// True when every page of `[start, end)` is mapped (a PROT_NONE reservation
+/// counts, like on Linux).
+fn range_mapped(start: u64, end: u64) -> bool {
+    let Some(cur) = process::current() else { return false };
+    let Some(aspace): Option<&AddressSpace> = cur.aspace.as_ref() else { return false };
+    let mut v = start;
+    while v < end {
+        if aspace.range_free(v, PAGE) {
+            return false;
+        }
+        v += PAGE;
+    }
+    true
+}
+
+/// `mlock(addr, len)` (syscall 120): there is no swap, so every mapped page is
+/// already resident and locking is a check, not an action.  `len` 0 is a
+/// no-op; `-ENOMEM` when the range is not fully mapped or (unprivileged) is
+/// larger than the soft RLIMIT_MEMLOCK; `-EPERM` for an unprivileged caller
+/// whose RLIMIT_MEMLOCK is 0.
+pub fn sys_mlock(addr: u64, len: u64) -> i64 {
+    if len == 0 {
+        return 0;
+    }
+    let Some((start, end)) = lock_range(addr, len) else { return -ENOMEM };
+    let Some(cur) = process::current() else { return -EFAULT };
+    if cur.cred.euid != 0 {
+        use crate::user::rlimit_core::{RLIMIT_MEMLOCK, RLIM_INFINITY};
+        let soft = cur.rlim.get(RLIMIT_MEMLOCK).map_or(RLIM_INFINITY, |l| l.cur);
+        if soft == 0 {
+            return -crate::user::rlimit_core::EPERM;
+        }
+        if soft != RLIM_INFINITY && end - start > soft {
+            return -ENOMEM;
+        }
+    }
+    if range_mapped(start, end) { 0 } else { -ENOMEM }
+}
+
+/// `munlock(addr, len)` (syscall 121): the same range check, nothing to undo.
+pub fn sys_munlock(addr: u64, len: u64) -> i64 {
+    if len == 0 {
+        return 0;
+    }
+    let Some((start, end)) = lock_range(addr, len) else { return -ENOMEM };
+    if range_mapped(start, end) { 0 } else { -ENOMEM }
+}
+
+/// Size in bytes of the CPU mask the kernel speaks: one 64-bit word.  User
+/// processes run on a single CPU here, so the only valid mask is CPU 0.
+const CPUMASK_BYTES: u64 = 8;
+
+/// `-ESRCH` unless `pid` is 0 (the caller) or a process that exists.
+fn sched_target_ok(pid: u64) -> bool {
+    pid == 0 || process::with_pid_mut(pid, |_| ()).is_some()
+}
+
+/// `sched_getaffinity(pid, len, mask)` (syscall 122): like the Linux raw call,
+/// it needs `len` to be a multiple of 8 and at least 8, writes the 8-byte mask
+/// (CPU 0 only) and returns the number of bytes written.
+pub fn sys_sched_getaffinity(pid: u64, len: u64, mask_p: u64) -> i64 {
+    if len < CPUMASK_BYTES || len % 8 != 0 {
+        return -EINVAL;
+    }
+    if !sched_target_ok(pid) {
+        return -3; // ESRCH
+    }
+    if !rl_write_user(mask_p, &1u64.to_le_bytes()) {
+        return -EFAULT;
+    }
+    CPUMASK_BYTES as i64
+}
+
+/// `sched_setaffinity(pid, len, mask)` (syscall 123): accepted when the mask
+/// contains CPU 0 (the only CPU user processes run on), `-EINVAL` otherwise.
+/// Nothing to pin: it changes no scheduling.
+pub fn sys_sched_setaffinity(pid: u64, len: u64, mask_p: u64) -> i64 {
+    if len == 0 {
+        return -EINVAL;
+    }
+    let mut b = [0u8; 8];
+    let n = core::cmp::min(len, CPUMASK_BYTES) as usize;
+    if !rl_read_user(mask_p, &mut b[..n]) {
+        return -EFAULT;
+    }
+    if !sched_target_ok(pid) {
+        return -3; // ESRCH
+    }
+    if u64::from_le_bytes(b) & 1 == 0 {
+        return -EINVAL;
+    }
+    0
+}
+
 /// `gettimeofday(tv, tz)` (syscall 53): the realtime clock of
 /// `clock_gettime(CLOCK_REALTIME)` in `struct timeval` clothes (i64 sec,
 /// i64 usec).  `tz` is accepted and ignored, like on Linux.

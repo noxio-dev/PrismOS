@@ -621,6 +621,14 @@ epolltest:
 	rustc --edition 2021 --test tests/epoll_host.rs -o $(B)/epoll_host
 	$(B)/epoll_host --test-threads=1
 
+# Host-side tests of the resource-limit table (no QEMU needed): defaults, the
+# setrlimit(2) rules, the descriptor-table ceiling.
+.PHONY: rlimittest
+rlimittest:
+	mkdir -p $(B)
+	rustc --edition 2021 --test tests/rlimit_host.rs -o $(B)/rlimit_host
+	$(B)/rlimit_host --test-threads=1
+
 # Host-side tests of the thread-group logic (clone flags, thread exit, signal target).
 .PHONY: threadtest
 threadtest:

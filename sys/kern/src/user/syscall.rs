@@ -79,6 +79,12 @@
 //    115 fallocate(fd, mode, off, len)   116 memfd_create(name, flags)
 //           (phase 2.2 for Xorg: with MAP_SHARED on tmpfs files and /dev/shm,
 //           user/fd.rs and user/sysc.rs)
+//    117 getrlimit(res, rlim)       118 setrlimit(res, rlim)
+//    119 prlimit64(pid, res, new, old)   -- `old` in r10
+//    120 mlock(addr, len)           121 munlock(addr, len)
+//    122 sched_getaffinity(pid, len, mask)   123 sched_setaffinity(pid, len, mask)
+//           (phase 2.4 for Xorg: user/sysc.rs, the limit table in
+//           user/rlimit_core.rs)
 //
 // Phase 3.4 (the BusyBox step -- the gaps the port revealed):
 //    62 fchdir(fd)                  the directory an fd is open on
@@ -452,6 +458,14 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         114 => fd::sys_truncate(a0, a1),
         115 => fd::sys_fallocate(a0, a1, a2, frame.r10),
         116 => fd::sys_memfd_create(a0, a1),
+        // ---- limits, locking, CPU affinity: the Xorg step (phase 2.4) -----
+        117 => sysc::sys_getrlimit(a0, a1),
+        118 => sysc::sys_setrlimit(a0, a1),
+        119 => sysc::sys_prlimit64(a0, a1, a2, frame.r10),
+        120 => sysc::sys_mlock(a0, a1),
+        121 => sysc::sys_munlock(a0, a1),
+        122 => sysc::sys_sched_getaffinity(a0, a1, a2),
+        123 => sysc::sys_sched_setaffinity(a0, a1, a2),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

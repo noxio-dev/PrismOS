@@ -28,7 +28,6 @@ Basis: analysis of the repository as read (Rust kernel, mlibc port,
 - [x] `MAP_SHARED` on tmpfs files (file frames mapped directly; other file systems answer `-ENODEV`, a real page cache stays optional)
 - [x] `ftruncate` / `truncate` / `fallocate` (syscalls 113..115)
 - [x] `/dev/shm` (tmpfs, 32 MiB) + `memfd_create` (116); `shm_open` = mlibc's open on `/dev/shm`, **to verify at mlibc build time**; unlinked-but-open files stay alive
-- [ ] `memfd_create`
 - [ ] SysV `shmget` / `shmat` / `shmdt` / `shmctl` (MIT-SHM)
 
 ### 2.3 Event descriptors
@@ -38,9 +37,14 @@ Basis: analysis of the repository as read (Rust kernel, mlibc port,
 - [ ] `epoll_pwait`
 
 ### 2.4 Miscellaneous syscalls
-- [ ] `getrlimit` / `setrlimit` / `prlimit64`
-- [ ] `mlock` / `munlock`
-- [ ] `sched_*` (at least `sched_getaffinity`, `sched_yield`)
+- [x] `getrlimit` / `setrlimit` / `prlimit64` (117..119, kernel side: stored and
+      reported, **not enforced**; defaults are the real system sizes; **mlibc sysdep to wire**)
+- [x] `mlock` / `munlock` (120, 121: a range check, there is no swap; **mlibc sysdep to wire**)
+- [x] `sched_getaffinity` / `sched_setaffinity` (122, 123: one CPU, mask `0x1`);
+      `sched_yield` is the existing syscall 4 (`Yield` sysdep already there);
+      **mlibc sysdep to wire**
+- [ ] kernel not compiled yet for these: the build target (`x86_64-unknown-none`) was not
+      available in the session that wrote them -- run `make kernel` first
 - [ ] `O_DIRECTORY`, `*at()` calls (`openat`, `fstatat`, ...) beyond `AT_FDCWD`
 
 ### 2.4b Networking / hardware discovery

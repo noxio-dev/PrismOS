@@ -17,7 +17,7 @@ Linux-like, x86-64 `syscall` instruction:
 | `rcx`, `r11` | clobbered by the CPU |
 
 * Success returns a value `>= 0`; failure returns `-errno` (Linux numbering).
-* An unknown number returns `-ENOSYS`. Numbers 0..112 are assigned; 113 and up
+* An unknown number returns `-ENOSYS`. Numbers 0..123 are assigned; 124 and up
   are not.
 * A pending signal is delivered between the return value and `sysretq`.
 * `exit` never returns. `execve` returns only on failure, and the caller is
@@ -172,6 +172,34 @@ Only a few requests are answered:
 * `FIONREAD` / `FIONBIO` on sockets.
 
 Anything else returns `-ENOTTY`.
+
+## Limits, memory locking, CPU affinity
+
+Implemented in `user/sysc.rs`; the limit table and its rules are in
+`user/rlimit_core.rs` (`make rlimittest`).
+
+| # | Call | Notes |
+|---|------|-------|
+| 117 | `getrlimit(resource, rlim)` | `struct rlimit` = two u64 (soft, hard); `-EINVAL` for a resource >= 16 |
+| 118 | `setrlimit(resource, rlim)` | `-EINVAL` if soft > hard; `-EPERM` if a caller with euid != 0 raises the hard limit; RLIMIT_NOFILE's hard limit can never pass 64 (the descriptor table), even for root |
+| 119 | `prlimit64(pid, resource, new, old)` | `old` in `r10`; `pid` must be 0 or the caller's own, otherwise `-EPERM`; the old value is copied out after the new one is applied |
+| 120 | `mlock(addr, len)` | there is no swap, so this is a check: `-ENOMEM` if the page-rounded range is not fully mapped or an unprivileged caller exceeds the soft RLIMIT_MEMLOCK, `-EPERM` if that limit is 0; `len` 0 succeeds |
+| 121 | `munlock(addr, len)` | same range check, nothing to undo |
+| 122 | `sched_getaffinity(pid, len, mask)` | `len` must be a multiple of 8, at least 8; writes an 8-byte mask (CPU 0 only) and returns 8; `-ESRCH` for an unknown pid |
+| 123 | `sched_setaffinity(pid, len, mask)` | accepted when the mask contains CPU 0, `-EINVAL` otherwise; pins nothing |
+
+Differences from Linux:
+
+* limits are stored, reported and copied by `fork` / `clone`, but **not
+  enforced**: lowering RLIMIT_NOFILE does not stop `open` before 64 descriptors,
+  RLIMIT_AS does not stop `mmap`. The defaults are the real system sizes
+  rather than Linux's: RLIMIT_STACK 16 KiB (the fixed user stack),
+  RLIMIT_NOFILE 64 (`MAX_FDS`), RLIMIT_CORE 0 soft / unlimited hard, the rest
+  unlimited;
+* `mlock` / `munlock` have no effect on residency (nothing is ever swapped);
+* user processes run on one CPU, so the affinity mask is always `0x1`;
+* `sched_yield` is syscall 4 (`yield`); there is no `sched_setscheduler` /
+  `sched_getparam` family.
 
 ## Time and system
 

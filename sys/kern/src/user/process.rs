@@ -226,6 +226,10 @@ pub struct Process {
     /// `fork` and `execve` (POSIX).  File creation through `open` keeps the
     /// VFS's fixed mode until chmod lands (roadmap 3.4.2).
     pub umask: u16,
+    /// Resource limits (getrlimit / setrlimit / prlimit64): stored and
+    /// reported, copied by `fork` and `clone`.  Not enforced yet, except that
+    /// the descriptor table and the user stack have fixed sizes of their own.
+    pub rlim: crate::user::rlimit_core::RlimitTable,
     /// Identity (phase 3.5.3): real/effective ids and supplementary groups,
     /// plus the saved set-user/group ids.  Inherited by fork, changed by
     /// set*id and by setuid/setgid binaries at execve.
@@ -598,6 +602,10 @@ fn spawn_common(
         argv: Vec::new(),
         exe: String::new(),
         umask: 0o022,
+        rlim: crate::user::rlimit_core::RlimitTable::new(
+            crate::user::usermode::USER_STACK_SIZE,
+            crate::user::fd::MAX_FDS as u64,
+        ),
         cred: crate::fs::vfs::Cred::ROOT,
         suid: 0,
         sgid: 0,
@@ -771,6 +779,7 @@ pub fn fork_current(frame: &IsrFrame) -> i64 {
     // The child keeps the caller's command line, binary path and umask
     // (phase 3.3): /proc must show what the process tree is.
     let (argv, exe, umask) = (cur.argv.clone(), cur.exe.clone(), cur.umask);
+    let rlim = cur.rlim;
     let (cred, suid, sgid) = (cur.cred, cur.suid, cur.sgid);
     // And its session / process group / controlling terminal (phase 3.3.4):
     // a forked child joins nothing, it is born where the parent is.
@@ -821,6 +830,7 @@ pub fn fork_current(frame: &IsrFrame) -> i64 {
                 c.argv = argv;
                 c.exe = exe;
                 c.umask = umask;
+                c.rlim = rlim;
                 c.cred = cred;
                 c.suid = suid;
                 c.sgid = sgid;
@@ -1876,6 +1886,7 @@ pub fn clone_current(frame: &IsrFrame, flags: u64, stack: u64, ptid: u64, ctid: 
     let mut signals = cur.signals.fork_copy();
     signals.disable_altstack();
     let (argv, exe, umask) = (cur.argv.clone(), cur.exe.clone(), cur.umask);
+    let rlim = cur.rlim;
     let (cred, suid, sgid) = (cur.cred, cur.suid, cur.sgid);
     let (pgid, sid, ctty) = (cur.pgid, cur.sid, cur.ctty);
     let (cwd, tgid, ppid, budget) = (cur.cwd.clone(), cur.tgid, cur.ppid, cur.budget);
@@ -1921,6 +1932,7 @@ pub fn clone_current(frame: &IsrFrame, flags: u64, stack: u64, ptid: u64, ctid: 
                 c.argv = argv;
                 c.exe = exe;
                 c.umask = umask;
+                c.rlim = rlim;
                 c.cred = cred;
                 c.suid = suid;
                 c.sgid = sgid;

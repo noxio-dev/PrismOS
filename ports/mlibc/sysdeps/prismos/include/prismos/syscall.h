@@ -143,6 +143,14 @@ enum {
         PRISM_SYS_TRUNCATE = 114,    /* truncate(path, length) */
         PRISM_SYS_FALLOCATE = 115,   /* fallocate(fd, mode, offset, len) -- plain and KEEP_SIZE only */
         PRISM_SYS_MEMFD_CREATE = 116, /* memfd_create(name, flags) -- a /dev/shm file, anonymous */
+        /* limits, locking, CPU affinity (kernel user/sysc.rs, table in user/rlimit_core.rs) */
+        PRISM_SYS_GETRLIMIT = 117,   /* getrlimit(resource, &rlim) */
+        PRISM_SYS_SETRLIMIT = 118,   /* setrlimit(resource, &rlim) */
+        PRISM_SYS_PRLIMIT64 = 119,   /* prlimit64(pid, resource, &new, &old) -- own pid or 0 only */
+        PRISM_SYS_MLOCK = 120,       /* mlock(addr, len) -- a range check, there is no swap */
+        PRISM_SYS_MUNLOCK = 121,     /* munlock(addr, len) */
+        PRISM_SYS_SCHED_GETAFFINITY = 122, /* sched_getaffinity(pid, len, &mask) -- returns bytes written */
+        PRISM_SYS_SCHED_SETAFFINITY = 123, /* sched_setaffinity(pid, len, &mask) */
 };
 
 /* arch_prctl() codes -- the Linux x86-64 values the kernel expects. */
