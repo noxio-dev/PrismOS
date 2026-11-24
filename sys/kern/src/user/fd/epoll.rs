@@ -165,6 +165,34 @@ pub fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, ev_p: u64) -> i64 {
     }
 }
 
+/// `epoll_pwait(epfd, events, maxevents, timeout_ms, sigmask, sigsetsize)`
+/// (125): `epoll_wait` with the blocked mask swapped for `sigmask` for the
+/// duration of the call (NULL = plain `epoll_wait`).  `sigsetsize` must be 8,
+/// the kernel's mask width.  When a signal interrupts the wait the temporary
+/// mask stays until the handler has run, and `sigreturn` then restores the
+/// caller's own (see `signal::restore_mask_after_delivery`); in every other
+/// outcome the caller's mask is back before the call returns.
+pub fn sys_epoll_pwait(epfd: u64, ev_p: u64, max: u64, timeout: u64, mask_p: u64, size: u64) -> i64 {
+    if mask_p == 0 {
+        return sys_epoll_wait(epfd, ev_p, max, timeout);
+    }
+    if size != 8 {
+        return -EINVAL;
+    }
+    let mut raw = [0u8; 8];
+    if !copy_in(mask_p, 0, &mut raw) {
+        return -EFAULT;
+    }
+    let Some(old) = signal::swap_mask(u64::from_le_bytes(raw)) else { return -EFAULT };
+    let r = sys_epoll_wait(epfd, ev_p, max, timeout);
+    if r == -EINTR {
+        signal::restore_mask_after_delivery(old);
+    } else {
+        signal::restore_mask(old);
+    }
+    r
+}
+
 /// `epoll_wait(epfd, events, maxevents, timeout_ms)` (111).
 pub fn sys_epoll_wait(epfd: u64, ev_p: u64, max: u64, timeout: u64) -> i64 {
     let ep = match desc_of_or_errno(epfd) {

@@ -17,7 +17,7 @@ Linux-like, x86-64 `syscall` instruction:
 | `rcx`, `r11` | clobbered by the CPU |
 
 * Success returns a value `>= 0`; failure returns `-errno` (Linux numbering).
-* An unknown number returns `-ENOSYS`. Numbers 0..123 are assigned; 124 and up
+* An unknown number returns `-ENOSYS`. Numbers 0..125 are assigned; 126 and up
   are not.
 * A pending signal is delivered between the return value and `sysretq`.
 * `exit` never returns. `execve` returns only on failure, and the caller is
@@ -126,6 +126,8 @@ Implemented in `user/fd/epoll.rs` over the host-tested interest list
 | 114 | `truncate(path, len)` | same, by path, with the VFS write-permission check |
 | 115 | `fallocate(fd, mode, off, len)` | mode 0 and `FALLOC_FL_KEEP_SIZE` only; other modes `-EOPNOTSUPP` |
 | 116 | `memfd_create(name, flags)` | anonymous file on `/dev/shm` (created then unlinked), `MFD_CLOEXEC` honoured, `MFD_ALLOW_SEALING` accepted but no seals; `-ENOSYS` without `/dev/shm` |
+| 124 | `eventfd2(initval, flags)` | a 64-bit counter descriptor (`user/fd/eventfd.rs`, rules in `user/eventfd_core.rs`, `make eventfdtest`); `EFD_SEMAPHORE` (1), `EFD_NONBLOCK`, `EFD_CLOEXEC`: both the Linux values (04000, 02000000) and this port's `O_NONBLOCK` / `O_CLOEXEC` (0100, 0200) are accepted; any other bit is `-EINVAL` |
+| 125 | `epoll_pwait(epfd, events, maxevents, timeout_ms, sigmask, sigsetsize)` | 4th..6th arguments in `r10`, `r8`, `r9`; `sigmask` NULL is plain `epoll_wait`; `sigsetsize` must be 8, else `-EINVAL` |
 
 `struct epoll_event` is the packed 12-byte x86-64 layout (`u32 events`, `u64
 data`). Supported: `EPOLLIN/OUT/ERR/HUP/RDHUP` (plus the `RDNORM`/`WRNORM`/band
@@ -143,8 +145,26 @@ Differences from Linux:
   readable pipe is not a new edge;
 * a timeout above 10 s is capped like every bounded wait here (`poll` does the
   same), and a negative timeout re-arms the cap and waits for an event;
-* `epoll_pwait` with a signal mask is `-ENOSYS` (the mlibc sysdep refuses it);
+* `epoll_pwait` swaps the blocked mask for the call. When a signal ends the
+  wait (`-EINTR`) the temporary mask stays until the handler has run and
+  `sigreturn` restores the caller's own (`SignalState::saved_mask`); the
+  mlibc sysdep still has to be wired to syscall 125;
   `EPOLLEXCLUSIVE` / `EPOLLWAKEUP` are accepted and have no effect.
+
+### eventfd (124)
+
+`read` and `write` move exactly 8 bytes (a shorter buffer is `-EINVAL`). `read`
+returns the whole counter and resets it to 0 (in `EFD_SEMAPHORE` mode: returns 1
+and subtracts 1) and parks while it is 0. `write` adds the value, parks while
+the sum would pass `u64::MAX - 1`, and rejects `u64::MAX` with `-EINVAL`.
+`O_NONBLOCK` answers `-EAGAIN` at once instead of parking. A bad user pointer on
+`read` puts the counter back. Readable when the counter is above 0, writable
+when a write of 1 would fit, so `poll`, `select` and `epoll` all see it. A
+parked reader or writer is woken by the shared `unix::notify`.
+
+Differences from Linux: a wait is capped like every blocking call here (10 s,
+then `-EAGAIN`); `fsync` is `-EINVAL`; `fstat` reports a generic 0600 inode and
+`/proc/<pid>/fd` names it `anon_inode:[eventfd]`.
 
 ### `ioctl(fd, request, arg)` (29)
 

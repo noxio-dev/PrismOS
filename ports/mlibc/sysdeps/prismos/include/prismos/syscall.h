@@ -151,6 +151,8 @@ enum {
         PRISM_SYS_MUNLOCK = 121,     /* munlock(addr, len) */
         PRISM_SYS_SCHED_GETAFFINITY = 122, /* sched_getaffinity(pid, len, &mask) -- returns bytes written */
         PRISM_SYS_SCHED_SETAFFINITY = 123, /* sched_setaffinity(pid, len, &mask) */
+        PRISM_SYS_EVENTFD2 = 124,    /* eventfd2(initval, flags) */
+        PRISM_SYS_EPOLL_PWAIT = 125, /* epoll_pwait(epfd, ev, max, timeout, sigmask, sigsetsize) */
 };
 
 /* arch_prctl() codes -- the Linux x86-64 values the kernel expects. */

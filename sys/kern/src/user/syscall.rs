@@ -85,6 +85,9 @@
 //    122 sched_getaffinity(pid, len, mask)   123 sched_setaffinity(pid, len, mask)
 //           (phase 2.4 for Xorg: user/sysc.rs, the limit table in
 //           user/rlimit_core.rs)
+//    124 eventfd2(initval, flags)   (user/fd/eventfd.rs, counter in user/eventfd_core.rs)
+//    125 epoll_pwait(epfd, events, max, timeout, sigmask, sigsetsize)
+//           -- r10, r8, r9 carry the last three (user/fd/epoll.rs)
 //
 // Phase 3.4 (the BusyBox step -- the gaps the port revealed):
 //    62 fchdir(fd)                  the directory an fd is open on
@@ -466,6 +469,9 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         121 => sysc::sys_munlock(a0, a1),
         122 => sysc::sys_sched_getaffinity(a0, a1, a2),
         123 => sysc::sys_sched_setaffinity(a0, a1, a2),
+        // ---- eventfd and epoll_pwait: the Xorg step (phase 2.4) -----------
+        124 => fd::eventfd::sys_eventfd2(a0, a1),
+        125 => fd::epoll::sys_epoll_pwait(a0, a1, a2, frame.r10, frame.r8, frame.r9),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

@@ -629,6 +629,14 @@ rlimittest:
 	rustc --edition 2021 --test tests/rlimit_host.rs -o $(B)/rlimit_host
 	$(B)/rlimit_host --test-threads=1
 
+# Host-side tests of the eventfd counter (no QEMU needed): read / write /
+# semaphore mode / readiness / overflow.
+.PHONY: eventfdtest
+eventfdtest:
+	mkdir -p $(B)
+	rustc --edition 2021 --test tests/eventfd_host.rs -o $(B)/eventfd_host
+	$(B)/eventfd_host --test-threads=1
+
 # Host-side tests of the thread-group logic (clone flags, thread exit, signal target).
 .PHONY: threadtest
 threadtest:

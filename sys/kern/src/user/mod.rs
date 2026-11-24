@@ -40,6 +40,7 @@ pub mod fpu;
 pub mod ident;
 pub mod ident_rules;
 pub mod futex;
+pub mod eventfd_core;
 pub mod process;
 pub mod rlimit_core;
 pub mod signal;

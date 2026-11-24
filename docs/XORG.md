@@ -31,10 +31,10 @@ Basis: analysis of the repository as read (Rust kernel, mlibc port,
 - [ ] SysV `shmget` / `shmat` / `shmdt` / `shmctl` (MIT-SHM)
 
 ### 2.3 Event descriptors
-- [ ] `eventfd`
+- [x] `eventfd` (`eventfd2`, 124: counter, semaphore mode, O_NONBLOCK, poll / epoll readiness; host tests `make eventfdtest`; **mlibc sysdep to wire**)
 - [ ] `signalfd`
 - [ ] `timerfd`
-- [ ] `epoll_pwait`
+- [x] `epoll_pwait` (125: mask swap, restored after the handler on `-EINTR` via `SignalState::saved_mask`; **mlibc sysdep to wire**, it still refuses the call)
 
 ### 2.4 Miscellaneous syscalls
 - [x] `getrlimit` / `setrlimit` / `prlimit64` (117..119, kernel side: stored and
@@ -43,8 +43,6 @@ Basis: analysis of the repository as read (Rust kernel, mlibc port,
 - [x] `sched_getaffinity` / `sched_setaffinity` (122, 123: one CPU, mask `0x1`);
       `sched_yield` is the existing syscall 4 (`Yield` sysdep already there);
       **mlibc sysdep to wire**
-- [ ] kernel not compiled yet for these: the build target (`x86_64-unknown-none`) was not
-      available in the session that wrote them -- run `make kernel` first
 - [ ] `O_DIRECTORY`, `*at()` calls (`openat`, `fstatat`, ...) beyond `AT_FDCWD`
 
 ### 2.4b Networking / hardware discovery

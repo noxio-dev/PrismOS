@@ -281,6 +281,12 @@ pub struct SignalState {
     /// The alternate signal stack: per thread, copied by `fork`, dropped by
     /// `execve` and left disabled in a new thread (the man page's rules).
     pub(crate) altstack: AltStack,
+    /// The mask `epoll_pwait` was called with, set only while the call is
+    /// being interrupted by a signal: `blocked` then still holds the temporary
+    /// mask so the handler can run, and `deliver` records *this* mask (not the
+    /// temporary one) in the ucontext, so `sigreturn` puts the original back.
+    /// `deliver` clears it on every pass; never copied by fork / exec.
+    pub(crate) saved_mask: Option<u32>,
 }
 
 impl SignalState {
@@ -292,6 +298,7 @@ impl SignalState {
             dflt_pending: 0,
             info: [SigInfoRec::KERNEL; NSIG],
             altstack: AltStack::disabled(),
+            saved_mask: None,
         }
     }
 
@@ -318,6 +325,7 @@ impl SignalState {
             dflt_pending: 0,
             info: [SigInfoRec::KERNEL; NSIG],
             altstack: self.altstack,
+            saved_mask: None,
         }
     }
 
@@ -339,10 +347,35 @@ impl SignalState {
         self.dflt_pending = 0;
         self.info = [SigInfoRec::KERNEL; NSIG];
         self.altstack = AltStack::disabled(); // the old image's memory is gone
+        self.saved_mask = None;
     }
 }
 
 // ------------------------------------------------------------ syscall side
+
+/// Swap in a temporary blocked mask for the running process (the atomic half
+/// of `epoll_pwait`) and return the previous one.  SIGKILL's bit and bits
+/// past the signals tracked never stick, as in `sigprocmask`.  `None` without
+/// a current process.
+pub fn swap_mask(new: u64) -> Option<u32> {
+    with_current(|s| {
+        let old = s.blocked;
+        s.blocked = (new & ((1u64 << NSIG) - 1) & !(1 << SIGKILL)) as u32;
+        old
+    })
+}
+
+/// The call that swapped the mask in is over without a signal: put `old` back.
+pub fn restore_mask(old: u32) {
+    let _ = with_current(|s| s.blocked = old);
+}
+
+/// The call that swapped the mask in was interrupted by a signal: keep the
+/// temporary mask so the handler runs, and have `deliver` restore `old` when
+/// the handler returns (or at once, if no handler ends up running).
+pub fn restore_mask_after_delivery(old: u32) {
+    let _ = with_current(|s| s.saved_mask = Some(old));
+}
 
 /// Run `f` on the running process's signal state (syscall context).
 fn with_current<R>(f: impl FnOnce(&mut SignalState) -> R) -> Option<R> {
@@ -990,11 +1023,23 @@ pub fn deliver(frame: &mut IsrFrame) {
         }
         pick
     });
-    let Some(Some((sig, action, bit))) = pick else { return };
+    let Some(Some((sig, action, bit))) = pick else {
+        // No handler runs: an `epoll_pwait` that was interrupted by a signal
+        // that turned out to be ignored gets its own mask back right here.
+        with_current(|s| {
+            if let Some(m) = s.saved_mask.take() {
+                s.blocked = m;
+            }
+        });
+        return;
+    };
     let Some(cur) = process::current() else { return };
     let Some(aspace) = cur.aspace.as_ref() else { return };
-    // The interrupted mask, saved in the ucontext and restored by sigreturn.
-    let saved_mask = cur.signals.blocked;
+    // The mask the handler starts from (the temporary one, for epoll_pwait)...
+    let interrupted_mask = cur.signals.blocked;
+    // ...and the one saved in the ucontext, restored by sigreturn: the
+    // caller's own mask when a mask-swapping call was interrupted.
+    let saved_mask = cur.signals.saved_mask.unwrap_or(interrupted_mask);
     let alt = cur.signals.altstack;
     let rec = cur.signals.info[sig as usize];
 
@@ -1121,11 +1166,12 @@ pub fn deliver(frame: &mut IsrFrame) {
     // never blocked.  SA_RESETHAND puts the default disposition back.
     with_current(|s| {
         s.pending &= !bit;
+        s.saved_mask = None;
         s.info[sig as usize] = SigInfoRec::KERNEL;
         if action.flags & SA_RESETHAND != 0 {
             s.actions[sig as usize] = SigAction::new();
         }
-        let mut m = saved_mask | action.mask as u32 | bit;
+        let mut m = interrupted_mask | action.mask as u32 | bit;
         if action.flags & SA_NODEFER != 0 {
             m &= !bit;
         }
