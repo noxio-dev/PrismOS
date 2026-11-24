@@ -744,7 +744,8 @@ static RTC_ZERO_NS: AtomicU64 = AtomicU64::new(0);
 static RTC_READ: AtomicBool = AtomicBool::new(false);
 
 /// Nanoseconds since the epoch: the RTC anchor plus the monotonic clock.
-fn realtime_ns() -> u64 {
+/// (`pub(crate)`: a CLOCK_REALTIME timerfd reads it, user/fd/timerfd.rs.)
+pub(crate) fn realtime_ns() -> u64 {
     if !RTC_READ.load(Ordering::Acquire) {
         // The CMOS reads must not be stretched by a tick storm: mask them.
         let flags = crate::arch::io::cli_save();

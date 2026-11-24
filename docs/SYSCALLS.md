@@ -128,6 +128,9 @@ Implemented in `user/fd/epoll.rs` over the host-tested interest list
 | 116 | `memfd_create(name, flags)` | anonymous file on `/dev/shm` (created then unlinked), `MFD_CLOEXEC` honoured, `MFD_ALLOW_SEALING` accepted but no seals; `-ENOSYS` without `/dev/shm` |
 | 124 | `eventfd2(initval, flags)` | a 64-bit counter descriptor (`user/fd/eventfd.rs`, rules in `user/eventfd_core.rs`, `make eventfdtest`); `EFD_SEMAPHORE` (1), `EFD_NONBLOCK`, `EFD_CLOEXEC`: both the Linux values (04000, 02000000) and this port's `O_NONBLOCK` / `O_CLOEXEC` (0100, 0200) are accepted; any other bit is `-EINVAL` |
 | 125 | `epoll_pwait(epfd, events, maxevents, timeout_ms, sigmask, sigsetsize)` | 4th..6th arguments in `r10`, `r8`, `r9`; `sigmask` NULL is plain `epoll_wait`; `sigsetsize` must be 8, else `-EINVAL` |
+| 126 | `timerfd_create(clockid, flags)` | a timer descriptor (`user/fd/timerfd.rs`, rules in `user/timerfd_core.rs`, `make timerfdtest`); `CLOCK_REALTIME` (0), `CLOCK_MONOTONIC` (1), `CLOCK_BOOTTIME` (7, same as monotonic), any other clock `-EINVAL`; `TFD_NONBLOCK` / `TFD_CLOEXEC` accepted with both the Linux and this port's values, like eventfd; any other flag bit `-EINVAL` |
+| 127 | `timerfd_settime(fd, flags, new, old)` | 4th argument in `r10`; `new` / `old` are `struct itimerspec` (32 bytes: interval then value); `old` may be NULL; `TFD_TIMER_ABSTIME` (1), `TFD_TIMER_CANCEL_ON_SET` (2, accepted, nothing to cancel); a bad timespec is `-EINVAL`; value 0 disarms |
+| 128 | `timerfd_gettime(fd, cur)` | time left until the next expiry (0 when disarmed) and the interval |
 
 `struct epoll_event` is the packed 12-byte x86-64 layout (`u32 events`, `u64
 data`). Supported: `EPOLLIN/OUT/ERR/HUP/RDHUP` (plus the `RDNORM`/`WRNORM`/band
@@ -165,6 +168,26 @@ parked reader or writer is woken by the shared `unix::notify`.
 Differences from Linux: a wait is capped like every blocking call here (10 s,
 then `-EAGAIN`); `fsync` is `-EINVAL`; `fstat` reports a generic 0600 inode and
 `/proc/<pid>/fd` names it `anon_inode:[eventfd]`.
+
+### timerfd (126..128)
+
+`read` returns exactly 8 bytes: the number of expirations since the last read
+(a shorter buffer is `-EINVAL`). A one-shot timer ends up disarmed; a periodic
+one counts every missed interval and keeps its phase, so a late read does not
+drift. `settime` forgets unread expirations and returns the previous setting;
+the interval is kept even when the timer is disarmed. `write` is `-EINVAL`.
+Readable when the count is above 0, never writable, so `poll`, `select` and
+`epoll` all see it.
+
+There is no kernel timer behind the descriptor: it is a deadline on a clock,
+and whoever looks (read, poll probe, gettime, settime) counts what has expired.
+A blocked `read` sleeps to the exact deadline; a `poll` / `epoll` waiter notices
+an expiry at its next probe (the usual 10 ms park). `O_NONBLOCK` answers
+`-EAGAIN`; a wait is capped like every blocking call here (10 s, then `-EAGAIN`).
+
+Differences from Linux: no `CLOCK_*_ALARM`, `TFD_TIMER_CANCEL_ON_SET` never
+cancels (the wall clock cannot be stepped), `fsync` is `-EINVAL`, and
+`/proc/<pid>/fd` names it `anon_inode:[timerfd]`.
 
 ### `ioctl(fd, request, arg)` (29)
 

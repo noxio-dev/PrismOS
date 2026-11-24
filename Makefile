@@ -637,6 +637,14 @@ eventfdtest:
 	rustc --edition 2021 --test tests/eventfd_host.rs -o $(B)/eventfd_host
 	$(B)/eventfd_host --test-threads=1
 
+# Host-side tests of the timerfd state machine (no QEMU needed): clock ids,
+# timespec checks, one-shot / periodic expiry, absolute and relative arming.
+.PHONY: timerfdtest
+timerfdtest:
+	mkdir -p $(B)
+	rustc --edition 2021 --test tests/timerfd_host.rs -o $(B)/timerfd_host
+	$(B)/timerfd_host --test-threads=1
+
 # Host-side tests of the thread-group logic (clone flags, thread exit, signal target).
 .PHONY: threadtest
 threadtest:

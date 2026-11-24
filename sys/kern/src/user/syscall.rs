@@ -88,6 +88,10 @@
 //    124 eventfd2(initval, flags)   (user/fd/eventfd.rs, counter in user/eventfd_core.rs)
 //    125 epoll_pwait(epfd, events, max, timeout, sigmask, sigsetsize)
 //           -- r10, r8, r9 carry the last three (user/fd/epoll.rs)
+//    126 timerfd_create(clockid, flags)
+//    127 timerfd_settime(fd, flags, new, old)   -- r10 carries `old`
+//    128 timerfd_gettime(fd, cur)
+//           (user/fd/timerfd.rs, state machine in user/timerfd_core.rs)
 //
 // Phase 3.4 (the BusyBox step -- the gaps the port revealed):
 //    62 fchdir(fd)                  the directory an fd is open on
@@ -472,6 +476,10 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         // ---- eventfd and epoll_pwait: the Xorg step (phase 2.4) -----------
         124 => fd::eventfd::sys_eventfd2(a0, a1),
         125 => fd::epoll::sys_epoll_pwait(a0, a1, a2, frame.r10, frame.r8, frame.r9),
+        // ---- timerfd: the Xorg step (phase 2.3) ----------------------------
+        126 => fd::timerfd::sys_timerfd_create(a0, a1),
+        127 => fd::timerfd::sys_timerfd_settime(a0, a1, a2, frame.r10),
+        128 => fd::timerfd::sys_timerfd_gettime(a0, a1),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

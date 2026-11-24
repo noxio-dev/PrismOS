@@ -96,6 +96,8 @@ pub(crate) mod unix;
 pub(crate) mod epoll;
 /// eventfd (the syscall half; user/eventfd_core.rs is the counter).
 pub(crate) mod eventfd;
+/// timerfd (the syscall half; user/timerfd_core.rs is the timer state machine).
+pub(crate) mod timerfd;
 
 // ------------------------------------------------------------- limits
 
@@ -199,6 +201,8 @@ pub(crate) enum Kind {
     Epoll(Rc<RefCell<epoll::Set>>),
     /// An eventfd: a 64-bit counter (`eventfd2`, syscall 124).
     EventFd(eventfd::Counter),
+    /// A timerfd: a deadline on a clock (`timerfd_create`, syscall 126).
+    TimerFd(timerfd::Timer),
 }
 
 /// Which terminal a descriptor talks to, if it is a terminal at all.
@@ -407,6 +411,7 @@ impl FdInner {
                     Kind::Unix(_) => unix::proc_name(),
                     Kind::Epoll(_) => String::from("anon_inode:[eventpoll]"),
                     Kind::EventFd(_) => String::from("anon_inode:[eventfd]"),
+                    Kind::TimerFd(_) => String::from("anon_inode:[timerfd]"),
                 };
                 Some((i, name))
             })
@@ -618,6 +623,7 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> i64 {
         Kind::Unix(s) => unix::read(s, &desc, buf, len),
         Kind::Epoll(_) => -EINVAL,
         Kind::EventFd(c) => eventfd::read(c, &desc, buf, len),
+        Kind::TimerFd(t) => timerfd::read(t, &desc, buf, len),
     }
 }
 
@@ -912,6 +918,7 @@ pub fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
         Kind::Unix(s) => unix::write(s, &desc, buf, len),
         Kind::Epoll(_) => -EINVAL,
         Kind::EventFd(c) => eventfd::write(c, &desc, buf, len),
+        Kind::TimerFd(_) => -EINVAL, // a timerfd is read-only, like on Linux
     }
 }
 
@@ -1420,7 +1427,7 @@ pub fn sys_fstat(fd: u64, buf: u64) -> i64 {
                 -EFAULT
             }
         }
-        Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::Epoll(_) | Kind::EventFd(_) => {
+        Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::Epoll(_) | Kind::EventFd(_) | Kind::TimerFd(_) => {
             if put_stat(buf, 0, 0o600, (0, 0), &FileType::Other, 0, 1, 0, 0, (0, 0, 0)) {
                 0
             } else {
@@ -2019,7 +2026,12 @@ pub fn sys_fsync(fd: u64) -> i64 {
         Kind::Vfs(slot) => {
             crate::fs::fsys::vfs().fsync_fd(*slot).map_or_else(|e| -fs_errno(e), |_| 0)
         }
-        Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::Unix(_) | Kind::Epoll(_) | Kind::EventFd(_) => -EINVAL,
+        Kind::PipeRead(_)
+        | Kind::PipeWrite(_)
+        | Kind::Unix(_)
+        | Kind::Epoll(_)
+        | Kind::EventFd(_)
+        | Kind::TimerFd(_) => -EINVAL,
         _ => 0,
     }
 }
@@ -2417,6 +2429,7 @@ fn desc_ready(desc: &Rc<FileDesc>) -> Ready {
             let (read, write) = eventfd::ready(c);
             Ready { read, write, err: false, hup: false }
         }
+        Kind::TimerFd(t) => Ready { read: timerfd::ready(t), write: false, err: false, hup: false },
     }
 }
 

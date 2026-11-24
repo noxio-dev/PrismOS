@@ -47,6 +47,7 @@ pub mod signal;
 pub mod sysc;
 pub mod syscall;
 pub mod thread_core;
+pub mod timerfd_core;
 pub mod tty;
 pub mod unix_core;
 pub mod usermode;
