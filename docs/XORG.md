@@ -31,18 +31,23 @@ Basis: analysis of the repository as read (Rust kernel, mlibc port,
 - [ ] SysV `shmget` / `shmat` / `shmdt` / `shmctl` (MIT-SHM)
 
 ### 2.3 Event descriptors
-- [x] `eventfd` (`eventfd2`, 124: counter, semaphore mode, O_NONBLOCK, poll / epoll readiness; host tests `make eventfdtest`; **mlibc sysdep to wire**)
-- [x] `signalfd` (`signalfd4`, 129: mask update on an existing fd, 128-byte `signalfd_siginfo` records, poll / epoll readiness; blocked signals now stay pending whatever their disposition; host tests `make signalfdtest`; **mlibc sysdep to wire**)
-- [x] `timerfd` (`timerfd_create` / `timerfd_settime` / `timerfd_gettime`, 126..128: CLOCK_REALTIME / MONOTONIC / BOOTTIME, one-shot and periodic, absolute and relative, poll / epoll readiness; host tests `make timerfdtest`; **mlibc sysdep to wire**)
-- [x] `epoll_pwait` (125: mask swap, restored after the handler on `-EINTR` via `SignalState::saved_mask`; **mlibc sysdep to wire**, it still refuses the call)
+- [x] `eventfd` (`eventfd2`, 124: counter, semaphore mode, O_NONBLOCK, poll / epoll readiness; host tests `make eventfdtest`; mlibc sysdep `EventfdCreate` wired)
+- [x] `signalfd` (`signalfd4`, 129: mask update on an existing fd, 128-byte `signalfd_siginfo` records, poll / epoll readiness; blocked signals now stay pending whatever their disposition; host tests `make signalfdtest`; mlibc sysdep `SignalfdCreate` wired, mask shifted like every other)
+- [x] `timerfd` (`timerfd_create` / `timerfd_settime` / `timerfd_gettime`, 126..128: CLOCK_REALTIME / MONOTONIC / BOOTTIME, one-shot and periodic, absolute and relative, poll / epoll readiness; host tests `make timerfdtest`; mlibc sysdeps `TimerfdCreate` / `TimerfdSettime` / `TimerfdGettime` wired)
+- [x] `epoll_pwait` (125: mask swap, restored after the handler on `-EINTR` via `SignalState::saved_mask`; mlibc `EpollPwait` now sends a real mask to 125 (shifted to the kernel's bit order); a null mask stays the plain 111)
 
 ### 2.4 Miscellaneous syscalls
 - [x] `getrlimit` / `setrlimit` / `prlimit64` (117..119, kernel side: stored and
-      reported, **not enforced**; defaults are the real system sizes; **mlibc sysdep to wire**)
-- [x] `mlock` / `munlock` (120, 121: a range check, there is no swap; **mlibc sysdep to wire**)
+      reported, **not enforced**; defaults are the real system sizes; mlibc `GetRlimit` / `SetRlimit` wired -- mlibc has no
+      prlimit tag, so 119 stays reachable only through `syscall()`)
+- [x] `mlock` / `munlock` (120, 121: a range check, there is no swap; mlibc `Mlock` / `Munlock`
+      wired; no `mlockall` tag, no kernel call)
 - [x] `sched_getaffinity` / `sched_setaffinity` (122, 123: one CPU, mask `0x1`);
       `sched_yield` is the existing syscall 4 (`Yield` sysdep already there);
-      **mlibc sysdep to wire**
+      mlibc `GetAffinity` / `SetAffinity` wired (the rest of the caller's `cpu_set_t` is zeroed;
+      mlibc v7.0.0's `sched_setaffinity` aborted with "Not implemented", the patch now routes
+      it to the sysdep); the `*_thread*` affinity tags stay absent (the kernel takes a pid)
+- [x] mlibc `Truncate` / `Fallocate` / `MemfdCreate` (114..116) wired next to `Ftruncate`
 - [ ] `O_DIRECTORY`, `*at()` calls (`openat`, `fstatat`, ...) beyond `AT_FDCWD`
 
 ### 2.4b Networking / hardware discovery

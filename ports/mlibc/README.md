@@ -12,7 +12,9 @@ The fifth step (the shared half: `-Ddefault_library=both`, `libc.so` +
 
 ```
 ports/mlibc/
-├── mlibc-prismos.patch          the seven-line registration in mlibc's meson.build
+├── mlibc-prismos.patch          the registration in mlibc's meson.build, plus small fixes (the last
+│                                hunk routes `sched_setaffinity` to the `SetAffinity` sysdep: v7.0.0
+│                                aborts with "Not implemented" instead)
 └── sysdeps/prismos/
     ├── meson.build              sources, headers, the crt objects (the sysdeps/demo shape)
     ├── include/

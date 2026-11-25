@@ -558,8 +558,10 @@ int Sysdeps<Pselect>::operator()(int num_fds, fd_set *read_set, fd_set *write_se
 
 /* epoll: the kernel keeps the interest list; these only translate the
  * result words.  epoll_wait reaches the kernel through EpollPwait with a
- * null mask (epoll_pwait with a real mask is refused, like pselect: the
- * kernel keeps no per-call signal mask). */
+ * null mask, which stays the plain epoll_wait (111).  A real mask goes to
+ * epoll_pwait (125): the kernel swaps the blocked mask for the wait and puts
+ * it back, and the mask crosses the boundary shifted like every other one
+ * (mask_to_kernel).  (pselect still refuses a mask: it has no such call.) */
 int Sysdeps<EpollCreate>::operator()(int flags, int *fd) {
         auto ret = sys(PRISM_SYS_EPOLL_CREATE1, flags);
         if(int e = sc_error(ret); e)
@@ -575,9 +577,15 @@ int Sysdeps<EpollCtl>::operator()(int epfd, int mode, int fd, struct epoll_event
 
 int Sysdeps<EpollPwait>::operator()(int epfd, struct epoll_event *ev, int n, int timeout,
                 const sigset_t *sigmask, int *raised) {
-        if(sigmask)
-                return ENOSYS;
-        auto ret = sys(PRISM_SYS_EPOLL_WAIT, epfd, ev, n, timeout);
+        sc_word_t ret;
+        if(sigmask) {
+                uint64_t kset = 0;
+                memcpy(&kset, sigmask, sizeof(kset));
+                kset = mask_to_kernel(kset);
+                ret = sys(PRISM_SYS_EPOLL_PWAIT, epfd, ev, n, timeout, &kset, 8);
+        } else {
+                ret = sys(PRISM_SYS_EPOLL_WAIT, epfd, ev, n, timeout);
+        }
         if(int e = sc_error(ret); e)
                 return e;
         *raised = static_cast<int>(ret);
@@ -1143,6 +1151,118 @@ int Sysdeps<Sigaltstack>::operator()(const stack_t *ss, stack_t *oss) {
 int Sysdeps<Ftruncate>::operator()(int fd, size_t size) {
         auto ret = sys(PRISM_SYS_FTRUNCATE, fd, size);
         return sc_error(ret);
+}
+
+int Sysdeps<Truncate>::operator()(const char *path, off_t length) {
+        auto ret = sys(PRISM_SYS_TRUNCATE, path, length);
+        return sc_error(ret);
+}
+
+/* mlibc's fallocate(fd, offset, size) has no mode word: it is the plain
+ * allocation, mode 0 of the kernel's four-argument call. */
+int Sysdeps<Fallocate>::operator()(int fd, off_t offset, size_t size) {
+        auto ret = sys(PRISM_SYS_FALLOCATE, fd, 0, offset, size);
+        return sc_error(ret);
+}
+
+int Sysdeps<MemfdCreate>::operator()(const char *name, int flags, int *fd) {
+        auto ret = sys(PRISM_SYS_MEMFD_CREATE, name, flags);
+        if(int e = sc_error(ret); e)
+                return e;
+        *fd = static_cast<int>(ret);
+        return 0;
+}
+
+/* ---- limits, locking, CPU affinity (kernel syscalls 117..123) ---- */
+
+/* struct rlimit is two u64 words (soft, hard) on both sides. */
+int Sysdeps<GetRlimit>::operator()(int resource, struct rlimit *limit) {
+        auto ret = sys(PRISM_SYS_GETRLIMIT, resource, limit);
+        return sc_error(ret);
+}
+
+int Sysdeps<SetRlimit>::operator()(int resource, const struct rlimit *limit) {
+        auto ret = sys(PRISM_SYS_SETRLIMIT, resource, limit);
+        return sc_error(ret);
+}
+
+int Sysdeps<Mlock>::operator()(const void *addr, size_t length) {
+        auto ret = sys(PRISM_SYS_MLOCK, addr, length);
+        return sc_error(ret);
+}
+
+int Sysdeps<Munlock>::operator()(const void *addr, size_t length) {
+        auto ret = sys(PRISM_SYS_MUNLOCK, addr, length);
+        return sc_error(ret);
+}
+
+/* The kernel has one CPU: it writes an 8-byte mask (CPU 0) and returns the
+ * byte count.  The libc contract is a whole cpu_set_t, so the rest of the
+ * caller's buffer is cleared here (CPU_COUNT would read stale bytes). */
+int Sysdeps<GetAffinity>::operator()(pid_t pid, size_t cpusetsize, cpu_set_t *mask) {
+        auto ret = sys(PRISM_SYS_SCHED_GETAFFINITY, pid, cpusetsize, mask);
+        if(int e = sc_error(ret); e)
+                return e;
+        size_t done = static_cast<size_t>(ret);
+        if(done < cpusetsize)
+                memset(reinterpret_cast<char *>(mask) + done, 0, cpusetsize - done);
+        return 0;
+}
+
+int Sysdeps<SetAffinity>::operator()(pid_t pid, size_t cpusetsize, const cpu_set_t *mask) {
+        auto ret = sys(PRISM_SYS_SCHED_SETAFFINITY, pid, cpusetsize, mask);
+        return sc_error(ret);
+}
+
+/* ---- event descriptors (kernel syscalls 124, 126..129) ----
+ * The EFD_* / TFD_* / SFD_* flag values mlibc's headers define are the
+ * port's O_NONBLOCK / O_CLOEXEC; the kernel accepts those and the Linux
+ * spellings alike, so the flags travel unchanged. */
+
+int Sysdeps<EventfdCreate>::operator()(unsigned int initval, int flags, int *fd) {
+        auto ret = sys(PRISM_SYS_EVENTFD2, initval, flags);
+        if(int e = sc_error(ret); e)
+                return e;
+        *fd = static_cast<int>(ret);
+        return 0;
+}
+
+int Sysdeps<TimerfdCreate>::operator()(int clockid, int flags, int *fd) {
+        auto ret = sys(PRISM_SYS_TIMERFD_CREATE, clockid, flags);
+        if(int e = sc_error(ret); e)
+                return e;
+        *fd = static_cast<int>(ret);
+        return 0;
+}
+
+/* struct itimerspec is it_interval then it_value, two 16-byte timespecs on
+ * both sides; the old value pointer may be null. */
+int Sysdeps<TimerfdSettime>::operator()(int fd, int flags, const struct itimerspec *value,
+                struct itimerspec *oldvalue) {
+        auto ret = sys(PRISM_SYS_TIMERFD_SETTIME, fd, flags, value, oldvalue);
+        return sc_error(ret);
+}
+
+int Sysdeps<TimerfdGettime>::operator()(int fd, struct itimerspec *its) {
+        auto ret = sys(PRISM_SYS_TIMERFD_GETTIME, fd, its);
+        return sc_error(ret);
+}
+
+/* mlibc's signalfd(fd, mask, flags) hands the caller's fd in through *fd
+ * (-1 makes a new descriptor, another value re-masks that signalfd) and
+ * takes the descriptor back out of it.  The mask is shifted like every mask
+ * crossing the boundary (mlibc bit N-1 = kernel bit N). */
+int Sysdeps<SignalfdCreate>::operator()(const sigset_t *mask, int flags, int *fd) {
+        if(!mask)
+                return EFAULT;
+        uint64_t kset = 0;
+        memcpy(&kset, mask, sizeof(kset));
+        kset = mask_to_kernel(kset);
+        auto ret = sys(PRISM_SYS_SIGNALFD4, *fd, &kset, 8, flags);
+        if(int e = sc_error(ret); e)
+                return e;
+        *fd = static_cast<int>(ret);
+        return 0;
 }
 
 int Sysdeps<ThreadSigmask>::operator()(int how, const sigset_t *__restrict set,

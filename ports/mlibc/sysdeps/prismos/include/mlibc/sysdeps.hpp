@@ -183,9 +183,36 @@ struct PrismOSSysdepTags :
         Sigaltstack,
         /* ftruncate (kernel syscall 113): what shm_open'ed files and
          * memfds are sized with before a MAP_SHARED mmap (MIT-SHM, shm
-         * clients).  truncate / fallocate / memfd_create (114..116) have
-         * no tag here yet: reach them through prism_raw.h or syscall(). */
-        Ftruncate
+         * clients).  truncate / fallocate / memfd_create (114..116) follow
+         * below, with the rest of the Xorg step's syscalls. */
+        Ftruncate,
+        Truncate,
+        Fallocate,
+        MemfdCreate,
+
+        /* limits, locking, CPU affinity (kernel syscalls 117..123).  The
+         * kernel stores and reports the limits without enforcing them and
+         * has one CPU, so these answer honestly and pin nothing.  There is
+         * no prlimit tag in mlibc (getrlimit / setrlimit ride 117 / 118),
+         * no mlockall (no kernel call), and the *_thread* affinity tags stay
+         * absent: the kernel's affinity calls take a pid, not a tid. */
+        GetRlimit,
+        SetRlimit,
+        Mlock,
+        Munlock,
+        GetAffinity,
+        SetAffinity,
+
+        /* event descriptors (kernel syscalls 124, 126..129; the options
+         * linux-eventfd / -timerfd / -signalfd default to the linux option,
+         * already on, so the wrappers were built and answered ENOSYS until
+         * these tags existed).  What an X server's main loop and its
+         * signal / timer handling stand on. */
+        EventfdCreate,
+        TimerfdCreate,
+        TimerfdSettime,
+        TimerfdGettime,
+        SignalfdCreate
 {};
 
 struct SysdepTraits {
