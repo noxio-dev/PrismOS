@@ -84,7 +84,7 @@ Linux-like, x86-64 `syscall` instruction:
 | 17 | `dup(fd)` | |
 | 26 | `dup2(old, new)` | |
 | 18 | `pipe(int *fds)` | |
-| 27 | `fcntl(fd, cmd, arg)` | `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETFD`, `F_SETFD`, `F_GETFL`, `F_SETFL` (e.g. `O_NONBLOCK`) |
+| 27 | `fcntl(fd, cmd, arg)` | `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETFD`, `F_SETFD`, `F_GETFL`, `F_SETFL` (`O_NONBLOCK`, `O_APPEND`, `O_ASYNC`), `F_SETOWN` / `F_GETOWN` / `F_SETSIG` / `F_GETSIG` (SIGIO, below) |
 | 28 | `getdents(fd, buf, len)` | |
 | 19 | `stat(path, st)` | follows the final symlink |
 | 58 | `lstat(path, st)` | does not follow the final symlink |
@@ -355,3 +355,14 @@ Implemented in `user/fd/unix.rs`.
 4. A userspace package that uses it must list the number in the `syscalls`
    array of its `prism.toml` (`[verify]`), or the build's loader-contract check
    fails.
+## SIGIO (fcntl `F_SETOWN`, `F_SETSIG`, `O_ASYNC`)
+
+`F_SETFL` accepts `O_ASYNC` (the port's `0x400`, and Linux's `0x2000`, kept as `0x400`).
+`F_SETOWN` takes a pid (> 0) or a process group (< 0), 0 clears it; `F_SETSIG` takes 0 (plain
+`SIGIO`, 29) or a signal 1..31 (real-time numbers: `-EINVAL`). State lives on the open file
+description, so dups and forks share it. The signal is sent to the owner on the
+not-readable -> readable edge (`si_code` = `SI_SIGIO`, -5), probed in process context only:
+at every syscall return and after each park. A process that neither makes a syscall nor
+parks hears nothing until it does, and one signal goes out per edge, not per event: drain
+to `EAGAIN`. `SIGIO` terminates by default; `SIGURG` is defined and ignored. Host tests:
+`make sigiotest`.

@@ -653,6 +653,12 @@ signalfdtest:
 	rustc --edition 2021 --test tests/signalfd_host.rs -o $(B)/signalfd_host
 	$(B)/signalfd_host --test-threads=1
 
+.PHONY: sigiotest
+sigiotest:
+	mkdir -p $(B)
+	rustc --edition 2021 --test tests/sigio_host.rs -o $(B)/sigio_host
+	$(B)/sigio_host --test-threads=1
+
 # Host-side tests of the thread-group logic (clone flags, thread exit, signal target).
 .PHONY: threadtest
 threadtest:

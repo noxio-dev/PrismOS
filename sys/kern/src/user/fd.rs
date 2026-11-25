@@ -100,6 +100,8 @@ pub(crate) mod eventfd;
 pub(crate) mod timerfd;
 /// signalfd (the syscall half; user/signalfd_core.rs holds the mask and record rules).
 pub(crate) mod signalfd;
+/// SIGIO: F_SETOWN / F_SETSIG / O_ASYNC (the rules are user/sigio_core.rs).
+pub(crate) mod sigio;
 
 // ------------------------------------------------------------- limits
 
@@ -229,17 +231,19 @@ pub struct FileDesc {
     /// string /proc/<pid>/fd/N points at.  Devices and pipes describe
     /// themselves through their Kind; nothing else stores one.
     path: Option<String>,
+    /// SIGIO state (F_SETOWN / F_SETSIG / O_ASYNC), shared by every dup.
+    aio: sigio::Aio,
 }
 
 impl FileDesc {
     fn new(kind: Kind, flags: u32) -> FileDesc {
-        FileDesc { kind, flags: Cell::new(flags), path: None }
+        FileDesc { kind, flags: Cell::new(flags), path: None, aio: sigio::Aio::new() }
     }
 
     /// A VFS description with its open path recorded (phase 3.3.6): the
     /// string /proc/<pid>/fd/N points at.
     fn with_path(kind: Kind, flags: u32, path: String) -> FileDesc {
-        FileDesc { kind, flags: Cell::new(flags), path: Some(path) }
+        FileDesc { kind, flags: Cell::new(flags), path: Some(path), aio: sigio::Aio::new() }
     }
 
     pub(crate) fn flags(&self) -> u32 {
@@ -593,6 +597,8 @@ fn park_once() {
     unix::parked_enter(pid);
     process::sleep_current(PARK_MS);
     unix::parked_leave(pid);
+    // Input that arrived while we slept may owe a SIGIO to somebody.
+    sigio::scan();
 }
 
 // -------------------------------------------------------------- read
@@ -1479,6 +1485,10 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
     // The Linux-specific numbering (include/uapi/asm-generic/fcntl.h): one
     // past the five portable commands, F_LINUX_SPECIFIC_BASE = 1024 + 6.
     const F_DUPFD_CLOEXEC: u64 = 1030;
+    const F_SETOWN: u64 = 8;
+    const F_GETOWN: u64 = 9;
+    const F_SETSIG: u64 = 10;
+    const F_GETSIG: u64 = 11;
     let Some(cur) = process::current() else { return -EFAULT };
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
@@ -1534,10 +1544,21 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
                 None => return -EBADF,
             };
             let mut f = desc.flags();
-            f &= !(O_NONBLOCK | O_APPEND);
+            f &= !(O_NONBLOCK | O_APPEND | sigio::O_ASYNC);
             f |= (arg as u32) & (O_NONBLOCK | O_APPEND);
+            if sigio::wants_async(arg as u32) {
+                f |= sigio::O_ASYNC;
+            }
             desc.flags.set(f);
+            sigio::flags_changed(&desc);
             0
+        }
+        F_SETOWN | F_GETOWN | F_SETSIG | F_GETSIG => {
+            let desc = match cur.fds.get(fd as usize) {
+                Some(d) => d,
+                None => return -EBADF,
+            };
+            sigio::fcntl(&desc, cmd, arg)
         }
         _ => -EINVAL,
     }

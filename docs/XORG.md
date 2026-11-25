@@ -22,7 +22,7 @@ Basis: analysis of the repository as read (Rust kernel, mlibc port,
 ### 2.1 Signals
 - [x] `SA_SIGINFO` (siginfo + ucontext passed to the handler)
 - [x] `sigaltstack` + `SA_ONSTACK` (syscall 112)
-- [ ] `SIGIO`: `F_SETOWN`, `F_SETSIG`, `O_ASYNC`
+- [x] `SIGIO`: `F_SETOWN`, `F_SETSIG`, `O_ASYNC` (edge-triggered, probed in process context at syscall return and after a park; mlibc `Fcntl` already passes the commands through; host tests `make sigiotest`)
 
 ### 2.2 Shared memory
 - [x] `MAP_SHARED` on tmpfs files (file frames mapped directly; other file systems answer `-ENODEV`, a real page cache stays optional)

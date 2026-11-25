@@ -95,6 +95,8 @@ pub const SIGPIPE: u64 = 13;
 pub const SIGALRM: u64 = 14;
 pub const SIGTERM: u64 = 15;
 pub const SIGCHLD: u64 = 17;
+pub const SIGURG: u64 = 23;
+pub const SIGIO: u64 = 29;
 
 /// `signal()` / `sigaction` dispositions beyond a plain handler (phase 3.1):
 /// 0 is the default action, 1 is SIG_IGN -- "ignore".  The value is the
@@ -194,7 +196,7 @@ const EPIPE: i64 = 32;
 /// SIGHUP in 3.3.4: a session leader's death reaches its foreground group
 /// through it).
 fn terminates_by_default(sig: u64) -> bool {
-    sig == SIGHUP || sig == SIGKILL || sig == SIGTERM || sig == SIGINT || sig == SIGPIPE
+    sig == SIGHUP || sig == SIGKILL || sig == SIGTERM || sig == SIGINT || sig == SIGPIPE || sig == SIGIO
 }
 
 /// Wait flags (the part wait() understands).
@@ -1001,6 +1003,8 @@ pub fn pipe_sigpipe() -> i64 {
 /// before `sysretq`.  sigreturn reads this exact layout back -- keep both
 /// in sync.
 pub fn deliver(frame: &mut IsrFrame) {
+    // Descriptors in O_ASYNC mode that became ready owe their owners a SIGIO.
+    crate::user::fd::sigio::scan();
     // A default-action signal the timer raised (SIGALRM with no handler):
     // the process dies of it, like any other terminating signal.
     if let Some(Some(sig)) = with_current(|s| {
