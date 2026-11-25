@@ -1,3 +1,4 @@
 PATH=/usr/bin:/bin
 export PATH
-PS1="PrismOS $ "
+
+PS1='[$USER@$(hostname) $PWD]$ '
