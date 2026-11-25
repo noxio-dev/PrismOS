@@ -346,7 +346,7 @@ unsafe fn raise(which: Term, sig: u64) {
         // at the syscall return), the default action applied at once
         // (which never returns, exactly like the watchdog's tick exit).
         if let Some(cur) = process::current() {
-            if cur.signals.handler_of(sig) != 0 {
+            if cur.signals.queues(sig) {
                 cur.signals.pending |= 1 << sig;
                 return;
             }

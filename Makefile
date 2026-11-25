@@ -645,6 +645,14 @@ timerfdtest:
 	rustc --edition 2021 --test tests/timerfd_host.rs -o $(B)/timerfd_host
 	$(B)/timerfd_host --test-threads=1
 
+# Host-side tests of the signalfd rules (no QEMU needed): mask normalisation,
+# which pending signal a read takes, the 128-byte record layout.
+.PHONY: signalfdtest
+signalfdtest:
+	mkdir -p $(B)
+	rustc --edition 2021 --test tests/signalfd_host.rs -o $(B)/signalfd_host
+	$(B)/signalfd_host --test-threads=1
+
 # Host-side tests of the thread-group logic (clone flags, thread exit, signal target).
 .PHONY: threadtest
 threadtest:

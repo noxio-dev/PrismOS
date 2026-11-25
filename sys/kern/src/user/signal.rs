@@ -314,6 +314,17 @@ impl SignalState {
         self.actions[sig as usize].handler
     }
 
+    /// Whether a signal raised now must be *queued* (pending bit) instead of
+    /// acted on at once: a handler (or SIG_IGN) is installed, or the signal
+    /// is blocked -- POSIX keeps a blocked signal pending whatever its
+    /// disposition, which is what `sigtimedwait` and `signalfd` consume.  The
+    /// default action of a queued one is applied by `deliver` the moment it
+    /// is unblocked.  Before signalfd a blocked signal with the default
+    /// disposition killed the process anyway.
+    pub(crate) fn queues(&self, sig: u64) -> bool {
+        self.actions[sig as usize].handler != 0 || self.blocked & (1u32 << sig) != 0
+    }
+
     /// What `fork` hands to the child: the dispositions (POSIX keeps them),
     /// an empty pending set and the *blocked mask* (POSIX keeps it too --
     /// phase 3.2; the pre-3.2 code cleared it).
@@ -767,7 +778,7 @@ fn self_signal(sig: u64) -> i64 {
     }
     let rec = SigInfoRec::from_current(SI_USER);
     match with_current(|s| {
-        if sig != 0 && s.handler_of(sig) != 0 {
+        if sig != 0 && s.queues(sig) {
             s.pending |= 1 << sig;
             s.info[sig as usize] = rec;
             true
@@ -969,9 +980,10 @@ fn sanitize_user_frame(f: &mut IsrFrame) -> bool {
 /// -- the caller reports -EPIPE and carries on.
 pub fn pipe_sigpipe() -> i64 {
     let handler = with_current(|s| s.handler_of(SIGPIPE));
+    let blocked = with_current(|s| s.blocked & (1u32 << SIGPIPE) != 0).unwrap_or(false);
     match handler {
         Some(SIG_IGN) => -EPIPE,
-        Some(h) if h != 0 => {
+        Some(h) if h != 0 || blocked => {
             let _ = with_current(|s| s.pending |= 1 << SIGPIPE);
             -EPIPE
         }
@@ -1002,8 +1014,12 @@ pub fn deliver(frame: &mut IsrFrame) {
     }) {
         process::exit_current(process::Outcome::Signaled(sig));
     }
-    // Pick a signal: lowest number first, handlers only (SIG_IGN counts as
-    // "installed" -- its pending bit is simply dropped), nothing blocked.
+    // Pick a signal: lowest number first, nothing blocked.  SIG_IGN counts as
+    // "installed" -- its pending bit is simply dropped.  A pending bit with
+    // the default disposition is one that sat blocked (see `queues`) and has
+    // just been unblocked: its default action applies now, a terminating one
+    // ends the process, the others are discarded.
+    let mut dies = None;
     let pick = with_current(|s| {
         let mut pick = None;
         for sig in 1..NSIG as u64 {
@@ -1016,13 +1032,23 @@ pub fn deliver(frame: &mut IsrFrame) {
                 s.pending &= !bit; // ignored: consume and move on
                 continue;
             }
-            if a.handler != 0 {
-                pick = Some((sig, a, bit));
-                break;
+            if a.handler == 0 {
+                s.pending &= !bit;
+                s.info[sig as usize] = SigInfoRec::KERNEL;
+                if terminates_by_default(sig) {
+                    dies = Some(sig);
+                    break;
+                }
+                continue;
             }
+            pick = Some((sig, a, bit));
+            break;
         }
         pick
     });
+    if let Some(sig) = dies {
+        process::exit_current(process::Outcome::Signaled(sig));
+    }
     let Some(Some((sig, action, bit))) = pick else {
         // No handler runs: an `epoll_pwait` that was interrupted by a signal
         // that turned out to be ignored gets its own mask back right here.

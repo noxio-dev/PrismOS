@@ -131,6 +131,7 @@ Implemented in `user/fd/epoll.rs` over the host-tested interest list
 | 126 | `timerfd_create(clockid, flags)` | a timer descriptor (`user/fd/timerfd.rs`, rules in `user/timerfd_core.rs`, `make timerfdtest`); `CLOCK_REALTIME` (0), `CLOCK_MONOTONIC` (1), `CLOCK_BOOTTIME` (7, same as monotonic), any other clock `-EINVAL`; `TFD_NONBLOCK` / `TFD_CLOEXEC` accepted with both the Linux and this port's values, like eventfd; any other flag bit `-EINVAL` |
 | 127 | `timerfd_settime(fd, flags, new, old)` | 4th argument in `r10`; `new` / `old` are `struct itimerspec` (32 bytes: interval then value); `old` may be NULL; `TFD_TIMER_ABSTIME` (1), `TFD_TIMER_CANCEL_ON_SET` (2, accepted, nothing to cancel); a bad timespec is `-EINVAL`; value 0 disarms |
 | 128 | `timerfd_gettime(fd, cur)` | time left until the next expiry (0 when disarmed) and the interval |
+| 129 | `signalfd4(fd, mask, sizemask, flags)` | `flags` (4th argument) in `r10`; `fd` -1 makes a new descriptor, another `fd` must be a signalfd and only gets a new mask; `sizemask` must be 8, else `-EINVAL`; `SFD_NONBLOCK` / `SFD_CLOEXEC` accepted with both the Linux and this port's values, like eventfd; any other flag bit `-EINVAL` (`user/fd/signalfd.rs`, rules in `user/signalfd_core.rs`, `make signalfdtest`) |
 
 `struct epoll_event` is the packed 12-byte x86-64 layout (`u32 events`, `u64
 data`). Supported: `EPOLLIN/OUT/ERR/HUP/RDHUP` (plus the `RDNORM`/`WRNORM`/band
@@ -188,6 +189,29 @@ an expiry at its next probe (the usual 10 ms park). `O_NONBLOCK` answers
 Differences from Linux: no `CLOCK_*_ALARM`, `TFD_TIMER_CANCEL_ON_SET` never
 cancels (the wall clock cannot be stepped), `fsync` is `-EINVAL`, and
 `/proc/<pid>/fd` names it `anon_inode:[timerfd]`.
+
+### signalfd (129)
+
+`read` returns whole 128-byte `struct signalfd_siginfo` records (`ssi_signo`,
+`ssi_code`, `ssi_pid`, `ssi_uid` filled, the rest zero): one per pending signal
+of the mask, lowest number first, as many as the buffer holds; a buffer under
+128 bytes is `-EINVAL`. The signal is consumed, so it is not delivered
+afterwards. Readable when a signal of the mask is pending, never writable
+(`write` is `-EINVAL`), so `poll`, `select` and `epoll` all see it.
+`SIGKILL` and `SIGSTOP` never stick in the mask. As on Linux the signals must
+be blocked (`sigprocmask`) for a read to see them: an unblocked one is
+delivered or acted on first. The pending set read is the calling process's.
+
+**Blocked signals now stay pending.** A signal raised while blocked is queued
+whatever its disposition (`SignalState::queues`, used by `kill`, `tgkill`, the
+tty, `SIGALRM`, `SIGPIPE`), as POSIX says; before, only a signal with a handler
+was, and a blocked one with the default action killed the process anyway. When
+such a signal is unblocked, `deliver` applies its default action (terminating
+ones end the process, the others are discarded). `sigtimedwait` benefits too.
+
+Differences from Linux: signals 1..31 only (no real-time signals), the
+`ssi_*` fields beyond uid are not filled, and `/proc/<pid>/fd` names it
+`anon_inode:[signalfd]`.
 
 ### `ioctl(fd, request, arg)` (29)
 

@@ -98,6 +98,8 @@ pub(crate) mod epoll;
 pub(crate) mod eventfd;
 /// timerfd (the syscall half; user/timerfd_core.rs is the timer state machine).
 pub(crate) mod timerfd;
+/// signalfd (the syscall half; user/signalfd_core.rs holds the mask and record rules).
+pub(crate) mod signalfd;
 
 // ------------------------------------------------------------- limits
 
@@ -203,6 +205,8 @@ pub(crate) enum Kind {
     EventFd(eventfd::Counter),
     /// A timerfd: a deadline on a clock (`timerfd_create`, syscall 126).
     TimerFd(timerfd::Timer),
+    /// A signalfd: the mask of the signals it reads (`signalfd4`, syscall 129).
+    SignalFd(signalfd::Mask),
 }
 
 /// Which terminal a descriptor talks to, if it is a terminal at all.
@@ -412,6 +416,7 @@ impl FdInner {
                     Kind::Epoll(_) => String::from("anon_inode:[eventpoll]"),
                     Kind::EventFd(_) => String::from("anon_inode:[eventfd]"),
                     Kind::TimerFd(_) => String::from("anon_inode:[timerfd]"),
+                    Kind::SignalFd(_) => String::from("anon_inode:[signalfd]"),
                 };
                 Some((i, name))
             })
@@ -624,6 +629,7 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> i64 {
         Kind::Epoll(_) => -EINVAL,
         Kind::EventFd(c) => eventfd::read(c, &desc, buf, len),
         Kind::TimerFd(t) => timerfd::read(t, &desc, buf, len),
+        Kind::SignalFd(m) => signalfd::read(m, &desc, buf, len),
     }
 }
 
@@ -919,6 +925,7 @@ pub fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
         Kind::Epoll(_) => -EINVAL,
         Kind::EventFd(c) => eventfd::write(c, &desc, buf, len),
         Kind::TimerFd(_) => -EINVAL, // a timerfd is read-only, like on Linux
+        Kind::SignalFd(_) => -EINVAL, // so is a signalfd
     }
 }
 
@@ -1427,7 +1434,12 @@ pub fn sys_fstat(fd: u64, buf: u64) -> i64 {
                 -EFAULT
             }
         }
-        Kind::PipeRead(_) | Kind::PipeWrite(_) | Kind::Epoll(_) | Kind::EventFd(_) | Kind::TimerFd(_) => {
+        Kind::PipeRead(_)
+        | Kind::PipeWrite(_)
+        | Kind::Epoll(_)
+        | Kind::EventFd(_)
+        | Kind::TimerFd(_)
+        | Kind::SignalFd(_) => {
             if put_stat(buf, 0, 0o600, (0, 0), &FileType::Other, 0, 1, 0, 0, (0, 0, 0)) {
                 0
             } else {
@@ -2031,7 +2043,8 @@ pub fn sys_fsync(fd: u64) -> i64 {
         | Kind::Unix(_)
         | Kind::Epoll(_)
         | Kind::EventFd(_)
-        | Kind::TimerFd(_) => -EINVAL,
+        | Kind::TimerFd(_)
+        | Kind::SignalFd(_) => -EINVAL,
         _ => 0,
     }
 }
@@ -2430,6 +2443,7 @@ fn desc_ready(desc: &Rc<FileDesc>) -> Ready {
             Ready { read, write, err: false, hup: false }
         }
         Kind::TimerFd(t) => Ready { read: timerfd::ready(t), write: false, err: false, hup: false },
+        Kind::SignalFd(m) => Ready { read: signalfd::ready(m), write: false, err: false, hup: false },
     }
 }
 

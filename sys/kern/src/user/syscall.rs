@@ -92,6 +92,8 @@
 //    127 timerfd_settime(fd, flags, new, old)   -- r10 carries `old`
 //    128 timerfd_gettime(fd, cur)
 //           (user/fd/timerfd.rs, state machine in user/timerfd_core.rs)
+//    129 signalfd4(fd, mask, sizemask, flags)   -- r10 carries `flags`
+//           (user/fd/signalfd.rs, rules in user/signalfd_core.rs)
 //
 // Phase 3.4 (the BusyBox step -- the gaps the port revealed):
 //    62 fchdir(fd)                  the directory an fd is open on
@@ -480,6 +482,8 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         126 => fd::timerfd::sys_timerfd_create(a0, a1),
         127 => fd::timerfd::sys_timerfd_settime(a0, a1, a2, frame.r10),
         128 => fd::timerfd::sys_timerfd_gettime(a0, a1),
+        // ---- signalfd: the last descriptor of phase 2.3 --------------------
+        129 => fd::signalfd::sys_signalfd4(a0, a1, a2, frame.r10),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

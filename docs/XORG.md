@@ -32,7 +32,7 @@ Basis: analysis of the repository as read (Rust kernel, mlibc port,
 
 ### 2.3 Event descriptors
 - [x] `eventfd` (`eventfd2`, 124: counter, semaphore mode, O_NONBLOCK, poll / epoll readiness; host tests `make eventfdtest`; **mlibc sysdep to wire**)
-- [ ] `signalfd`
+- [x] `signalfd` (`signalfd4`, 129: mask update on an existing fd, 128-byte `signalfd_siginfo` records, poll / epoll readiness; blocked signals now stay pending whatever their disposition; host tests `make signalfdtest`; **mlibc sysdep to wire**)
 - [x] `timerfd` (`timerfd_create` / `timerfd_settime` / `timerfd_gettime`, 126..128: CLOCK_REALTIME / MONOTONIC / BOOTTIME, one-shot and periodic, absolute and relative, poll / epoll readiness; host tests `make timerfdtest`; **mlibc sysdep to wire**)
 - [x] `epoll_pwait` (125: mask swap, restored after the handler on `-EINTR` via `SignalState::saved_mask`; **mlibc sysdep to wire**, it still refuses the call)
 

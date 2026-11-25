@@ -1391,6 +1391,9 @@ fn fire_itimers(now: u64) {
             p.itimer_next = if p.itimer_interval > 0 { now + p.itimer_interval } else { 0 };
             match p.signals.handler_of(signal::SIGALRM) {
                 signal::SIG_IGN => {}
+                // Blocked with the default action: queue it (signalfd /
+                // sigtimedwait see it; `deliver` kills on unblock).
+                0 if p.signals.blocked & SIGALRM_BIT != 0 => p.signals.pending |= SIGALRM_BIT,
                 0 => p.signals.dflt_pending |= SIGALRM_BIT,
                 _ => p.signals.pending |= SIGALRM_BIT,
             }
@@ -2074,7 +2077,7 @@ pub fn post_signal_from(pid: u64, sig: u64, rec: signal::SigInfoRec) -> bool {
         }
         if let Some(i) = pick_signal_thread(&cands, sig) {
             let p = &mut *members[i];
-            if p.signals.handler_of(sig) != 0 {
+            if p.signals.queues(sig) {
                 p.signals.pending |= 1 << sig;
                 p.signals.info[sig as usize] = rec;
                 raised = true;
@@ -2105,7 +2108,7 @@ pub fn post_signal_thread(tid: u64, sig: u64, rec: signal::SigInfoRec) -> bool {
         let mut raised = false;
         for p in (*addr_of_mut!(TABLE)).iter_mut() {
             if p.pid == tid && p.state != State::Zombie {
-                if p.signals.handler_of(sig) != 0 {
+                if p.signals.queues(sig) {
                     p.signals.pending |= 1 << sig;
                     p.signals.info[sig as usize] = rec;
                     raised = true;

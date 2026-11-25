@@ -156,6 +156,7 @@ enum {
         PRISM_SYS_TIMERFD_CREATE = 126,  /* timerfd_create(clockid, flags) */
         PRISM_SYS_TIMERFD_SETTIME = 127, /* timerfd_settime(fd, flags, &new, &old) -- 4th arg in r10 */
         PRISM_SYS_TIMERFD_GETTIME = 128, /* timerfd_gettime(fd, &cur) */
+        PRISM_SYS_SIGNALFD4 = 129,       /* signalfd4(fd, &mask, 8, flags) -- 4th arg in r10 */
 };
 
 /* arch_prctl() codes -- the Linux x86-64 values the kernel expects. */
