@@ -48,7 +48,8 @@ Basis: analysis of the repository as read (Rust kernel, mlibc port,
       mlibc v7.0.0's `sched_setaffinity` aborted with "Not implemented", the patch now routes
       it to the sysdep); the `*_thread*` affinity tags stay absent (the kernel takes a pid)
 - [x] mlibc `Truncate` / `Fallocate` / `MemfdCreate` (114..116) wired next to `Ftruncate`
-- [ ] `O_DIRECTORY`, `*at()` calls (`openat`, `fstatat`, ...) beyond `AT_FDCWD`
+- [x] `O_DIRECTORY` (0x2000, kernel `open`; mlibc `OpenDir` uses it, no stat round trip)
+- [x] `*at()` calls (130..140: `openat`, `fstatat`, `mkdirat`, `unlinkat`, `readlinkat`, `renameat`, `symlinkat`, `linkat`, `faccessat`, `fchmodat`, `fchownat`; the dirfd base is the path the directory was opened by; mlibc `Openat` / `Mkdirat` / `Readlinkat` / `Renameat` / `Symlinkat` / `Linkat` / `Fchmodat` added, `Stat` fd_path / `Faccessat` / `Fchownat` / `Unlinkat` now send any dirfd to the kernel; `utimensat` stays `AT_FDCWD` only)
 
 ### 2.4b Networking / hardware discovery
 - [ ] `SOCK_DGRAM` / `SOCK_SEQPACKET` on AF_UNIX

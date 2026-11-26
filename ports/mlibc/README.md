@@ -51,7 +51,7 @@ phase.
 
 **What the kernel lacks stays ENOSYS** — the rule of the phase.  Tags the
 kernel cannot serve are simply absent from the tag list, and mlibc's
-generic layer answers `ENOSYS` on its own: `*at()` past `AT_FDCWD`, rusage accounting (wait4 gets honest
+generic layer answers `ENOSYS` on its own: `utimensat` past `AT_FDCWD`, rusage accounting (wait4 gets honest
 zeroes), `fchmod` and the whole permission family (phase 3.5).  A few
 corners are emulated where the emulation is exact: `pipe2`'s flags ride
 `fcntl` (`O_CLOEXEC`→`F_SETFD`, `O_NONBLOCK`→`F_SETFL`), `opendir` checks

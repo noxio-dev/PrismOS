@@ -81,7 +81,7 @@ use crate::fs::devfs::{
     DEV_URANDOM, DEV_ZERO, N_EVENT_NODES, N_VT_NODES,
 };
 use crate::fs::vfs::{
-    DirEntry, FsError, FileType, O_APPEND, O_CLOEXEC, O_CREATE, O_EXCL, O_NONBLOCK, O_READ,
+    DirEntry, FsError, FileType, O_APPEND, O_CLOEXEC, O_CREATE, O_DIRECTORY, O_EXCL, O_NONBLOCK, O_READ,
     O_TRUNC, O_WRITE, Opened, Whence,
 };
 use crate::mem::vmm::AddressSpace;
@@ -102,6 +102,8 @@ pub(crate) mod timerfd;
 pub(crate) mod signalfd;
 /// SIGIO: F_SETOWN / F_SETSIG / O_ASYNC (the rules are user/sigio_core.rs).
 pub(crate) mod sigio;
+/// The *at() family (openat, fstatat, mkdirat, ...).
+pub(crate) mod at;
 
 // ------------------------------------------------------------- limits
 
@@ -1083,14 +1085,21 @@ fn write_pipe(pipe: &Rc<RefCell<Pipe>>, desc: &Rc<FileDesc>, buf: u64, len: usiz
 /// against the *process's* cwd.  Devices resolve through /dev (devfs): the
 /// node gives the id, the id gives the descriptor.
 pub fn sys_open(path_p: u64, flags: u64) -> i64 {
-    const KNOWN: u32 = O_READ | O_WRITE | O_CREATE | O_TRUNC | O_APPEND | O_EXCL | O_NONBLOCK | O_CLOEXEC;
-    if flags > KNOWN as u64 {
+    sys_openat(at::AT_FDCWD as u64, path_p, flags)
+}
+
+/// `openat(dirfd, path, flags)` (syscall 130): `open` with a relative path
+/// resolved against `dirfd` (see fd/at.rs).
+pub fn sys_openat(dirfd: u64, path_p: u64, flags: u64) -> i64 {
+    const KNOWN: u32 =
+        O_READ | O_WRITE | O_CREATE | O_TRUNC | O_APPEND | O_EXCL | O_NONBLOCK | O_CLOEXEC | O_DIRECTORY;
+    if flags & !(KNOWN as u64) != 0 {
         return -EINVAL; // unknown bits: refuse rather than guess
     }
     let asked = flags as u32 & KNOWN;
     let cloexec = asked & O_CLOEXEC != 0;
     let flagbits = asked & !O_CLOEXEC; // description-level flags only
-    let abs = match user_path(path_p) {
+    let abs = match at::user_path_at(dirfd, path_p) {
         Ok(p) => p,
         Err(e) => return e,
     };

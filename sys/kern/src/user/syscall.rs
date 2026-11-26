@@ -93,6 +93,8 @@
 //    128 timerfd_gettime(fd, cur)
 //           (user/fd/timerfd.rs, state machine in user/timerfd_core.rs)
 //    129 signalfd4(fd, mask, sizemask, flags)   -- r10 carries `flags`
+//    130..140 openat fstatat mkdirat unlinkat readlinkat renameat symlinkat
+//             linkat faccessat fchmodat fchownat (dirfd first; user/fd/at.rs)
 //           (user/fd/signalfd.rs, rules in user/signalfd_core.rs)
 //
 // Phase 3.4 (the BusyBox step -- the gaps the port revealed):
@@ -484,6 +486,18 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         128 => fd::timerfd::sys_timerfd_gettime(a0, a1),
         // ---- signalfd: the last descriptor of phase 2.3 --------------------
         129 => fd::signalfd::sys_signalfd4(a0, a1, a2, frame.r10),
+        // ---- the *at() family (user/fd/at.rs) ---------------------------
+        130 => fd::sys_openat(a0, a1, a2),
+        131 => fd::at::sys_fstatat(a0, a1, a2, frame.r10),
+        132 => fd::at::sys_mkdirat(a0, a1, a2),
+        133 => fd::at::sys_unlinkat(a0, a1, a2),
+        134 => fd::at::sys_readlinkat(a0, a1, a2, frame.r10),
+        135 => fd::at::sys_renameat(a0, a1, a2, frame.r10),
+        136 => fd::at::sys_symlinkat(a0, a1, a2),
+        137 => fd::at::sys_linkat(a0, a1, a2, frame.r10, frame.r8),
+        138 => fd::at::sys_faccessat(a0, a1, a2, frame.r10),
+        139 => fd::at::sys_fchmodat(a0, a1, a2, frame.r10),
+        140 => fd::at::sys_fchownat(a0, a1, a2, frame.r10, frame.r8),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

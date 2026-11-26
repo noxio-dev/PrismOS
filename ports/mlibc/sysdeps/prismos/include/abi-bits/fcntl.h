@@ -23,13 +23,15 @@
 #define O_NONBLOCK    0100
 #define O_CLOEXEC     0200
 
+/* The kernel's own: ENOTDIR unless the path is a directory. */
+#define O_DIRECTORY  0x2000
+
 /* Reference constants (refused by the kernel if actually passed). */
 #define O_NOCTTY      0x100
 #define O_SYNC        0x200
 #define O_ASYNC       0x400
 #define O_DIRECT      0x800
 #define O_LARGEFILE  0x1000
-#define O_DIRECTORY  0x2000
 #define O_NOFOLLOW   0x4000
 #define O_NOATIME    0x8000
 #define O_PATH      0x10000

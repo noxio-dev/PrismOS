@@ -620,9 +620,14 @@ int Sysdeps<Stat>::operator()(fsfd_target fsfdt, int fd, const char *path, int f
                         return e;
                 return 0;
         }
-        default:
-                /* fd_path would be fstatat(); the kernel has no *at calls. */
-                return ENOSYS;
+        default: {
+                /* fd_path is fstatat(): the kernel's 131 (the flags are the
+                 * Linux values, AT_EMPTY_PATH included). */
+                auto ret = sys(PRISM_SYS_FSTATAT, fd, path, statbuf, flags);
+                if(int e = sc_error(ret); e)
+                        return e;
+                return 0;
+        }
         }
 }
 
@@ -670,14 +675,17 @@ int Sysdeps<Access>::operator()(const char *path, int mode) {
 }
 
 int Sysdeps<Faccessat>::operator()(int dirfd, const char *path, int mode, int flags) {
-        /* No *at syscalls in the kernel: only AT_FDCWD resolves (the
-         * port's contract), and AT_EACCESS is moot on a root-only
-         * system.  AT_SYMLINK_NOFOLLOW is lstat's spelling, the Linux
-         * value the Stat tag already knows. */
-        if(dirfd != AT_FDCWD)
-                return ENOSYS;
+        /* AT_FDCWD keeps the classic calls; any other dirfd is the kernel's
+         * 138.  AT_SYMLINK_NOFOLLOW is lstat's spelling, the Linux value
+         * the Stat tag already knows. */
         if(flags & ~(AT_SYMLINK_NOFOLLOW | AT_EACCESS))
                 return EINVAL;
+        if(dirfd != AT_FDCWD) {
+                auto ret = sys(PRISM_SYS_FACCESSAT, dirfd, path, mode, flags);
+                if(int e = sc_error(ret); e)
+                        return e;
+                return 0;
+        }
         if(flags & AT_SYMLINK_NOFOLLOW) {
                 /* The link itself: only its existence is checkable. */
                 struct stat st;
@@ -692,20 +700,11 @@ int Sysdeps<Faccessat>::operator()(int dirfd, const char *path, int mode, int fl
 }
 
 int Sysdeps<OpenDir>::operator()(const char *path, int *handle) {
-        /* No O_DIRECTORY in the kernel's flag set: open read-only, then let
-         * a stat decide -- POSIX wants opendir to fail with ENOTDIR. */
+        /* O_DIRECTORY is the kernel's: a path that is not a directory
+         * answers ENOTDIR itself, no stat round trip. */
         int fd;
-        if(int e = sysdep<Open>(path, O_RDONLY, 0, &fd); e)
+        if(int e = sysdep<Open>(path, O_RDONLY | O_DIRECTORY, 0, &fd); e)
                 return e;
-        struct stat st;
-        if(int e = sysdep<Stat>(fsfd_target::fd, fd, nullptr, 0, &st); e) {
-                sysdep<Close>(fd);
-                return e;
-        }
-        if(!S_ISDIR(st.st_mode)) {
-                sysdep<Close>(fd);
-                return ENOTDIR;
-        }
         *handle = fd;
         return 0;
 }
@@ -869,10 +868,14 @@ int Sysdeps<Fchownat>::operator()(int dirfd, const char *path,
          * the flags only AT_SYMLINK_NOFOLLOW changes the call.  uid / gid
          * of (uid_t)-1 / (gid_t)-1 keep the field: the kernel's own
          * "unchanged" spelling, passed through as the 64-bit value. */
-        if(dirfd != AT_FDCWD)
-                return ENOSYS;
-        if(flags & ~AT_SYMLINK_NOFOLLOW)
+        if(flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))
                 return EINVAL;
+        if(dirfd != AT_FDCWD || (flags & AT_EMPTY_PATH)) {
+                auto r = sys(PRISM_SYS_FCHOWNAT, dirfd, path, uid, gid, flags);
+                if(int e = sc_error(r); e)
+                        return e;
+                return 0;
+        }
         auto ret = sys(flags & AT_SYMLINK_NOFOLLOW ? PRISM_SYS_LCHOWN
                                                    : PRISM_SYS_CHOWN,
                         path, uid, gid);
@@ -884,10 +887,14 @@ int Sysdeps<Fchownat>::operator()(int dirfd, const char *path,
 int Sysdeps<Unlinkat>::operator()(int dirfd, const char *path, int flags) {
         /* No *at syscalls in the kernel: only AT_FDCWD resolves, and of the
          * flags only AT_REMOVEDIR changes the call. */
-        if(dirfd != AT_FDCWD)
-                return ENOSYS;
         if(flags & ~AT_REMOVEDIR)
                 return EINVAL;
+        if(dirfd != AT_FDCWD) {
+                auto r = sys(PRISM_SYS_UNLINKAT, dirfd, path, flags);
+                if(int e = sc_error(r); e)
+                        return e;
+                return 0;
+        }
         auto ret = flags & AT_REMOVEDIR
                         ? sys(PRISM_SYS_RMDIR, path)
                         : sys(PRISM_SYS_UNLINK, path);
@@ -927,6 +934,62 @@ int Sysdeps<Readlink>::operator()(const char *path, void *buffer, size_t max_siz
                 return e;
         // The kernel's answer is the byte count it placed (no NUL, POSIX).
         *length = static_cast<ssize_t>(ret);
+        return 0;
+}
+
+int Sysdeps<Openat>::operator()(int dirfd, const char *path, int flags, mode_t, int *fd) {
+        /* Like Open: no mode on the wire; the O_* bits are the kernel's. */
+        auto ret = sys(PRISM_SYS_OPENAT, dirfd, path, flags);
+        if(int e = sc_error(ret); e)
+                return e;
+        *fd = static_cast<int>(ret);
+        return 0;
+}
+
+int Sysdeps<Mkdirat>::operator()(int dirfd, const char *path, mode_t mode) {
+        auto ret = sys(PRISM_SYS_MKDIRAT, dirfd, path, mode);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<Readlinkat>::operator()(int dirfd, const char *path, void *buffer,
+                size_t max_size, ssize_t *length) {
+        auto ret = sys(PRISM_SYS_READLINKAT, dirfd, path, buffer, max_size);
+        if(int e = sc_error(ret); e)
+                return e;
+        *length = static_cast<ssize_t>(ret);
+        return 0;
+}
+
+int Sysdeps<Renameat>::operator()(int olddirfd, const char *old_path,
+                int newdirfd, const char *new_path) {
+        auto ret = sys(PRISM_SYS_RENAMEAT, olddirfd, old_path, newdirfd, new_path);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<Symlinkat>::operator()(const char *target_path, int dirfd,
+                const char *link_path) {
+        auto ret = sys(PRISM_SYS_SYMLINKAT, target_path, dirfd, link_path);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<Linkat>::operator()(int olddirfd, const char *old_path,
+                int newdirfd, const char *new_path, int flags) {
+        auto ret = sys(PRISM_SYS_LINKAT, olddirfd, old_path, newdirfd, new_path, flags);
+        if(int e = sc_error(ret); e)
+                return e;
+        return 0;
+}
+
+int Sysdeps<Fchmodat>::operator()(int dirfd, const char *path, mode_t mode, int flags) {
+        auto ret = sys(PRISM_SYS_FCHMODAT, dirfd, path, mode, flags);
+        if(int e = sc_error(ret); e)
+                return e;
         return 0;
 }
 

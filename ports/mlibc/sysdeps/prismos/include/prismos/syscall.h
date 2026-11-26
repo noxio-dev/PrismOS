@@ -157,6 +157,19 @@ enum {
         PRISM_SYS_TIMERFD_SETTIME = 127, /* timerfd_settime(fd, flags, &new, &old) -- 4th arg in r10 */
         PRISM_SYS_TIMERFD_GETTIME = 128, /* timerfd_gettime(fd, &cur) */
         PRISM_SYS_SIGNALFD4 = 129,       /* signalfd4(fd, &mask, 8, flags) -- 4th arg in r10 */
+
+        /* the *at() family: a relative path starts at dirfd (AT_FDCWD = -100) */
+        PRISM_SYS_OPENAT = 130,      /* openat(dirfd, path, flags) */
+        PRISM_SYS_FSTATAT = 131,     /* fstatat(dirfd, path, buf, flags) -- 4th arg in r10 */
+        PRISM_SYS_MKDIRAT = 132,     /* mkdirat(dirfd, path, mode) */
+        PRISM_SYS_UNLINKAT = 133,    /* unlinkat(dirfd, path, flags) */
+        PRISM_SYS_READLINKAT = 134,  /* readlinkat(dirfd, path, buf, size) -- 4th arg in r10 */
+        PRISM_SYS_RENAMEAT = 135,    /* renameat(olddirfd, old, newdirfd, new) -- 4th arg in r10 */
+        PRISM_SYS_SYMLINKAT = 136,   /* symlinkat(target, newdirfd, linkpath) */
+        PRISM_SYS_LINKAT = 137,      /* linkat(olddirfd, old, newdirfd, new, flags) -- r10, r8 */
+        PRISM_SYS_FACCESSAT = 138,   /* faccessat(dirfd, path, mode, flags) -- 4th arg in r10 */
+        PRISM_SYS_FCHMODAT = 139,    /* fchmodat(dirfd, path, mode, flags) -- 4th arg in r10 */
+        PRISM_SYS_FCHOWNAT = 140,    /* fchownat(dirfd, path, uid, gid, flags) -- r10, r8 */
 };
 
 /* arch_prctl() codes -- the Linux x86-64 values the kernel expects. */

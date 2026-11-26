@@ -195,7 +195,11 @@ fn chown_path(path_p: u64, uid: u64, gid: u64, follow: bool) -> i64 {
         Ok(p) => p,
         Err(e) => return e,
     };
-    crate::fs::fsys::vfs().chown(&abs, follow, opt(uid), opt(gid)).map_or_else(|e| -fs_errno(e), |_| 0)
+    chown_abs(&abs, uid, gid, follow)
+}
+/// The chown of an already resolved path (fchownat shares it).
+pub fn chown_abs(abs: &str, uid: u64, gid: u64, follow: bool) -> i64 {
+    crate::fs::fsys::vfs().chown(abs, follow, opt(uid), opt(gid)).map_or_else(|e| -fs_errno(e), |_| 0)
 }
 pub fn sys_chown(path_p: u64, uid: u64, gid: u64) -> i64 {
     chown_path(path_p, uid, gid, true)

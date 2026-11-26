@@ -458,6 +458,11 @@ pub const O_NONBLOCK: u32 = 64;
 /// descriptor layer's table, never here) -- `execve` closes the marked
 /// numbers, dup / dup2 clear it on their new number.
 pub const O_CLOEXEC: u32 = 128;
+/// O_DIRECTORY, at the value this port's abi-bits/fcntl.h has always spelled
+/// it (0x2000, so mlibc passes it straight through): the open fails with
+/// ENOTDIR unless the path is a directory.  A request-time check -- never
+/// stored on the description.
+pub const O_DIRECTORY: u32 = 0x2000;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Whence {
@@ -1155,6 +1160,12 @@ impl Vfs {
         if flags & (O_READ | O_WRITE) == 0 {
             return Err(FsError::Invalid);
         }
+        // Linux: O_DIRECTORY | O_CREAT is EINVAL.
+        if flags & O_DIRECTORY != 0 && flags & O_CREATE != 0 {
+            return Err(FsError::Invalid);
+        }
+        let want_dir = flags & O_DIRECTORY != 0;
+        let flags = flags & !O_DIRECTORY; // a request-time check, not stored
         let p = normalize("/", path);
         let mut created = false;
         let (mi, ino) = match self.walk(&p, true) {
@@ -1175,6 +1186,11 @@ impl Vfs {
             Err(e) => return Err(e),
         };
         let st = self.mounts[mi].fs.stat(ino)?;
+        // O_DIRECTORY: anything that is not a directory (a device node
+        // included) is refused before the permission check, ENOTDIR.
+        if want_dir && st.ftype != FileType::Dir {
+            return Err(FsError::NotDir);
+        }
         // The mode bits against the effective ids (a file we just created
         // is ours by construction, whatever its mode says).
         if !created {

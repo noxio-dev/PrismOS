@@ -78,7 +78,7 @@ Linux-like, x86-64 `syscall` instruction:
 |---|------|-------|
 | 1 | `write(fd, buf, len)` | `SIGPIPE` rule on pipes |
 | 13 | `read(fd, buf, len)` | |
-| 14 | `open(path, flags)` | `O_NONBLOCK`, `O_CLOEXEC` supported |
+| 14 | `open(path, flags)` | `O_NONBLOCK`, `O_CLOEXEC`, `O_DIRECTORY` (0x2000: `-ENOTDIR` unless the path is a directory, device nodes included; with `O_CREATE` `-EINVAL`; not kept in `F_GETFL`) supported |
 | 15 | `close(fd)` | |
 | 16 | `lseek(fd, off, whence)` | |
 | 17 | `dup(fd)` | |
@@ -132,6 +132,23 @@ Implemented in `user/fd/epoll.rs` over the host-tested interest list
 | 127 | `timerfd_settime(fd, flags, new, old)` | 4th argument in `r10`; `new` / `old` are `struct itimerspec` (32 bytes: interval then value); `old` may be NULL; `TFD_TIMER_ABSTIME` (1), `TFD_TIMER_CANCEL_ON_SET` (2, accepted, nothing to cancel); a bad timespec is `-EINVAL`; value 0 disarms |
 | 128 | `timerfd_gettime(fd, cur)` | time left until the next expiry (0 when disarmed) and the interval |
 | 129 | `signalfd4(fd, mask, sizemask, flags)` | `flags` (4th argument) in `r10`; `fd` -1 makes a new descriptor, another `fd` must be a signalfd and only gets a new mask; `sizemask` must be 8, else `-EINVAL`; `SFD_NONBLOCK` / `SFD_CLOEXEC` accepted with both the Linux and this port's values, like eventfd; any other flag bit `-EINVAL` (`user/fd/signalfd.rs`, rules in `user/signalfd_core.rs`, `make signalfdtest`) |
+
+| 130 | `openat(dirfd, path, flags)` | `open` with a relative path resolved against `dirfd` (`AT_FDCWD` = -100, or an open directory; an absolute path ignores it); same flags as 14 |
+| 131 | `fstatat(dirfd, path, buf, flags)` | flags (4th argument) in `r10`: `AT_SYMLINK_NOFOLLOW` (= lstat), `AT_EMPTY_PATH` (= fstat of `dirfd`) |
+| 132 | `mkdirat(dirfd, path, mode)` | as 31 |
+| 133 | `unlinkat(dirfd, path, flags)` | `AT_REMOVEDIR` = rmdir, else unlink |
+| 134 | `readlinkat(dirfd, path, buf, size)` | `size` in `r10`; as 47 |
+| 135 | `renameat(olddirfd, old, newdirfd, new)` | `new` in `r10`; no flags (renameat2 stays absent) |
+| 136 | `symlinkat(target, newdirfd, linkpath)` | the target is stored verbatim, only the link path is resolved |
+| 137 | `linkat(olddirfd, old, newdirfd, new, flags)` | `new` in `r10`, `flags` in `r8`; only 0 (`AT_SYMLINK_FOLLOW` is `-EINVAL`) |
+| 138 | `faccessat(dirfd, path, mode, flags)` | flags in `r10`: `AT_EACCESS` (moot, real ids are used) and `AT_SYMLINK_NOFOLLOW` accepted |
+| 139 | `fchmodat(dirfd, path, mode, flags)` | flags in `r10`, only 0 |
+| 140 | `fchownat(dirfd, path, uid, gid, flags)` | `gid` in `r10`, `flags` in `r8`: `AT_SYMLINK_NOFOLLOW`, `AT_EMPTY_PATH` (= fchown) |
+
+The *at() family (`user/fd/at.rs`): a `dirfd` other than `AT_FDCWD` must be a descriptor of an open
+directory (`-EBADF` if closed, `-ENOTDIR` if not a directory). The base is the path the directory was
+opened by, so a directory renamed after the open keeps resolving through its old name (the one
+deviation from Linux). `utimensat` (68) predates the family and still serves `AT_FDCWD` only.
 
 `struct epoll_event` is the packed 12-byte x86-64 layout (`u32 events`, `u64
 data`). Supported: `EPOLLIN/OUT/ERR/HUP/RDHUP` (plus the `RDNORM`/`WRNORM`/band

@@ -212,7 +212,20 @@ struct PrismOSSysdepTags :
         TimerfdCreate,
         TimerfdSettime,
         TimerfdGettime,
-        SignalfdCreate
+        SignalfdCreate,
+
+        /* the *at() family (kernel syscalls 130..140, user/fd/at.rs): a
+         * relative path starts at a directory descriptor.  Stat's fd_path
+         * form, Faccessat, Fchownat and Unlinkat already existed (AT_FDCWD
+         * only) and now send any other dirfd to the kernel.  Utimensat
+         * (68) has always taken a dirfd and still serves AT_FDCWD only. */
+        Openat,
+        Mkdirat,
+        Readlinkat,
+        Renameat,
+        Symlinkat,
+        Linkat,
+        Fchmodat
 {};
 
 struct SysdepTraits {
