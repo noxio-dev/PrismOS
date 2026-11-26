@@ -43,6 +43,8 @@ pub mod futex;
 pub mod eventfd_core;
 pub mod process;
 pub mod rlimit_core;
+pub mod shm;
+pub mod shm_core;
 pub mod signal;
 pub mod sysc;
 pub mod syscall;

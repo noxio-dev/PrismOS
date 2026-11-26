@@ -170,6 +170,10 @@ enum {
         PRISM_SYS_FACCESSAT = 138,   /* faccessat(dirfd, path, mode, flags) -- 4th arg in r10 */
         PRISM_SYS_FCHMODAT = 139,    /* fchmodat(dirfd, path, mode, flags) -- 4th arg in r10 */
         PRISM_SYS_FCHOWNAT = 140,    /* fchownat(dirfd, path, uid, gid, flags) -- r10, r8 */
+        PRISM_SYS_SHMGET = 141,      /* shmget(key, size, flg) -- System V shared memory */
+        PRISM_SYS_SHMAT = 142,       /* shmat(id, addr, flg) -> the mapping's address */
+        PRISM_SYS_SHMDT = 143,       /* shmdt(addr) */
+        PRISM_SYS_SHMCTL = 144,      /* shmctl(id, cmd, buf) */
 };
 
 /* arch_prctl() codes -- the Linux x86-64 values the kernel expects. */

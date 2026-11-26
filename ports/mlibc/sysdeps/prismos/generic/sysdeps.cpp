@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include <sys/epoll.h>
 #include <sys/resource.h>
+#include <sys/shm.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/statfs.h>
@@ -1433,6 +1434,38 @@ int Sysdeps<SetSockopt>::operator()(int fd, int layer, int number,
                 const void *buffer, socklen_t size) {
         auto ret = sys(PRISM_SYS_SETSOCKOPT, fd, layer, number, buffer, size);
         return sc_error(ret);
+}
+
+/* ---- System V shared memory (kernel syscalls 141..144) ---- */
+
+int Sysdeps<Shmget>::operator()(int *shm_id, key_t key, size_t size, int shmflg) {
+        auto ret = sys(PRISM_SYS_SHMGET, key, size, shmflg);
+        if(int e = sc_error(ret); e)
+                return e;
+        *shm_id = static_cast<int>(ret);
+        return 0;
+}
+
+int Sysdeps<Shmat>::operator()(void **seg_start, int shmid, const void *shmaddr, int shmflg) {
+        auto ret = sys(PRISM_SYS_SHMAT, shmid, shmaddr, shmflg);
+        if(int e = sc_error(ret); e)
+                return e;
+        *seg_start = reinterpret_cast<void *>(ret);
+        return 0;
+}
+
+int Sysdeps<Shmdt>::operator()(const void *shmaddr) {
+        auto ret = sys(PRISM_SYS_SHMDT, shmaddr);
+        return sc_error(ret);
+}
+
+/* IPC_STAT / SHM_STAT answer 0 or an index, so the result rides back in *idx. */
+int Sysdeps<Shmctl>::operator()(int *idx, int shmid, int cmd, struct shmid_ds *buf) {
+        auto ret = sys(PRISM_SYS_SHMCTL, shmid, cmd, buf);
+        if(int e = sc_error(ret); e)
+                return e;
+        *idx = static_cast<int>(ret);
+        return 0;
 }
 
 } // namespace mlibc

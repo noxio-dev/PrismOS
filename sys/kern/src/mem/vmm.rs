@@ -1404,6 +1404,8 @@ impl Drop for AddressSpace {
         if alloc::rc::Rc::strong_count(&self.refs) > 1 {
             return;
         }
+        // SysV shared memory: its attachments end with the last handle.
+        crate::user::shm::on_aspace_gone(self.pml4);
         // Never free the tables we are running on.
         if current_cr3() == self.pml4 {
             activate_kernel();

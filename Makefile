@@ -676,6 +676,14 @@ signalfdtest:
 	rustc --edition 2021 --test tests/signalfd_host.rs -o $(B)/signalfd_host
 	$(B)/signalfd_host --test-threads=1
 
+# Host-side tests of System V shared memory (no QEMU needed): shmget keys and
+# flags, permissions, attach counting, deferred IPC_RMID, shmid64_ds layout.
+.PHONY: shmsysvtest
+shmsysvtest:
+	mkdir -p $(B)
+	rustc --edition 2021 --test tests/shm_sysv_host.rs -o $(B)/shm_sysv_host
+	$(B)/shm_sysv_host --test-threads=1
+
 .PHONY: sigiotest
 sigiotest:
 	mkdir -p $(B)

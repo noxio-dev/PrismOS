@@ -28,7 +28,7 @@ Basis: analysis of the repository as read (Rust kernel, mlibc port,
 - [x] `MAP_SHARED` on tmpfs files (file frames mapped directly; other file systems answer `-ENODEV`, a real page cache stays optional)
 - [x] `ftruncate` / `truncate` / `fallocate` (syscalls 113..115)
 - [x] `/dev/shm` (tmpfs, 32 MiB) + `memfd_create` (116); `shm_open` = mlibc's open on `/dev/shm`, **to verify at mlibc build time**; unlinked-but-open files stay alive
-- [ ] SysV `shmget` / `shmat` / `shmdt` / `shmctl` (MIT-SHM)
+- [x] SysV `shmget` / `shmat` / `shmdt` / `shmctl` (141..144, MIT-SHM: segments are anonymous `/dev/shm` files mapped `MAP_SHARED` like `mmap` does, so attachers and fork children share the same frames; `IPC_RMID` is deferred to the last detach, attachments follow `fork` / `munmap` / `exit` / `execve`; `IPC_STAT` / `IPC_SET` / `IPC_INFO` / `SHM_INFO` / `SHM_STAT`, `SHM_RDONLY` / `SHM_RND` / `SHM_REMAP`; rules in `user/shm_core.rs`, host tests `make shmsysvtest`; mlibc sysdeps `Shmget` / `Shmat` / `Shmdt` / `Shmctl` wired)
 
 ### 2.3 Event descriptors
 - [x] `eventfd` (`eventfd2`, 124: counter, semaphore mode, O_NONBLOCK, poll / epoll readiness; host tests `make eventfdtest`; mlibc sysdep `EventfdCreate` wired)

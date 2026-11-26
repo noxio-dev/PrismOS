@@ -794,6 +794,7 @@ pub fn fork_current(frame: &IsrFrame) -> i64 {
     // alternate stack / thread pointer state across fork).
     let (cwd, brk_base, brk) = (cur.cwd.clone(), cur.brk_base, cur.brk);
     let (fs_base, gs_base) = (cur.fs_base, cur.gs_base);
+    let parent_cr3 = cur.aspace.as_ref().map_or(0, |a| a.cr3());
     let aspace = {
         let Some(a) = cur.aspace.as_mut() else { return -EFAULT };
         match a.fork_cow() {
@@ -801,6 +802,7 @@ pub fn fork_current(frame: &IsrFrame) -> i64 {
             None => return -ENOMEM,
         }
     };
+    let child_cr3 = aspace.cr3();
     // The child resumes as if fork() had just returned 0.
     let mut child_frame = *frame;
     child_frame.rax = 0;
@@ -818,6 +820,8 @@ pub fn fork_current(frame: &IsrFrame) -> i64 {
         brk,
     ) {
         Ok(pid) => {
+            // SysV shared memory: the child holds the parent's attachments too.
+            crate::user::shm::on_fork(parent_cr3, child_cr3);
             // Single CPU: the child cannot run before we yield, so the fixup
             // below happens-before its first switch.  The stdio table the
             // spawn built is dropped here, replaced by the parent's copy.

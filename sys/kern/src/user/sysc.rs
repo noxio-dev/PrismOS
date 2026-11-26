@@ -519,8 +519,10 @@ pub fn sys_munmap(addr: u64, len: u64) -> i64 {
     }
     let Some(cur) = process::current() else { return -EFAULT };
     let Some(aspace) = cur.aspace.as_mut() else { return -EFAULT };
+    let cr3 = aspace.cr3();
     // SAFETY: syscall context, our CR3 is live.
     if unsafe { aspace.unmap(addr, len) } {
+        crate::user::shm::on_unmap(cr3, addr, len);
         0
     } else {
         -EINVAL

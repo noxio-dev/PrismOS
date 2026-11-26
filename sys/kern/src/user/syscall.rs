@@ -96,6 +96,9 @@
 //    130..140 openat fstatat mkdirat unlinkat readlinkat renameat symlinkat
 //             linkat faccessat fchmodat fchownat (dirfd first; user/fd/at.rs)
 //           (user/fd/signalfd.rs, rules in user/signalfd_core.rs)
+//    141 shmget(key, size, flg)     142 shmat(id, addr, flg) -> address
+//    143 shmdt(addr)                144 shmctl(id, cmd, buf)
+//           (System V shared memory, user/shm.rs, rules in user/shm_core.rs)
 //
 // Phase 3.4 (the BusyBox step -- the gaps the port revealed):
 //    62 fchdir(fd)                  the directory an fd is open on
@@ -498,6 +501,11 @@ pub extern "C" fn dispatch(frame: &mut IsrFrame) {
         138 => fd::at::sys_faccessat(a0, a1, a2, frame.r10),
         139 => fd::at::sys_fchmodat(a0, a1, a2, frame.r10),
         140 => fd::at::sys_fchownat(a0, a1, a2, frame.r10, frame.r8),
+        // ---- System V shared memory, for MIT-SHM (user/shm.rs) -----------
+        141 => crate::user::shm::sys_shmget(a0, a1, a2),
+        142 => crate::user::shm::sys_shmat(a0, a1, a2),
+        143 => crate::user::shm::sys_shmdt(a0),
+        144 => crate::user::shm::sys_shmctl(a0, a1, a2),
         _ => -ENOSYS,
     };
     frame.rax = ret as u64;

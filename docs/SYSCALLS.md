@@ -144,6 +144,10 @@ Implemented in `user/fd/epoll.rs` over the host-tested interest list
 | 138 | `faccessat(dirfd, path, mode, flags)` | flags in `r10`: `AT_EACCESS` (moot, real ids are used) and `AT_SYMLINK_NOFOLLOW` accepted |
 | 139 | `fchmodat(dirfd, path, mode, flags)` | flags in `r10`, only 0 |
 | 140 | `fchownat(dirfd, path, uid, gid, flags)` | `gid` in `r10`, `flags` in `r8`: `AT_SYMLINK_NOFOLLOW`, `AT_EMPTY_PATH` (= fchown) |
+| 141 | `shmget(key, size, flg)` | System V shared memory; `IPC_PRIVATE` / `IPC_CREAT` / `IPC_EXCL`, size up to 32 MiB (the size of `/dev/shm`) |
+| 142 | `shmat(id, addr, flg)` | returns the mapping's address; `SHM_RDONLY`, `SHM_RND`, `SHM_REMAP`; `SHM_EXEC` is not honoured (shared mappings are never executable) |
+| 143 | `shmdt(addr)` | `addr` must be the start of an attachment |
+| 144 | `shmctl(id, cmd, buf)` | `IPC_RMID` (deferred to the last detach), `IPC_SET`, `IPC_STAT`, `IPC_INFO`, `SHM_INFO`, `SHM_STAT[_ANY]`, `SHM_LOCK/UNLOCK` (root, no-op); Linux x86-64 `shmid64_ds` |
 
 The *at() family (`user/fd/at.rs`): a `dirfd` other than `AT_FDCWD` must be a descriptor of an open
 directory (`-EBADF` if closed, `-ENOTDIR` if not a directory). The base is the path the directory was

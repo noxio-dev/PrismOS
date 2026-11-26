@@ -225,7 +225,16 @@ struct PrismOSSysdepTags :
         Renameat,
         Symlinkat,
         Linkat,
-        Fchmodat
+        Fchmodat,
+
+        /* System V shared memory (kernel syscalls 141..144, user/shm.rs):
+         * what MIT-SHM's shmget / shmat / shmdt / shmctl stand on.  The
+         * kernel speaks the Linux x86-64 shmid64_ds, which is mlibc's
+         * struct shmid_ds, so the buffers cross unchanged. */
+        Shmget,
+        Shmat,
+        Shmdt,
+        Shmctl
 {};
 
 struct SysdepTraits {
