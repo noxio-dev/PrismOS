@@ -322,7 +322,7 @@ MLIBC_SRC ?= build/mlibc
 TOOLCHAIN  := $B/toolchain/usr
 SYSROOT    := $(TOOLCHAIN)/x86_64-prismos
 
-.PHONY: mlibc pkgs hello-dyn bintest
+.PHONY: mlibc pkgs hello-dyn dltest bintest
 mlibc: $B/toolchain/usr/.stamp
 
 # Any change under ports/mlibc -- the sysdeps tree, not just the
@@ -359,6 +359,25 @@ $(HELLO_DYN): pkg/hello/src/hello.c pkg/include/prism_raw.h \
 	@mkdir -p $(@D)
 	sh ports/toolchain/build.sh stage dyn
 	sh ports/toolchain/verify.sh $@ $(SYSROOT) dyn
+
+# dlopen / dlsym from ring 3 (docs/XORG.md, 3.2): /usr/bin/dltest, a
+# dynamic PIE that dlopen()s /usr/lib/libdlplug.so -- a plug-in shaped
+# like an Xorg module (constructor, data, imports from libc and from the
+# host).  mlibc's rtld provides the machinery; build.sh's dl stage builds
+# the pair and checks the ELF shape the run depends on; `dltest` in the
+# guest prints "dltest: N/N checks passed" (boot_test.py runs it).
+DLTEST     := $B/usr/bin-mlibc-dyn/dltest
+DLPLUG_SO  := $B/usr/bin-mlibc-dyn/libdlplug.so
+
+dltest: $(DLTEST)
+
+$(DLTEST): ports/toolchain/dltest/dltest.c ports/toolchain/dltest/dlplug.c \
+		ports/toolchain/build.sh $(HELLO_DYN)
+	@mkdir -p $(@D)
+	sh ports/toolchain/build.sh stage dl
+
+# The stage builds the plug-in with the host program: one recipe, two files.
+$(DLPLUG_SO): $(DLTEST)
 
 # ---- P1 (ESP) and P3 (ext4 root) trees -------------------------------------------
 
@@ -397,7 +416,7 @@ $B/root.wad: FORCE
 FORCE:
 
 $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
-	$(HELLO_DYN) $B/pkgs.stamp $B/binutils.stamp $B/busybox.stamp $B/nano.stamp \
+	$(HELLO_DYN) $(DLTEST) $(DLPLUG_SO) $B/pkgs.stamp $B/binutils.stamp $B/busybox.stamp $B/nano.stamp \
 	$(DOOM_WAD) $B/root.wad $(ROOTFS_FILES)
 	rm -rf $B/root
 	mkdir -p $B/root/boot/lua $B/root/boot/defaults $B/root/boot/kernel \
@@ -420,6 +439,10 @@ $B/root.stamp: $B/kernel $(wildcard boot/lua/*.lua) $(wildcard boot/conf/*) \
 	cp $B/kernel $B/root/boot/kernel/kernel
 	$(PYTHON) tools/prism.py install --all --dest $B/root
 	cp $(HELLO_DYN) $B/root/usr/bin/hello-dyn
+	# dlopen proof: the host program and the plug-in it loads by path
+	# (/usr/lib is where the rtld's default search path looks, too).
+	cp $(DLTEST) $B/root/usr/bin/dltest
+	cp $(DLPLUG_SO) $B/root/usr/lib/libdlplug.so
 	# Phase 4.1: the binutils utilities, cross-built for x86_64-prismos --
 	# the first tools the target itself owns, the seed of phase 5's
 	# self-hosting (as and ld stay 5.1's).  Stripped already: the cross

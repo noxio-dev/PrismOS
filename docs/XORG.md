@@ -91,7 +91,20 @@ with a minimal `xorg.conf` (`Driver "modesetting"`, `kmsdev
 "/dev/dri/card0"`, evdev for input, `AutoAddDevices off`).
 
 ### 3.2 Module loading
-- [ ] check `dlopen` / `dlsym` in the mlibc port (Xorg's `.so` modules)
+- [x] `dlopen` / `dlsym` / `dlclose` / `dlerror` / `dladdr` in the mlibc port (Xorg's `.so` modules).
+      Nothing to write in the library: mlibc already carries them -- `dlfcn.cpp` in `libc.so` wraps the
+      rtld's `__dlapi_*` exports in `ld.so`, and every sysdep the rtld calls (`Open`, `Read`, `Seek`,
+      `VmMap`, `Close`, `TcbSet`, `Stat`) is implemented in `sysdeps/prismos` (not an `ENOSYS`).  The rtld binds eagerly, so a plain
+      DSO needs no lazy-binding support; `-ldl` is mlibc's empty `libdl`, the symbols are in `libc.so`;
+      the default search path is `/lib`, `/lib64`, `/usr/lib`, `/usr/lib64` (+ `LD_LIBRARY_PATH`).
+      What was missing was a proof: `ports/toolchain/dltest` (`make dltest`, `build.sh stage dl`) builds
+      `/usr/bin/dltest` (a dynamic PIE linked `--export-dynamic`) and `/usr/lib/libdlplug.so`, a plug-in
+      shaped like an Xorg module (constructor, initialised data, relocated function-pointer table, imports
+      from libc **and from the host executable**, a general-dynamic TLS variable); 16 checks, run by
+      `boot_test.py`'s userland scenario (`dltest: 16/16 checks passed`).  The stage also asserts the
+      exports and the ELF shape.  **Still to run under QEMU**: the sources compile against the port's
+      headers and the check logic passes against glibc, but no PrismOS boot has executed it yet -- the
+      TLS and host-import checks are the likeliest to show a kernel / rtld gap.
 - [ ] plan B: build `modesetting`, `fb`, `evdev` statically into the server
 
 ## 4. Validation milestones

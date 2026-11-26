@@ -93,7 +93,7 @@ while [ $# -gt 0 ]; do
         --src)    SRC=$2; shift 2 ;;
         --jobs)   JOBS=$2; shift 2 ;;
         stage)    STAGE=$2; shift 2 ;;
-        list)     echo "fetch binutils gcc mlibc hello verify dynlib dyn dynverify"; exit 0 ;;
+        list)     echo "fetch binutils gcc mlibc hello verify dynlib dyn dl dynverify"; exit 0 ;;
         *) echo "usage: $0 [--prefix dir] [--src dir] [--jobs n] [stage <name>|list]" >&2; exit 2 ;;
         esac
 done
@@ -350,6 +350,102 @@ do_dyn() {
         say dyn "build/usr/bin-mlibc-dyn/hello"
 }
 
+# ---- stage: dl ----------------------------------------------------------------
+# dlopen / dlsym from ring 3 (docs/XORG.md, 3.2 -- Xorg loads its drivers and
+# extensions as shared objects).  The machinery is mlibc's: dlfcn.cpp in
+# libc.so wraps the rtld's __dlapi_* exports (ld.so), and the rtld binds
+# eagerly, so a plain DSO needs nothing special.  This stage builds the
+# proof, shaped like an Xorg module and the server that loads it:
+#
+#   libdlplug.so   the plug-in: a DSO with no crt and no entry (the recipe
+#                  of ports/nano's -shared answer -- -z norelro because the
+#                  rtld ignores PT_GNU_RELRO of a DSO, one protection per
+#                  page because ld.so maps segments with file mmap), linked
+#                  against libc.so, importing a symbol from the host
+#   dltest         the host: the dynamic PIE of do_dyn plus --export-dynamic
+#                  (the way Xorg's executable exports the API its modules
+#                  call), carrying PT_INTERP /lib/ld.so and DT_NEEDED
+#                  libc.so; it dlopen()s /usr/lib/libdlplug.so
+#
+# Both land in build/usr/bin-mlibc-dyn/ (the image takes them from there:
+# /usr/bin/dltest, /usr/lib/libdlplug.so); the stage checks the ELF shape
+# it depends on before it returns.
+do_dl() {
+        do_dyn
+        CC=$PREFIX/bin/x86_64-prismos-gcc
+        LD=$PREFIX/bin/x86_64-prismos-ld
+        READELF=$PREFIX/bin/x86_64-prismos-readelf
+        GCCINC=$($CC -print-file-name=include)
+        LIBGCC=$($CC -print-libgcc-file-name)
+        SRCDIR=$REPO/ports/toolchain/dltest
+        OUTDIR=$REPO/build/usr/bin-mlibc-dyn
+        mkdir -p "$OUTDIR"
+        CFLAGS="-O2 -Wall -Wextra -ffreestanding -fno-stack-protector \
+                -fno-asynchronous-unwind-tables -fno-math-errno \
+                -nostdinc -isystem $GCCINC -isystem $SYSROOT/usr/include"
+
+        say dl "compiling the plug-in (-fPIC) and the host (-fPIE)"
+        $CC -c "$SRCDIR/dlplug.c" -o "$OUTDIR/dlplug.o" $CFLAGS -fPIC
+        $CC -c "$SRCDIR/dltest.c" -o "$OUTDIR/dltest.o" $CFLAGS -fPIE
+
+        say dl "linking libdlplug.so (-shared, DT_NEEDED libc.so, -z now)"
+        $LD -m elf_x86_64 -shared -z now -z max-page-size=4096 \
+              -z separate-code -z noexecstack -z norelro \
+              -soname libdlplug.so -o "$OUTDIR/libdlplug.so" \
+              "$OUTDIR/dlplug.o" \
+              -L"$SYSROOT/usr/lib" -rpath-link "$SYSROOT/usr/lib" -lc "$LIBGCC"
+
+        say dl "linking dltest (dynamic PIE, --export-dynamic)"
+        CRTBEGIN=$($CC -print-file-name=crtbeginS.o)
+        CRTEND=$($CC -print-file-name=crtendS.o)
+        $LD -m elf_x86_64 -pie --export-dynamic \
+              --dynamic-linker /lib/ld.so -z now -z separate-code \
+              -z max-page-size=4096 -z noexecstack -z norelro -e _start \
+              -o "$OUTDIR/dltest" \
+              "$SYSROOT/usr/lib/Scrt1.o" "$SYSROOT/usr/lib/crti.o" \
+              "$CRTBEGIN" "$OUTDIR/dltest.o" \
+              -L"$SYSROOT/usr/lib" -rpath-link "$SYSROOT/usr/lib" -lc "$LIBGCC" \
+              "$CRTEND" "$SYSROOT/usr/lib/crtn.o"
+
+        # The shape the run depends on: a missing piece here is a link-time
+        # answer, not a boot-time mystery.
+        fail=0
+        need() { # description command...
+                d=$1; shift
+                if ! "$@" >/dev/null 2>&1; then say dl "FAIL: $d"; fail=1; fi
+        }
+        hdrs=$($READELF -lW "$OUTDIR/dltest")
+        dyns=$($READELF -dW "$OUTDIR/dltest")
+        psyms=$($READELF -dW "$OUTDIR/libdlplug.so")
+        need "dltest has PT_INTERP /lib/ld.so" \
+                sh -c "echo \"\$1\" | grep -q 'Requesting program interpreter: /lib/ld.so'" _ "$hdrs"
+        need "dltest needs libc.so" \
+                sh -c "echo \"\$1\" | grep -q 'NEEDED.*libc.so'" _ "$dyns"
+        need "dltest exports dltest_host_hook (--export-dynamic)" \
+                sh -c "$READELF --dyn-syms -W \"$OUTDIR/dltest\" | grep -q ' dltest_host_hook\$'"
+        need "libdlplug.so is a DSO with SONAME libdlplug.so" \
+                sh -c "echo \"\$1\" | grep -q 'SONAME.*libdlplug.so'" _ "$psyms"
+        need "libdlplug.so needs libc.so" \
+                sh -c "echo \"\$1\" | grep -q 'NEEDED.*libc.so'" _ "$psyms"
+        need "libdlplug.so has no text relocations" \
+                sh -c "! echo \"\$1\" | grep -q TEXTREL" _ "$psyms"
+        for s in dlplug_add dlplug_answer dlplug_ctor_ran dlplug_strlen \
+                 dlplug_call_host dlplug_tls_bump dlplug_ops; do
+                need "libdlplug.so exports $s" \
+                        sh -c "$READELF --dyn-syms -W \"$OUTDIR/libdlplug.so\" | grep -q ' $s\$'"
+        done
+        for s in dlopen dlsym dlclose dlerror dladdr; do
+                need "libc.so exports $s" \
+                        sh -c "$READELF --dyn-syms -W \"$SYSROOT/usr/lib/libc.so\" | grep -q ' $s\$'"
+        done
+        for s in __dlapi_open __dlapi_resolve __dlapi_close __dlapi_error; do
+                need "ld.so exports $s" \
+                        sh -c "$READELF --dyn-syms -W \"$SYSROOT/usr/lib/ld.so\" | grep -q ' $s\$'"
+        done
+        [ "$fail" -eq 0 ] || { say dl "the dlopen proof is malformed"; exit 1; }
+        say dl "build/usr/bin-mlibc-dyn/{dltest,libdlplug.so} ok"
+}
+
 # ---- stage: dynverify ---------------------------------------------------------
 # The dynamic-linking verification (verify.sh's dyn mode): the loader's own
 # checks on the executable (PT_INTERP, DT_NEEDED, BIND_NOW, the PLT), the
@@ -369,6 +465,7 @@ case "$STAGE" in
         verify)   do_verify ;;
         dynlib)   do_dynlib ;;
         dyn)      do_dyn ;;
+        dl)       do_dl ;;
         dynverify) do_dynverify ;;
         *) echo "unknown stage: $STAGE (try: list)" >&2; exit 2 ;;
 esac

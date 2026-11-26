@@ -718,7 +718,8 @@ def main():
     # The busybox applets the session leans on, in ash: the tmpfs package
     # (twice -- a good /tmp citizen leaves the tree clean), fork, the
     # dynamically linked hello (AT_PHNUM = 8, the interpreter's own), the
-    # infofetch banner, and ash's own pipes / arithmetic / subshell.
+    # infofetch banner, ash's own pipes / arithmetic / subshell, and dltest
+    # (dlopen / dlsym of a plug-in DSO, the Xorg module model).
     scenarios.append(
         ("BIOS userland: tmpfs x2, fork, hello-dyn, infofetch, ash", bios_cmd,
          [(SHELL_PROMPT, "tmpfs\r"),
@@ -730,7 +731,8 @@ def main():
           ("wc=3", "echo answer=$((6 * 7))\r"),
           ("answer=42", "for i in 1 2 3; do echo line $i; done | wc -l | sed 's/^/lines=/'\r"),
           ("lines=3", "busybox uname -s\r"),
-          ("PrismOS", "ash -c 'echo subshell $((40 + 2))'\r")],
+          ("PrismOS", "ash -c 'echo subshell $((40 + 2))'\r"),
+          ("subshell 42", "dltest\r")],
          [("count", "tmpfs: 37/37 checks passed", 2),
           "tmpfs: 37/37 checks passed",
           "fork: all 10 passed",
@@ -740,7 +742,13 @@ def main():
           "QEMU Virtual CPU version",          # infofetch's CPU line
           "wc=3", "answer=42", "lines=3",
           "PrismOS",                           # busybox uname -s (the utsname)
-          "subshell 42"], 300))
+          "subshell 42",
+          # dlopen / dlsym (docs/XORG.md 3.2): a dynamic PIE loads
+          # /usr/lib/libdlplug.so, a plug-in shaped like an Xorg module
+          "dltest: ok   dlopen(path, RTLD_NOW)",
+          "dltest: ok   plug-in calls the host's exported symbol",
+          "dltest: ok   plug-in thread-local (general dynamic)",
+          "dltest: 16/16 checks passed"], 300))
 
     # ash as a shell around real software: find over the tree, a tar round
     # trip, redirections into /tmp, umask + chmod + ls -l, grep, and a su
