@@ -1,0 +1,217 @@
+#!/bin/sh
+#-
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 noxio-dev
+#
+# prism-cc -- the C compiler meson sees in the libdrm port's cross file.
+#
+# x86_64-prismos-gcc compiles, but it does not link for PrismOS by itself:
+# every program of this tree is linked by an explicit `ld` call (the crt
+# "sandwich" of ports/toolchain/build.sh and tools/prism.py).  meson links
+# test programs while it configures (cc.links, has_function, the sanity
+# check), and installs shared libraries, so it needs a driver that does the
+# link the way the loader expects.  This is the driver of ports/nano
+# (do_cc) reduced to what libdrm needs:
+#
+#   compile  (-c, -E, -M...)  x86_64-prismos-gcc against the mlibc sysroot
+#                             only (-nostdinc, the compiler's own headers
+#                             and the sysroot's), -ffreestanding -fPIE ...
+#                             the do_prog discipline of ports/toolchain
+#   link                      the static-PIE sandwich the kernel's loader
+#                             applies itself: Scrt1 / crti / crtbeginS /
+#                             objects / libc.a / libgcc / crtendS / crtn
+#   link -shared              a DSO: ld -shared, no crt, no entry; -lc
+#                             resolves to libc.so so the record is
+#                             DT_NEEDED libc.so
+#
+# Where it looks (all overridable from the environment, build.sh exports
+# them):
+#   PRISM_PREFIX   the toolchain prefix (default build/toolchain/usr)
+#   PRISM_PORTSYS  the port sysroot searched for -l after the -L list
+#                  (default build/xorg-native/sysroot)
+# An -l resolves in the -L list, then the port sysroot, then the mlibc
+# sysroot (libm, libc ...); the static link takes archives only, the DSO
+# link shared objects only (a DSO must not weld archive code).
+set -e
+
+REPO=$(cd "$(dirname "$0")/../.." && pwd)
+PREFIX=${PRISM_PREFIX:-$REPO/build/toolchain/usr}
+SYSROOT=$PREFIX/x86_64-prismos
+PORTSYS=${PRISM_PORTSYS:-$REPO/build/xorg-native/sysroot}
+CCRAW=$PREFIX/bin/x86_64-prismos-gcc
+LD=$PREFIX/bin/x86_64-prismos-ld
+
+[ -x "$CCRAW" ] || {
+	echo "prism-cc: no $CCRAW -- run \`make mlibc\` first" >&2
+	exit 1
+}
+
+CRTBEGIN=$("$CCRAW" -print-file-name=crtbeginS.o)
+CRTEND=$("$CCRAW" -print-file-name=crtendS.o)
+LIBGCC=$("$CCRAW" -print-libgcc-file-name)
+GCCINC=$("$CCRAW" -print-file-name=include)
+BASE="-O2 -ffreestanding -fPIE -fno-stack-protector -fno-asynchronous-unwind-tables -fno-math-errno"
+
+compile() {
+	exec "$CCRAW" $BASE -nostdinc -isystem "$GCCINC" \
+		-isystem "$SYSROOT/usr/include" "$@"
+}
+
+# ---- the link ---------------------------------------------------------------
+# meson's probes hand the driver a .c (compile and link in one command);
+# its link rules hand it objects and archives.  Both end in the same link.
+link() {
+	out= objs= archives= libs= ldirs= srcs= tmpobjs= wflags= ldflags=
+	mode=static
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		-o)         out=$2; shift 2 ;;
+		--version|-v|-V|-qversion|-dumpversion|-dumpmachine|-print-*)
+		            exec "$CCRAW" "$@" ;;
+		-shared)    mode=dso; shift ;;
+		-Wl,*)      oifs=$IFS; IFS=,
+		            for w in ${1#-Wl,}; do
+				wflags="$wflags $w"
+		            done
+		            IFS=$oifs; shift ;;
+		-I*|-D*|-U*|-g*|-O*|-f*|-W*|-m*|-pedantic*|-std*|-c|-pthread)
+		            shift ;;
+		-L)         ldirs="$ldirs $2"; shift 2 ;;
+		-L*)        ldirs="$ldirs ${1#-L}"; shift ;;
+		-l)         libs="$libs $2"; shift 2 ;;
+		-l*)        libs="$libs ${1#-l}"; shift ;;
+		*.lo)       objs="$objs ${1%.lo}.o"; shift ;;
+		*.o)        objs="$objs $1"; shift ;;
+		*.a)        archives="$archives $1"; shift ;;
+		*.c)        srcs="$srcs $1"; shift ;;
+		*)          shift ;;
+		esac
+	done
+
+	# the -Wl parts go to ld verbatim: -soname takes the next word as its
+	# value, -l / -L join the resolution below, anything else rides in
+	# order
+	soname=
+	prev=
+	prevkind=
+	for w in $wflags; do
+		if [ -n "$prev" ]; then
+			case $prevkind in
+			soname) soname=$w ;;
+			l)      libs="$libs $w" ;;
+			esac
+			prev=
+			prevkind=
+			continue
+		fi
+		case $w in
+		-soname|--soname) prev=$w; prevkind=soname ;;
+		-l)      prev=$w; prevkind=l ;;
+		-l*)     libs="$libs ${w#-l}" ;;
+		-L*)     ldirs="$ldirs ${w#-L}" ;;
+		*)       ldflags="$ldflags $w" ;;
+		esac
+	done
+	if [ -n "$prev" ]; then
+		echo "prism-cc: -Wl,$prev without a value" >&2
+		exit 1
+	fi
+
+	# the default output name of a compiler called with no -o
+	[ -n "$out" ] || out=a.out
+
+	# the one-command compile-and-link of meson's probes (their flags are
+	# dropped above: a probe only needs the sysroot's headers)
+	for f in $srcs; do
+		o=$(mktemp "${TMPDIR:-/tmp}/prism-cc.XXXXXX")
+		if ! "$CCRAW" $BASE -nostdinc -isystem "$GCCINC" \
+				-isystem "$SYSROOT/usr/include" -c -x c "$f" -o "$o"; then
+			rm -f "$o" $tmpobjs
+			exit 1
+		fi
+		objs="$objs $o"
+		tmpobjs="$tmpobjs $o"
+	done
+	[ -n "$objs" ] || { echo "prism-cc: nothing to link" >&2; exit 1; }
+
+	resolve() { # name -> path (echoed) or nothing
+		l=$1
+		if [ "$mode" = dso ]; then
+			for d in $ldirs "$PORTSYS/usr/lib" "$SYSROOT/usr/lib"; do
+				[ -n "$d" ] || continue
+				if [ -f "$d/lib$l.so" ]; then
+					echo "$d/lib$l.so"
+					return
+				fi
+				for s in "$d/lib$l".so.*; do
+					if [ -f "$s" ]; then
+						echo "$s"
+						return
+					fi
+				done
+			done
+			return
+		fi
+		for d in $ldirs "$PORTSYS/usr/lib" "$SYSROOT/usr/lib"; do
+			[ -n "$d" ] || continue
+			if [ -f "$d/lib$l.a" ]; then
+				echo "$d/lib$l.a"
+				return
+			fi
+		done
+	}
+	resolved=
+	for l in $libs; do
+		found=$(resolve "$l")
+		if [ -z "$found" ]; then
+			rm -f $tmpobjs
+			echo "prism-cc: cannot resolve -l$l" >&2
+			exit 1
+		fi
+		resolved="$resolved $found"
+	done
+
+	if [ "$mode" = dso ]; then
+		# ---- a DSO: no crt, no entry, no libgcc.  -z norelro: the rtld
+		# ignores PT_GNU_RELRO of a DSO; max-page-size=4096 and
+		# separate-code: one protection per page, the way ld.so maps
+		# segments with file mmap.  The soname defaults to the output's
+		# basename (the file ld.so looks for).
+		if [ -z "$soname" ]; then soname=${out##*/}; fi
+		if "$LD" -m elf_x86_64 -shared -z max-page-size=4096 \
+			-z separate-code -z noexecstack -z norelro \
+			-soname "$soname" -o "$out" \
+			$objs $archives $resolved $ldflags; then
+			rc=0
+		else
+			rc=$?
+		fi
+		rm -f $tmpobjs
+		exit $rc
+	fi
+
+	# ---- the static-PIE sandwich of tools/prism.py's compile_and_link.
+	# libc.a leads the group so the archives' mutual dependencies stay
+	# satisfiable in both directions.
+	if "$LD" -m elf_x86_64 -pie --no-dynamic-linker -z separate-code \
+		-z max-page-size=4096 -z noexecstack -z norelro -e _start \
+		-o "$out" \
+		"$SYSROOT/usr/lib/Scrt1.o" "$SYSROOT/usr/lib/crti.o" \
+		"$CRTBEGIN" \
+		$objs \
+		--start-group "$SYSROOT/usr/lib/libc.a" \
+		$archives $resolved "$LIBGCC" --end-group \
+		"$CRTEND" "$SYSROOT/usr/lib/crtn.o" $ldflags; then
+		rc=0
+	else
+		rc=$?
+	fi
+	rm -f $tmpobjs
+	exit $rc
+}
+
+case " $* " in
+*" -E "*|*" -M"*) compile "$@" ;;
+*" -c "*)          compile "$@" ;;
+*)                 link "$@" ;;
+esac

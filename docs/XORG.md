@@ -65,7 +65,9 @@ Suggested build order:
 1. [x] `xorgproto`, `xtrans`, `util-macros` -- port in `ports/xorg` (`make xorg`: host-tool install into
         `build/xorg-native/sysroot`, `pkg-config` + header check); **`xorgproto` 2024.1 built and verified**,
         `xtrans` and `util-macros` still to run (not needed by `xorgproto` itself)
-2. [ ] `libdrm` (no GPU drivers, e.g. `-Dintel=disabled` etc.)
+2. [x] `libdrm` (no GPU drivers, e.g. `-Dintel=disabled` etc.) -- port in `ports/libdrm` (`make libdrm`: meson cross build,
+        the `__linux__` branches taken for `__prismos__` by `patches/libdrm-2.4.124-prismos.patch`, static `libdrm.a` into
+        `build/xorg-native/sysroot`, `drmtest` for M3); **still to run** against the cross toolchain (needs `make mlibc`)
 3. [ ] `pixman`
 4. [ ] `freetype`, `libfontenc`, `libXfont2`
 5. [ ] `libxcvt`, `libxkbfile`

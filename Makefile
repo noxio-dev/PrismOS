@@ -79,7 +79,7 @@ EFI_OBJS  := $(patsubst %.c,$B/efi/%.o,$(COMMON_SRCS) boot/loader/ext4.c $(wildc
 
 # ---- default target ----------------------------------------------------
 
-.PHONY: all clean run run-uefi run-iso test kernel esp root iso run-kvm run-uefi-kvm data fstest bintest pkgs binutils busybox busyboxtest nano xorg
+.PHONY: all clean run run-uefi run-iso test kernel esp root iso run-kvm run-uefi-kvm data fstest bintest pkgs binutils busybox busyboxtest nano xorg libdrm
 all: $B/$(NAME).img
 
 # ---- compile rules -------------------------------------------------------
@@ -277,6 +277,31 @@ xorg: $B/xorg.stamp
 $B/xorg.stamp: $(XORG_PORT_FILES)
 	@mkdir -p $(@D)
 	sh ports/xorg/build.sh
+	@touch $@
+
+# ---- Xorg, step 2: libdrm ----------------------------------------------------
+# ports/libdrm cross-builds libdrm 2.4.124 with meson, core library only (no
+# GPU driver), after a patch that takes its `#ifdef __linux__` branches --
+# the /sys/dev/char node discovery the kernel's sysfs serves -- for
+# __prismos__ too.  The compiler of its cross file is the port's own
+# prism-cc driver (x86_64-prismos-gcc does not link by itself).  It
+# installs into the same sysroot as ports/xorg, build/xorg-native/sysroot,
+# and builds build/libdrm-out/drmtest, the milestone-M3 program; nothing
+# goes into the image.  The libdrm tarball is not fetched through the
+# network if it is already in build/xorg-src.  The mlibc port checksum is
+# a dependency like the other ports': an edited sysdep rebuilds the
+# library, and this stamp follows.
+#
+#   make libdrm       fetch + patch, meson setup / build / install,
+#                     verify, build drmtest
+#   LIBDRM_LIBRARY=both make libdrm   also builds libdrm.so.2.124.0
+
+LIBDRM_PORT_FILES := $(shell find ports/libdrm -type f | sort)
+
+libdrm: $B/libdrm.stamp
+$B/libdrm.stamp: $B/toolchain/usr/.stamp $B/mlibc-port.md5 $(LIBDRM_PORT_FILES)
+	@mkdir -p $(@D)
+	sh ports/libdrm/build.sh
 	@touch $@
 
 # The applets the image carries as /usr/bin symlinks to busybox: the
