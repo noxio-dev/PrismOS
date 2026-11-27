@@ -62,7 +62,7 @@ Basis: analysis of the repository as read (Rust kernel, mlibc port,
 
 Suggested build order:
 
-1. [ ] `xorgproto`, `xtrans`, `util-macros` -- port in `ports/xorg` (`make xorg`: host-tool install into
+1. [x] `xorgproto`, `xtrans`, `util-macros` -- port in `ports/xorg` (`make xorg`: host-tool install into
         `build/xorg-native/sysroot`, `pkg-config` + header check); **`xorgproto` 2024.1 built and verified**,
         `xtrans` and `util-macros` still to run (not needed by `xorgproto` itself)
 2. [ ] `libdrm` (no GPU drivers, e.g. `-Dintel=disabled` etc.)
