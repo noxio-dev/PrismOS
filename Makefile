@@ -14,6 +14,13 @@ PYTHON    ?= python3
 CARGO     ?= cargo
 CARGOFLAGS ?=
 QEMU      ?= qemu-system-x86_64
+# QEMU's GTK display cannot confine a grabbed pointer under Wayland: GDK's
+# seat grab has no confine_to, so Ctrl+Alt+G leaves the host cursor free to
+# leave the window.  SDL2's Wayland backend uses pointer constraints and
+# grabs properly, so use it there (GTK stays the default on X11).  Override
+# with QEMU_DISPLAY=gtk, sdl or none.
+QEMU_DISPLAY ?= $(if $(or $(findstring wayland,$(XDG_SESSION_TYPE)),$(findstring wayland,$(WAYLAND_DISPLAY))),sdl,gtk)
+QEMU_DISPLAY_FLAGS = $(if $(filter-out none,$(QEMU_DISPLAY)),-display $(QEMU_DISPLAY))
 DATA_IMG  ?= build/data.img
 DATA_SIZE ?= 64M
 # Both disks sit on one AHCI controller: the boot disk on port 0 (where the
@@ -555,19 +562,20 @@ $(DATA_IMG):
 # ---- run / test -----------------------------------------------------------------
 
 run: $B/$(NAME).img $(DATA_IMG)
-	$(QEMU) $(QEMUFLAGS) $(call qemu_boot_drive,$<) -serial stdio
+	$(QEMU) $(QEMUFLAGS) $(QEMU_DISPLAY_FLAGS) $(call qemu_boot_drive,$<) -serial stdio
 
 run-uefi: $B/$(NAME).img $(DATA_IMG)
 	@test -n "$(OVMF_CODE)" || { echo "OVMF not found: set OVMF_CODE and OVMF_VARS"; exit 1; }
 	cp -f $(OVMF_VARS) $B/OVMF_VARS.fd
-	$(QEMU) $(QEMUFLAGS) -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	$(QEMU) $(QEMUFLAGS) $(QEMU_DISPLAY_FLAGS) \
+                -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
                 -drive if=pflash,format=raw,file=$B/OVMF_VARS.fd \
                 $(call qemu_boot_drive,$<) -serial stdio
 
 # KVM : BIOS
 run-kvm: $B/$(NAME).img $(DATA_IMG)
 	@test -e /dev/kvm || { echo "KVM unavailable: /dev/kvm not found"; exit 1; }
-	$(QEMU) -enable-kvm $(QEMUFLAGS) \
+	$(QEMU) -enable-kvm $(QEMUFLAGS) $(QEMU_DISPLAY_FLAGS) \
                 $(call qemu_boot_drive,$<) \
                 -serial stdio
 
@@ -578,7 +586,7 @@ run-uefi-kvm: $B/$(NAME).img $(DATA_IMG)
 	@test -f "$(OVMF_CODE)" || { echo "OVMF_CODE file not found: $(OVMF_CODE)"; exit 1; }
 	@test -f "$(OVMF_VARS)" || { echo "OVMF_VARS file not found: $(OVMF_VARS)"; exit 1; }
 	cp -f $(OVMF_VARS) $B/OVMF_VARS_KVM.fd
-	$(QEMU) -enable-kvm $(QEMUFLAGS) \
+	$(QEMU) -enable-kvm $(QEMUFLAGS) $(QEMU_DISPLAY_FLAGS) \
                 -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
                 -drive if=pflash,format=raw,file=$B/OVMF_VARS_KVM.fd \
                 $(call qemu_boot_drive,$<) \
@@ -632,7 +640,7 @@ build/root.img: build/prismos.img
 run-iso: build/prismos.iso
 	test -f "$(OVMF_CODE)"
 	cp "$(OVMF_VARS)" build/OVMF_VARS.iso.fd
-	$(QEMU) \
+	$(QEMU) $(QEMU_DISPLAY_FLAGS) \
 		-machine q35 \
 		-m 512M \
 		-drive if=pflash,format=raw,readonly=on,file="$(OVMF_CODE)" \

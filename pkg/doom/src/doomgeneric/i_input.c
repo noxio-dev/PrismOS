@@ -276,6 +276,25 @@ static void UpdateShiftStatus(int pressed, unsigned char key)
 }
 
 
+// Chocolate doom's mouse acceleration: motion past mouse_threshold is
+// multiplied by mouse_acceleration (i_video.c), emulating a DOS driver.
+
+static int AccelerateMouse(int val)
+{
+    if (val < 0)
+    {
+        return -AccelerateMouse(-val);
+    }
+
+    if (val > mouse_threshold)
+    {
+        return (int) ((val - mouse_threshold) * mouse_acceleration
+                      + mouse_threshold);
+    }
+
+    return val;
+}
+
 void I_GetEvent(void)
 {
     event_t event;
@@ -324,18 +343,24 @@ void I_GetEvent(void)
     }
 
 
-                /*
-            case SDL_MOUSEMOTION:
-                event.type = ev_mouse;
-                event.data1 = mouse_button_state;
-                event.data2 = AccelerateMouse(sdlevent.motion.xrel);
-                event.data3 = -AccelerateMouse(sdlevent.motion.yrel);
-                D_PostEvent(&event);
-                break;
-                */
+    // The mouse: the platform hands over everything that moved since the
+    // last tic as one (dx, dy, buttons) -- g_game.c's ev_mouse handler
+    // assigns rather than accumulates, so one event per poll is the
+    // right shape.  Screen y grows downward, doom's mousey upward.
+    {
+        int dx, dy, buttons;
+
+        if (DG_GetMouse(&dx, &dy, &buttons))
+        {
+            event.type = ev_mouse;
+            event.data1 = buttons;
+            event.data2 = AccelerateMouse(dx);
+            event.data3 = -AccelerateMouse(dy);
+            D_PostEvent(&event);
+        }
+    }
 }
 
 void I_InitInput(void)
 {
 }
-

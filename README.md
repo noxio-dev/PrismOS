@@ -49,6 +49,10 @@ make run-kvm-uefi # boot it in QEMU/KVM with OVMF
 make test         # automated boot tests
 ```
 
+On Wayland the run targets use QEMU's SDL display: its GTK backend cannot
+confine a grabbed pointer, so the host cursor can leave the window even after
+Ctrl+Alt+G.  Override the backend with `QEMU_DISPLAY=gtk`, `sdl` or `none`.
+
 Host-side tests that need no QEMU: `make fstest` (VFS + ext4 checked with
 `e2fsck`), `make bintest` (binutils port) and `make busyboxtest` (BusyBox port).
 

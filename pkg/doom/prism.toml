@@ -121,7 +121,11 @@ path = "/usr/bin/doom"
 # vtable the disassembly cannot see through), the anonymous maps mlibc's
 # allocator and the doom zone live in (22 / 23), the game's start chdir
 # (24), the tty's fcntl pair (27: F_GETFL/F_SETFL, the O_NONBLOCK of
-# DG_GetKey), the terminal's termios pair (29), the signal registration
+# DG_GetKey), the terminal's termios pair, the mouse's EVIOCGKEY resync
+# and the KDGKBENT lookup that picks ZQSD vs WASD (29; the mouse itself
+# is open 14 / read 13 / close 15 on /dev/input/event1, and the serial
+# path opens /dev/console 14 / close 15 for the keymap), the signal
+# registration
 # of the restore path (38) and the raw trio of pkg/include/prism_raw.h
 # (3 / 5 / 44 / 45).  The whole libc.a carries more wrappers than the
 # game will ever call (they come along for the file-granular link), so

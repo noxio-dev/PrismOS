@@ -165,6 +165,9 @@ Test safely on an image (no root privileges required):
 qemu-system-x86_64 -drive file=/tmp/prism.img,format=raw -serial stdio
 ```
 
+On Wayland, add `-display sdl`: QEMU's GTK backend cannot confine a grabbed
+pointer there, so Ctrl+Alt+G leaves the host cursor free to leave the window.
+
 ### Options
 
 | Option | Default | Description |

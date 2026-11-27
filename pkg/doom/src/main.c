@@ -19,6 +19,9 @@
  *                      more, and blit (fb_blit 45)
  *   DG_GetKey          the tty's bytes, translated: a hold-then-release
  *                      model, because a tty never says a key went up
+ *   DG_GetMouse        the PS/2 mouse, read from evdev (/dev/input/event1):
+ *                      motion accumulated per poll, the buttons, and the
+ *                      wheel as a previous / next weapon press
  *   DG_SleepMs         sleep 5
  *   DG_GetTicksMs      uptime_ms 3
  *   DG_SetWindowTitle  a no-op: the console has no title to set
@@ -44,8 +47,17 @@
 #include "doomgeneric/i_system.h"
 
 static int prism_kbd_init(void);
+static void prism_bind_movement(void);
+static int prism_mouse_init(void);
 static void prism_exit(void);
 static int kbd_medium;                  /* 1: console keycodes, press/release */
+
+/* doom's mouse button bits: 0 left (fire), 1 right (strafe), 2 middle
+ * (forward) -- the vanilla bindings.  The wheel has no button of its
+ * own in evdev; it is turned into a press of bit 3 / 4, bound to the
+ * previous / next weapon in DG_Init (see DG_GetMouse). */
+#define MB_PREVWEAPON 3
+#define MB_NEXTWEAPON 4
 
 /* ---------------------------------------------------------------- screen */
 
@@ -107,6 +119,14 @@ void DG_Init(void)
                 printf("doom: no keyboard (the game plays blind)\n");
         }
 
+        /* The mouse is optional: without the node the keyboard plays
+         * the whole game.  The wheel cycles the weapons (m_config's
+         * ORIGCODE is off, so the binds are set here, like the keys). */
+        if (prism_mouse_init() == 0) {
+                mousebprevweapon = MB_PREVWEAPON;
+                mousebnextweapon = MB_NEXTWEAPON;
+        }
+
         /* I_Quit runs the doom exit handlers and then -- the vendored
          * ORIGCODE being off -- returns: the SDL exit(0) it ended with
          * upstream is compiled out, so the game would keep running
@@ -125,20 +145,21 @@ void DG_Init(void)
          * as scancodes, it translates them away before the byte exists.
          * m_config's ORIGCODE is off (no config file is read or
          * written), so rebind here, before the game ever reads these:
-         * fire, use, strafe and speed on the keys a tty does send. */
+         * fire, use and speed on the keys a tty does send.  A/Q and D
+         * are direct strafe binds now (prism_bind_movement), so the
+         * vanilla alt-strafe modifier has no tty key left. */
         if (!kbd_medium) {
                 key_fire = 0x03;    /* ^C (ISIG is off) -- the original fire key */
                 key_use = ' ';
-                key_strafe = 'a';   /* vanilla's alt: hold + left/right arrows */
                 key_speed = 'r';
-                key_strafeleft = 'd';
-                key_straferight = 'f';
+                key_strafe = 0;
                 key_nextweapon = '/';
                 key_prevweapon = '.';
         }
-        /* On the console (K_MEDIUMRAW) the keys arrive as real scancode
-         * events and the in-code defaults apply: ctrl fire, space use,
-         * shift run, alt strafe, , and . strafe. */
+
+        /* ZQSD on AZERTY, WASD on QWERTY/QWERTZ: the movement cluster
+         * is bound to the layout, not to one spelling of the keys. */
+        prism_bind_movement();
 }
 
 void DG_DrawFrame(void)
@@ -193,6 +214,7 @@ static int kbd_fl;              /* the fd's own flags (O_NONBLOCK is ours) */
  * answers; the serial line says -ENOTTY and keeps the hold model below. */
 #define PRISM_KDGKBMODE 0x4B44
 #define PRISM_KDSKBMODE 0x4B45
+#define PRISM_KDGKBENT 0x4B46
 #define PRISM_K_UNICODE 3
 #define PRISM_K_MEDIUMRAW 2
 
@@ -302,6 +324,82 @@ static int prism_kbd_init(void)
                 }
         }
         return 0;
+}
+
+/* ---------------------------------------------------------- layout keys */
+
+/* struct kbentry { u8 kb_table; u8 kb_index; u16 kb_value; } -- KDGKBENT
+ * reads the first two bytes and writes the keysym back at offset 2
+ * (user/fd.rs).  Only the console answers it; the serial line says
+ * -ENOTTY. */
+struct prism_kbentry {
+        uint8_t table;
+        uint8_t index;
+        uint16_t value;
+};
+
+/* The character the live console keymap puts on keycode `kc` (table 0,
+ * unshifted): a keysym is (type << 8) | value and KT_LATIN is 0.  A
+ * non-Latin entry (an arrow, a dead key) or a descriptor without a
+ * keymap answers 0, and the caller keeps the US fallback. */
+static char prism_layout_char(int fd, int kc)
+{
+        struct prism_kbentry e;
+        uint16_t v;
+
+        if (fd < 0)
+                return 0;
+        e.table = 0;
+        e.index = (uint8_t)kc;
+        e.value = 0;
+        if (prism_ioctl(fd, PRISM_KDGKBENT, &e) != 0)
+                return 0;
+        v = e.value;
+        if ((v >> 8) != 0 || v < 0x20 || v > 0x7e)
+                return 0;
+        return (char)v;
+}
+
+/* Bind doom's movement actions to the ZQSD/WASD cluster.
+ *
+ * On the console (K_MEDIUMRAW) the bytes are physical keycodes, and
+ * kc_doom[] names them the QWERTY way: 'w', 'a', 's' and 'd' are the
+ * very keys whose caps say Z, Q, S and D on an AZERTY keyboard, so the
+ * same binds cover both layouts.  A tty (the serial line, or a console
+ * left in a text mode) delivers characters with the layout already
+ * applied; ask the live console keymap what the physical cluster types
+ * there, so the binds follow the selected layout (ZQSD on fr, WASD on
+ * us) instead of assuming one. */
+static void prism_bind_movement(void)
+{
+        int fd = kbd_fd;
+        char fwd, left, back, right;
+
+        if (kbd_medium) {
+                key_up = 'w';
+                key_strafeleft = 'a';
+                key_down = 's';
+                key_straferight = 'd';
+                return;
+        }
+
+        /* The serial descriptor has no keymap; /dev/console does. */
+        if (prism_layout_char(fd, 17) == 0) {
+                fd = open("/dev/console", O_RDONLY | O_NONBLOCK | O_NOCTTY);
+                if (fd < 0)
+                        fd = -1;
+        }
+        fwd = prism_layout_char(fd, 17);
+        left = prism_layout_char(fd, 30);
+        back = prism_layout_char(fd, 31);
+        right = prism_layout_char(fd, 32);
+        if (fd >= 0 && fd != kbd_fd)
+                close(fd);
+
+        key_up = fwd ? fwd : 'w';
+        key_strafeleft = left ? left : 'a';
+        key_down = back ? back : 's';
+        key_straferight = right ? right : 'd';
 }
 
 static void key_push(int pressed, int k)
@@ -500,6 +598,142 @@ int DG_GetKey(int *pressed, unsigned char *key)
         *pressed = key_q[key_qt].pressed;
         *key = (unsigned char)key_q[key_qt].key;
         key_qt = (key_qt + 1) % KB_QUEUE;
+        return 1;
+}
+
+/* ---------------------------------------------------------------- mouse */
+
+/* The PS/2 mouse is evdev's second node (sys/kern/src/input/): reads
+ * return Linux's 24-byte struct input_event, REL_X / REL_Y for motion
+ * (right / down positive), BTN_* for the buttons, one SYN_REPORT per
+ * packet.  It is read apart from the tty -- the console keyboard's
+ * K_MEDIUMRAW has nothing to say about it -- and non-blocking, the same
+ * way DG_GetKey must never park the game loop.  No node (a serial-only
+ * boot, no PS/2 mouse): the game simply plays without one. */
+#define MOUSE_DEV "/dev/input/event1"
+
+struct prism_input_event {
+        int64_t sec;
+        int64_t usec;
+        uint16_t type;
+        uint16_t code;
+        int32_t value;
+};
+
+#define PRISM_EV_SYN 0x00
+#define PRISM_EV_KEY 0x01
+#define PRISM_EV_REL 0x02
+#define PRISM_SYN_DROPPED 3
+#define PRISM_REL_X 0x00
+#define PRISM_REL_Y 0x01
+#define PRISM_REL_WHEEL 0x08
+#define PRISM_BTN_LEFT 0x110
+#define PRISM_BTN_RIGHT 0x111
+#define PRISM_BTN_MIDDLE 0x112
+/* EVIOCGKEY(96): _IOC(_IOC_READ, 'E', 0x18, 96) -- the held keys, one
+ * bit per keycode; the BTN_* codes sit in byte 34. */
+#define PRISM_EVIOCGKEY96 ((2UL << 30) | (96UL << 16) | ((unsigned long)'E' << 8) | 0x18)
+#define PRISM_KEYBIT(map, c) (((map)[(c) / 8] >> ((c) % 8)) & 1)
+
+static int mouse_fd = -1;
+static int mouse_btn;           /* the buttons held (bits 0..2) */
+static int mouse_sent;          /* the mask the game was last told */
+
+static void mouse_close(void)
+{
+        if (mouse_fd >= 0) {
+                close(mouse_fd);
+                mouse_fd = -1;
+        }
+}
+
+static int prism_mouse_init(void)
+{
+        mouse_fd = open(MOUSE_DEV, O_RDONLY | O_NONBLOCK);
+        if (mouse_fd < 0)
+                return -1;
+        atexit(mouse_close);
+        return 0;
+}
+
+/* The device's ring overflowed (SYN_DROPPED): the events in between are
+ * gone, a button release among them -- ask for the held keys instead of
+ * leaving the fire button stuck down. */
+static void mouse_resync(void)
+{
+        uint8_t keys[96];
+
+        memset(keys, 0, sizeof(keys));
+        if (prism_ioctl(mouse_fd, PRISM_EVIOCGKEY96, keys) != 0)
+                return;
+        mouse_btn = 0;
+        if (PRISM_KEYBIT(keys, PRISM_BTN_LEFT))
+                mouse_btn |= 1;
+        if (PRISM_KEYBIT(keys, PRISM_BTN_RIGHT))
+                mouse_btn |= 2;
+        if (PRISM_KEYBIT(keys, PRISM_BTN_MIDDLE))
+                mouse_btn |= 4;
+}
+
+int DG_GetMouse(int *dx, int *dy, int *buttons)
+{
+        struct prism_input_event ev[16];
+        int mx = 0, my = 0, wheel = 0, state;
+        long n;
+
+        if (mouse_fd < 0)
+                return 0;
+
+        while ((n = read(mouse_fd, ev, sizeof(ev))) >= (long)sizeof(ev[0])) {
+                for (long i = 0; i < n / (long)sizeof(ev[0]); i++) {
+                        int bit = 0;
+
+                        switch (ev[i].type) {
+                        case PRISM_EV_REL:
+                                if (ev[i].code == PRISM_REL_X)
+                                        mx += ev[i].value;
+                                else if (ev[i].code == PRISM_REL_Y)
+                                        my += ev[i].value;
+                                else if (ev[i].code == PRISM_REL_WHEEL)
+                                        wheel += ev[i].value;
+                                break;
+                        case PRISM_EV_KEY:
+                                if (ev[i].code == PRISM_BTN_LEFT)
+                                        bit = 1;
+                                else if (ev[i].code == PRISM_BTN_RIGHT)
+                                        bit = 2;
+                                else if (ev[i].code == PRISM_BTN_MIDDLE)
+                                        bit = 4;
+                                if (ev[i].value)
+                                        mouse_btn |= bit;
+                                else
+                                        mouse_btn &= ~bit;
+                                break;
+                        case PRISM_EV_SYN:
+                                if (ev[i].code == PRISM_SYN_DROPPED) {
+                                        mx = my = wheel = 0;
+                                        mouse_resync();
+                                }
+                                break;
+                        }
+                }
+        }
+
+        /* A wheel notch is a one-poll press: the game sees the button
+         * go down now and up on the next poll, which is what its
+         * weapon cycling (g_game.c's SetMouseButtons) detects. */
+        state = mouse_btn;
+        if (wheel > 0)
+                state |= 1 << MB_PREVWEAPON;
+        else if (wheel < 0)
+                state |= 1 << MB_NEXTWEAPON;
+
+        if (!mx && !my && state == mouse_sent)
+                return 0;
+        mouse_sent = state;
+        *dx = mx;
+        *dy = my;
+        *buttons = state;
         return 1;
 }
 
