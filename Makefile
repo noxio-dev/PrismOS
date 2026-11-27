@@ -79,7 +79,7 @@ EFI_OBJS  := $(patsubst %.c,$B/efi/%.o,$(COMMON_SRCS) boot/loader/ext4.c $(wildc
 
 # ---- default target ----------------------------------------------------
 
-.PHONY: all clean run run-uefi run-iso test kernel esp root iso run-kvm run-uefi-kvm data fstest bintest pkgs binutils busybox busyboxtest nano
+.PHONY: all clean run run-uefi run-iso test kernel esp root iso run-kvm run-uefi-kvm data fstest bintest pkgs binutils busybox busyboxtest nano xorg
 all: $B/$(NAME).img
 
 # ---- compile rules -------------------------------------------------------
@@ -259,6 +259,24 @@ nano: $B/nano.stamp
 $B/nano.stamp: $B/toolchain/usr/.stamp $B/mlibc-port.md5 $(NANO_PORT_FILES)
 	@mkdir -p $(@D)
 	sh ports/nano/build.sh
+	@touch $@
+
+# ---- Xorg, step 1: util-macros, xorgproto, xtrans -----------------------------
+# ports/xorg installs the three architecture-independent packages every
+# later X port configures against (xorg-macros.m4, the protocol headers,
+# the transport sources, and their .pc files) into its own sysroot,
+# build/xorg-native/sysroot.  They are built with the host's tools: no
+# target compiler is involved, so this stamp does not depend on the
+# toolchain, and nothing is installed into the image.
+#
+#   make xorg         fetch, install into the sysroot, verify
+
+XORG_PORT_FILES := $(shell find ports/xorg -type f | sort)
+
+xorg: $B/xorg.stamp
+$B/xorg.stamp: $(XORG_PORT_FILES)
+	@mkdir -p $(@D)
+	sh ports/xorg/build.sh
 	@touch $@
 
 # The applets the image carries as /usr/bin symlinks to busybox: the
